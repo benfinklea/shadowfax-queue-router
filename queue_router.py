@@ -985,20 +985,77 @@ function progressBar(percent, cls, id) {
     let barClass = cls;
     if (percent > 90) barClass = 'progress-red';
     else if (percent > 70) barClass = 'progress-yellow';
-    const barId = id || 'bar-' + Math.random().toString(36).substr(2,9);
-    return '<div class="progress-bar"><div id="' + barId + '" class="progress-fill ' + barClass + '" style="width:' + percent + '%"></div></div>';
+    return '<div class="progress-bar"><div id="' + id + '" class="progress-fill ' + barClass + '" data-percent="' + percent + '" style="width:' + percent + '%"></div></div>';
 }
 
-function renderSwapGauge(value, max, size) {
+// Update existing progress bars smoothly
+function updateProgressBar(id, percent, baseClass) {
+    const el = document.getElementById(id);
+    if (el) {
+        let barClass = baseClass;
+        if (percent > 90) barClass = 'progress-red';
+        else if (percent > 70) barClass = 'progress-yellow';
+        el.className = 'progress-fill ' + barClass;
+        el.style.width = percent + '%';
+    }
+}
+
+// Track if initial render is done
+let initialized = false;
+let lastData = null;
+
+// Smoothly update a gauge arc
+function updateGaugeArc(id, percent, color) {
+    const arc = document.querySelector('#' + id + ' .gauge-arc');
+    const circle = document.querySelector('#' + id + ' circle');
+    const valueEl = document.querySelector('#' + id + ' .gauge-value');
+    if (arc) {
+        const r = parseFloat(arc.getAttribute('r') || 45);
+        const arcLength = Math.PI * r;
+        const dashOffset = arcLength * (1 - percent / 100);
+        arc.style.strokeDashoffset = dashOffset;
+        arc.style.stroke = color;
+    }
+    if (circle) {
+        circle.style.stroke = color;
+    }
+    if (valueEl) {
+        valueEl.style.color = color;
+        valueEl.style.textShadow = '0 0 10px ' + color;
+    }
+}
+
+// Get color for normal gauges (low=good)
+function getNormalColor(percent) {
+    if (percent > 90) return '#ff0044';
+    if (percent > 70) return '#ffff00';
+    return '#39ff14';
+}
+
+// Get color for utilization (low=bad)
+function getUtilColor(percent) {
+    if (percent < 5) return '#ff0044';
+    if (percent < 25) return '#ffff00';
+    return '#39ff14';
+}
+
+// Get color for swap (0=good)
+function getSwapColor(percent) {
+    if (percent === 0) return '#39ff14';
+    if (percent < 70) return '#ffff00';
+    return '#ff0044';
+}
+
+function renderSwapGauge(value, max, size, id) {
     // Swap: green only at 0, yellow 0-70%, red >70%
     let color, glow;
     if (value === 0) { color = '#39ff14'; glow = '#39ff14'; }
     else if (value < 70) { color = '#ffff00'; glow = '#ffff00'; }
     else { color = '#ff0044'; glow = '#ff0044'; }
-    return renderGaugeWithColor(value, 0, max, "SWAP", "%", false, size, color, glow);
+    return renderGaugeWithColor(value, 0, max, "SWAP", "%", false, size, color, glow, id);
 }
 
-function renderGaugeWithColor(value, min, max, label, unit, showLimit, size, color, glow) {
+function renderGaugeWithColor(value, min, max, label, unit, showLimit, size, color, glow, id) {
     const s = size || 1;
     const w = Math.round(120 * s);
     const h = Math.round(70 * s);
@@ -1006,11 +1063,14 @@ function renderGaugeWithColor(value, min, max, label, unit, showLimit, size, col
     const strokeW = 8 * s;
     const cx = w / 2;
     const cy = h - 5;
+    const gaugeId = id || 'gauge-' + label.replace(/\\s/g,'');
 
     if (value === null) {
-        return '<div class="gauge" style="width:' + w + 'px"><svg width="' + w + '" height="' + h + '" viewBox="0 0 ' + w + ' ' + h + '">' +
+        return '<div class="gauge" id="' + gaugeId + '" style="width:' + w + 'px" data-r="' + r + '"><svg width="' + w + '" height="' + h + '" viewBox="0 0 ' + w + ' ' + h + '">' +
             '<path d="M ' + (cx - r) + ' ' + cy + ' A ' + r + ' ' + r + ' 0 0 1 ' + (cx + r) + ' ' + cy + '" fill="none" stroke="#1a2332" stroke-width="' + strokeW + '" stroke-linecap="round"/>' +
-            '</svg><div class="gauge-label">' + label + '</div><div class="gauge-value">--</div></div>';
+            '<path class="gauge-arc" r="' + r + '" d="M ' + (cx - r) + ' ' + cy + ' A ' + r + ' ' + r + ' 0 0 1 ' + (cx + r) + ' ' + cy + '" fill="none" stroke-width="' + strokeW + '" stroke-linecap="round" stroke-dasharray="' + (Math.PI * r) + '" style="stroke:#1a2332;stroke-dashoffset:' + (Math.PI * r) + ';transition:stroke-dashoffset 1.5s cubic-bezier(0.4,0,0.2,1),stroke 0.8s"/>' +
+            '<circle cx="' + cx + '" cy="' + cy + '" r="' + (6 * s) + '" fill="#0a0a0f" stroke="#1a2332" stroke-width="2" style="transition:stroke 0.8s"/>' +
+            '</svg><div class="gauge-label">' + label + '</div><div class="gauge-value" style="transition:color 0.8s">--</div></div>';
     }
 
     const clampedValue = Math.max(min, Math.min(max, value));
@@ -1019,66 +1079,32 @@ function renderGaugeWithColor(value, min, max, label, unit, showLimit, size, col
     const dashOffset = arcLength * (1 - percent / 100);
     const displayValue = showLimit ? Math.round(value) + '/' + max + unit : Math.round(value) + unit;
 
-    return '<div class="gauge" style="width:' + w + 'px">' +
+    return '<div class="gauge" id="' + gaugeId + '" style="width:' + w + 'px" data-r="' + r + '">' +
         '<svg width="' + w + '" height="' + h + '" viewBox="0 0 ' + w + ' ' + h + '" style="filter:drop-shadow(0 0 10px ' + glow + ')">' +
-        '<defs><linearGradient id="grad-' + label.replace(/\\s/g,'') + '" x1="0%" y1="0%" x2="100%" y2="0%">' +
+        '<defs><linearGradient id="grad-' + gaugeId + '" x1="0%" y1="0%" x2="100%" y2="0%">' +
         '<stop offset="0%" style="stop-color:#1a2332"/>' +
         '<stop offset="100%" style="stop-color:#2a3342"/></linearGradient></defs>' +
-        '<path d="M ' + (cx - r) + ' ' + cy + ' A ' + r + ' ' + r + ' 0 0 1 ' + (cx + r) + ' ' + cy + '" fill="none" stroke="url(#grad-' + label.replace(/\\s/g,'') + ')" stroke-width="' + (strokeW + 4) + '" stroke-linecap="round"/>' +
-        '<path class="gauge-arc" d="M ' + (cx - r) + ' ' + cy + ' A ' + r + ' ' + r + ' 0 0 1 ' + (cx + r) + ' ' + cy + '" fill="none" stroke="' + color + '" stroke-width="' + strokeW + '" stroke-linecap="round" stroke-dasharray="' + arcLength + '" stroke-dashoffset="' + dashOffset + '" style="transition:stroke-dashoffset 1.5s cubic-bezier(0.4,0,0.2,1),stroke 0.8s"/>' +
-        '<circle cx="' + cx + '" cy="' + cy + '" r="' + (6 * s) + '" fill="#0a0a0f" stroke="' + color + '" stroke-width="2"/>' +
+        '<path d="M ' + (cx - r) + ' ' + cy + ' A ' + r + ' ' + r + ' 0 0 1 ' + (cx + r) + ' ' + cy + '" fill="none" stroke="url(#grad-' + gaugeId + ')" stroke-width="' + (strokeW + 4) + '" stroke-linecap="round"/>' +
+        '<path class="gauge-arc" r="' + r + '" d="M ' + (cx - r) + ' ' + cy + ' A ' + r + ' ' + r + ' 0 0 1 ' + (cx + r) + ' ' + cy + '" fill="none" stroke-width="' + strokeW + '" stroke-linecap="round" stroke-dasharray="' + arcLength + '" style="stroke:' + color + ';stroke-dashoffset:' + dashOffset + ';transition:stroke-dashoffset 1.5s cubic-bezier(0.4,0,0.2,1),stroke 0.8s"/>' +
+        '<circle cx="' + cx + '" cy="' + cy + '" r="' + (6 * s) + '" fill="#0a0a0f" stroke="' + color + '" stroke-width="2" style="transition:stroke 0.8s"/>' +
         '</svg>' +
         '<div class="gauge-label">' + label + '</div>' +
-        '<div class="gauge-value" style="color:' + color + ';text-shadow:0 0 10px ' + glow + '">' + displayValue + '</div></div>';
+        '<div class="gauge-value" style="color:' + color + ';text-shadow:0 0 10px ' + glow + ';transition:color 0.8s">' + displayValue + '</div></div>';
 }
 
-function renderGauge(value, min, max, label, unit, showLimit, size, reverseColors) {
-    const s = size || 1;
-    const w = Math.round(120 * s);
-    const h = Math.round(70 * s);
-    const r = 45 * s;
-    const strokeW = 8 * s;
-    const cx = w / 2;
-    const cy = h - 5;
-
-    if (value === null) {
-        return '<div class="gauge" style="width:' + w + 'px"><svg width="' + w + '" height="' + h + '" viewBox="0 0 ' + w + ' ' + h + '">' +
-            '<path d="M ' + (cx - r) + ' ' + cy + ' A ' + r + ' ' + r + ' 0 0 1 ' + (cx + r) + ' ' + cy + '" fill="none" stroke="#1a2332" stroke-width="' + strokeW + '" stroke-linecap="round"/>' +
-            '</svg><div class="gauge-label">' + label + '</div><div class="gauge-value">--</div></div>';
-    }
-
-    const clampedValue = Math.max(min, Math.min(max, value));
-    const percent = ((clampedValue - min) / (max - min)) * 100;
-    const arcLength = Math.PI * r;
-    const dashOffset = arcLength * (1 - percent / 100);
-
+function renderGauge(value, min, max, label, unit, showLimit, size, reverseColors, id) {
     // Color based on percentage
+    const clampedValue = value !== null ? Math.max(min, Math.min(max, value)) : 0;
+    const percent = value !== null ? ((clampedValue - min) / (max - min)) * 100 : 0;
+
     let color, glow;
     if (reverseColors) {
-        // For utilization: low is bad, high is good
-        if (percent < 5) { color = '#ff0044'; glow = '#ff0044'; }        // Red: idle
-        else if (percent < 25) { color = '#ffff00'; glow = '#ffff00'; }  // Yellow: light use
-        else { color = '#39ff14'; glow = '#39ff14'; }                     // Green: working!
+        color = glow = getUtilColor(percent);
     } else {
-        // Normal: low is good, high is bad
-        if (percent > 90) { color = '#ff0044'; glow = '#ff0044'; }
-        else if (percent > 70) { color = '#ffff00'; glow = '#ffff00'; }
-        else { color = '#39ff14'; glow = '#39ff14'; }
+        color = glow = getNormalColor(percent);
     }
 
-    const displayValue = showLimit ? Math.round(value) + '/' + max + unit : Math.round(value) + unit;
-
-    return '<div class="gauge" style="width:' + w + 'px">' +
-        '<svg width="' + w + '" height="' + h + '" viewBox="0 0 ' + w + ' ' + h + '" style="filter:drop-shadow(0 0 10px ' + glow + ')">' +
-        '<defs><linearGradient id="grad-' + label.replace(/\\s/g,'') + '" x1="0%" y1="0%" x2="100%" y2="0%">' +
-        '<stop offset="0%" style="stop-color:#1a2332"/>' +
-        '<stop offset="100%" style="stop-color:#2a3342"/></linearGradient></defs>' +
-        '<path d="M ' + (cx - r) + ' ' + cy + ' A ' + r + ' ' + r + ' 0 0 1 ' + (cx + r) + ' ' + cy + '" fill="none" stroke="url(#grad-' + label.replace(/\\s/g,'') + ')" stroke-width="' + (strokeW + 4) + '" stroke-linecap="round"/>' +
-        '<path class="gauge-arc" d="M ' + (cx - r) + ' ' + cy + ' A ' + r + ' ' + r + ' 0 0 1 ' + (cx + r) + ' ' + cy + '" fill="none" stroke="' + color + '" stroke-width="' + strokeW + '" stroke-linecap="round" stroke-dasharray="' + arcLength + '" stroke-dashoffset="' + dashOffset + '" style="transition:stroke-dashoffset 1.5s cubic-bezier(0.4,0,0.2,1),stroke 0.8s"/>' +
-        '<circle cx="' + cx + '" cy="' + cy + '" r="' + (6 * s) + '" fill="#0a0a0f" stroke="' + color + '" stroke-width="2"/>' +
-        '</svg>' +
-        '<div class="gauge-label">' + label + '</div>' +
-        '<div class="gauge-value" style="color:' + color + ';text-shadow:0 0 10px ' + glow + '">' + displayValue + '</div></div>';
+    return renderGaugeWithColor(value, min, max, label, unit, showLimit, size, color, glow, id);
 }
 
 function setupPowerButtons() {
@@ -1124,117 +1150,168 @@ function formatJobTime(isoString) {
 }
 
 
+function updateGauge(id, value, min, max, unit, showLimit, colorFn) {
+    const gauge = document.getElementById(id);
+    if (!gauge) return;
+
+    const r = parseFloat(gauge.dataset.r) || 45;
+    const arcLength = Math.PI * r;
+    const clampedValue = Math.max(min, Math.min(max, value));
+    const percent = ((clampedValue - min) / (max - min)) * 100;
+    const dashOffset = arcLength * (1 - percent / 100);
+    const color = colorFn(percent);
+    const displayValue = showLimit ? Math.round(value) + '/' + max + unit : Math.round(value) + unit;
+
+    const arc = gauge.querySelector('.gauge-arc');
+    const circle = gauge.querySelector('circle');
+    const valueEl = gauge.querySelector('.gauge-value');
+    const svg = gauge.querySelector('svg');
+
+    if (arc) {
+        arc.style.strokeDashoffset = dashOffset;
+        arc.style.stroke = color;
+    }
+    if (circle) circle.style.stroke = color;
+    if (valueEl) {
+        valueEl.textContent = displayValue;
+        valueEl.style.color = color;
+        valueEl.style.textShadow = '0 0 10px ' + color;
+    }
+    if (svg) svg.style.filter = 'drop-shadow(0 0 10px ' + color + ')';
+}
+
 function refresh() {
     fetch("/api/status").then(r => r.json()).then(data => {
-        let html = '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:20px">';
+        // If not initialized, build the full HTML
+        if (!initialized) {
+            let html = '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:20px">';
 
-        for (const [name, info] of Object.entries(data.targets)) {
-            const icon = icons[name] || "🖥️";
-            const status = info.online ? '<span class="online">ONLINE</span>' : '<span class="offline">OFFLINE</span>';
-            const queueBadge = info.queue_pending > 0
-                ? '<span class="queue-badge">' + info.queue_pending + ' queued</span>'
-                : '<span class="queue-badge empty">idle</span>';
+            for (const [name, info] of Object.entries(data.targets)) {
+                const icon = icons[name] || "🖥️";
+                const status = info.online ? '<span class="online">ONLINE</span>' : '<span class="offline">OFFLINE</span>';
 
-            html += '<div class="gpu-card">';
-            html += '<div class="gpu-header"><span class="gpu-name">' + icon + ' ' + name + '</span>' + status + '</div>';
+                html += '<div class="gpu-card" id="card-' + name + '">';
+                html += '<div class="gpu-header"><span class="gpu-name">' + icon + ' ' + name + '</span><span id="status-' + name + '">' + status + '</span></div>';
 
-            // Jobs today and queue info below name
-            const queueCount = info.queue_running + info.queue_pending;
-            const jobsToday = info.jobs_today || 0;
-            html += '<div class="queue-info">';
-            html += '<div class="jobs-today">' + jobsToday + ' jobs today</div>';
-            html += '<div class="queue-count">' + queueCount + ' Queued</div>';
-            html += '</div>';
-
-            if (info.online && info.gpu) {
-                // Row 1: GPU Util + Power (both 1.5x bigger)
-                html += '<div class="gauge-row">';
-                html += renderGauge(info.gpu_util, 0, 100, "GPU UTIL", "%", false, 1.5, true);
-                html += renderGauge(info.gpu_watts, 0, info.gpu_power_max, "POWER", "W", true, 1.5);
-                html += '</div>';
-                // Row 2: Temp, CPU, Swap (normal size)
-                html += '<div class="gauge-row">';
-                html += renderGauge(info.gpu_temp, 24, 90, "TEMP", "°C", false);
-                html += renderGauge(info.cpu_percent, 0, 100, "CPU", "%", false);
-                const swapPct = info.swap ? info.swap.percent : 0;
-                html += renderSwapGauge(swapPct, 100, 1);
-                html += '</div>';
-                html += '<button class="power-btn" data-target="' + name + '" data-current="' + info.gpu_power_limit + '" data-max="' + info.gpu_power_max + '">⚡ Set Power Limit</button>';
-
-                // VRAM bar
-                html += '<div class="stat-row">';
-                html += '<div class="progress-label"><span>🎮 VRAM</span><span>' + info.gpu.vram_used_gb + ' / ' + info.gpu.vram_total_gb + ' GB</span></div>';
-                html += progressBar(info.gpu.vram_percent, "progress-vram");
+                const queueCount = info.queue_running + info.queue_pending;
+                const jobsToday = info.jobs_today || 0;
+                html += '<div class="queue-info">';
+                html += '<div class="jobs-today" id="jobs-today-' + name + '">' + jobsToday + ' jobs today</div>';
+                html += '<div class="queue-count" id="queue-' + name + '">' + queueCount + ' Queued</div>';
                 html += '</div>';
 
-                // RAM bar
-                if (info.ram) {
-                    html += '<div class="stat-row">';
-                    html += '<div class="progress-label"><span>💾 RAM</span><span>' + info.ram.used_gb + ' / ' + info.ram.total_gb + ' GB</span></div>';
-                    html += progressBar(info.ram.percent, "progress-ram");
-                    html += '</div>';
-                }
-
-                // Disk bar
-                if (info.disk) {
-                    html += '<div class="stat-row">';
-                    const diskUsed = info.disk.total_gb >= 1000 ? (info.disk.used_gb / 1024).toFixed(1) + ' TB' : info.disk.used_gb + ' GB';
-                    const diskTotal = info.disk.total_gb >= 1000 ? (info.disk.total_gb / 1024).toFixed(1) + ' TB' : info.disk.total_gb + ' GB';
-                    html += '<div class="progress-label"><span>💿 Disk</span><span>' + diskUsed + ' / ' + diskTotal + '</span></div>';
-                    html += progressBar(info.disk.percent, "progress-disk");
-                    html += '</div>';
-                }
-
-                // I/O Stats
-                html += '<div class="io-stats">';
-                if (info.disk_io) {
-                    const diskClass = (info.disk_io.read_mbps + info.disk_io.write_mbps) > 500 ? 'warning' : '';
-                    html += '<div class="io-stat ' + diskClass + '">📀 <span class="value">' + info.disk_io.read_mbps + '/' + info.disk_io.write_mbps + '</span> MB/s</div>';
-                }
-                if (info.net_io) {
-                    const netClass = (info.net_io.rx_mbps + info.net_io.tx_mbps) > 100 ? 'warning' : '';
-                    html += '<div class="io-stat ' + netClass + '">🌐 <span class="value">' + info.net_io.rx_mbps + '/' + info.net_io.tx_mbps + '</span> MB/s</div>';
-                }
-                html += '</div>';
-
-                html += '<div style="margin-top:10px;font-size:0.85em;color:#888">' + info.gpu.name + (info.gpu.cuda_version ? ' (CUDA ' + info.gpu.cuda_version + ')' : '') + '</div>';
-            } else if (!info.online) {
-                // Show SSH metrics even if ComfyUI is offline
-                if (info.cpu_percent !== null || info.gpu_watts !== null) {
-                    html += '<div style="color:#d9a54a;font-size:0.9em;margin-bottom:10px">ComfyUI offline - showing system metrics</div>';
+                if (info.online && info.gpu) {
                     html += '<div class="gauge-row">';
-                    html += renderGauge(info.gpu_util, 0, 100, "GPU UTIL", "%", false, 1.5, true);
-                    html += renderGauge(info.gpu_watts, 0, info.gpu_power_max, "POWER", "W", true, 1.5);
+                    html += renderGauge(info.gpu_util, 0, 100, "GPU UTIL", "%", false, 1.5, true, 'util-' + name);
+                    html += renderGauge(info.gpu_watts, 0, info.gpu_power_max, "POWER", "W", true, 1.5, false, 'power-' + name);
                     html += '</div>';
                     html += '<div class="gauge-row">';
-                    html += renderGauge(info.gpu_temp, 24, 90, "TEMP", "°C", false);
-                    html += renderGauge(info.cpu_percent, 0, 100, "CPU", "%", false);
+                    html += renderGauge(info.gpu_temp, 24, 90, "TEMP", "°C", false, 1, false, 'temp-' + name);
+                    html += renderGauge(info.cpu_percent, 0, 100, "CPU", "%", false, 1, false, 'cpu-' + name);
                     const swapPct = info.swap ? info.swap.percent : 0;
-                    html += renderSwapGauge(swapPct, 100, 1);
+                    html += renderSwapGauge(swapPct, 100, 1, 'swap-' + name);
                     html += '</div>';
-                    if (info.gpu_watts !== null) {
-                        html += '<button class="power-btn" data-target="' + name + '" data-current="' + info.gpu_power_limit + '" data-max="' + info.gpu_power_max + '">⚡ Set Power Limit</button>';
-                    }
-                    // Disk bar even when offline
-                    if (info.disk) {
+                    html += '<button class="power-btn" data-target="' + name + '" data-current="' + info.gpu_power_limit + '" data-max="' + info.gpu_power_max + '">⚡ Set Power Limit</button>';
+
+                    html += '<div class="stat-row">';
+                    html += '<div class="progress-label"><span>🎮 VRAM</span><span id="vram-label-' + name + '">' + info.gpu.vram_used_gb + ' / ' + info.gpu.vram_total_gb + ' GB</span></div>';
+                    html += progressBar(info.gpu.vram_percent, "progress-vram", 'vram-' + name);
+                    html += '</div>';
+
+                    if (info.ram) {
                         html += '<div class="stat-row">';
-                        const diskUsed = info.disk.total_gb >= 1000 ? (info.disk.used_gb / 1024).toFixed(1) + ' TB' : info.disk.used_gb + ' GB';
-                        const diskTotal = info.disk.total_gb >= 1000 ? (info.disk.total_gb / 1024).toFixed(1) + ' TB' : info.disk.total_gb + ' GB';
-                        html += '<div class="progress-label"><span>💿 Disk</span><span>' + diskUsed + ' / ' + diskTotal + '</span></div>';
-                        html += progressBar(info.disk.percent, "progress-disk");
+                        html += '<div class="progress-label"><span>💾 RAM</span><span id="ram-label-' + name + '">' + info.ram.used_gb + ' / ' + info.ram.total_gb + ' GB</span></div>';
+                        html += progressBar(info.ram.percent, "progress-ram", 'ram-' + name);
                         html += '</div>';
                     }
-                } else {
-                    html += '<div style="color:#666;padding:20px 0">Offline or unreachable</div>';
+
+                    if (info.disk) {
+                        const diskUsed = info.disk.total_gb >= 1000 ? (info.disk.used_gb / 1024).toFixed(1) + ' TB' : info.disk.used_gb + ' GB';
+                        const diskTotal = info.disk.total_gb >= 1000 ? (info.disk.total_gb / 1024).toFixed(1) + ' TB' : info.disk.total_gb + ' GB';
+                        html += '<div class="stat-row">';
+                        html += '<div class="progress-label"><span>💿 Disk</span><span id="disk-label-' + name + '">' + diskUsed + ' / ' + diskTotal + '</span></div>';
+                        html += progressBar(info.disk.percent, "progress-disk", 'disk-' + name);
+                        html += '</div>';
+                    }
+
+                // I/O Stats
+                    html += '<div class="io-stats">';
+                    if (info.disk_io) {
+                        html += '<div class="io-stat" id="disk-io-' + name + '">📀 <span class="value">' + info.disk_io.read_mbps + '/' + info.disk_io.write_mbps + '</span> MB/s</div>';
+                    }
+                    if (info.net_io) {
+                        html += '<div class="io-stat" id="net-io-' + name + '">🌐 <span class="value">' + info.net_io.rx_mbps + '/' + info.net_io.tx_mbps + '</span> MB/s</div>';
+                    }
+                    html += '</div>';
+
+                    html += '<div style="margin-top:10px;font-size:0.85em;color:#888">' + info.gpu.name + (info.gpu.cuda_version ? ' (CUDA ' + info.gpu.cuda_version + ')' : '') + '</div>';
+                }
+
+                html += '<div style="margin-top:10px"><a href="' + info.url + '" style="color:var(--neon-cyan);font-size:0.9em">Open ComfyUI →</a></div>';
+                html += '</div>';
+            }
+            html += '</div>';
+            document.getElementById("monitors").innerHTML = html;
+            setupPowerButtons();
+            initialized = true;
+
+        } else {
+            // UPDATE PATH: Just update values in place
+            for (const [name, info] of Object.entries(data.targets)) {
+                // Update queue info
+                const queueCount = info.queue_running + info.queue_pending;
+                const jobsToday = info.jobs_today || 0;
+                const queueEl = document.getElementById('queue-' + name);
+                const jobsTodayEl = document.getElementById('jobs-today-' + name);
+                if (queueEl) queueEl.textContent = queueCount + ' Queued';
+                if (jobsTodayEl) jobsTodayEl.textContent = jobsToday + ' jobs today';
+
+                if (info.online && info.gpu) {
+                    // Update gauges
+                    updateGauge('util-' + name, info.gpu_util, 0, 100, '%', false, getUtilColor);
+                    updateGauge('power-' + name, info.gpu_watts, 0, info.gpu_power_max, 'W', true, getNormalColor);
+                    updateGauge('temp-' + name, info.gpu_temp, 24, 90, '°C', false, getNormalColor);
+                    updateGauge('cpu-' + name, info.cpu_percent, 0, 100, '%', false, getNormalColor);
+                    const swapPct = info.swap ? info.swap.percent : 0;
+                    updateGauge('swap-' + name, swapPct, 0, 100, '%', false, getSwapColor);
+
+                    // Update progress bars
+                    updateProgressBar('vram-' + name, info.gpu.vram_percent, 'progress-vram');
+                    const vramLabel = document.getElementById('vram-label-' + name);
+                    if (vramLabel) vramLabel.textContent = info.gpu.vram_used_gb + ' / ' + info.gpu.vram_total_gb + ' GB';
+
+                    if (info.ram) {
+                        updateProgressBar('ram-' + name, info.ram.percent, 'progress-ram');
+                        const ramLabel = document.getElementById('ram-label-' + name);
+                        if (ramLabel) ramLabel.textContent = info.ram.used_gb + ' / ' + info.ram.total_gb + ' GB';
+                    }
+
+                    if (info.disk) {
+                        updateProgressBar('disk-' + name, info.disk.percent, 'progress-disk');
+                        const diskLabel = document.getElementById('disk-label-' + name);
+                        if (diskLabel) {
+                            const diskUsed = info.disk.total_gb >= 1000 ? (info.disk.used_gb / 1024).toFixed(1) + ' TB' : info.disk.used_gb + ' GB';
+                            const diskTotal = info.disk.total_gb >= 1000 ? (info.disk.total_gb / 1024).toFixed(1) + ' TB' : info.disk.total_gb + ' GB';
+                            diskLabel.textContent = diskUsed + ' / ' + diskTotal;
+                        }
+                    }
+
+                    // Update I/O stats
+                    if (info.disk_io) {
+                        const diskIoEl = document.getElementById('disk-io-' + name);
+                        if (diskIoEl) {
+                            diskIoEl.querySelector('.value').textContent = info.disk_io.read_mbps + '/' + info.disk_io.write_mbps;
+                        }
+                    }
+                    if (info.net_io) {
+                        const netIoEl = document.getElementById('net-io-' + name);
+                        if (netIoEl) {
+                            netIoEl.querySelector('.value').textContent = info.net_io.rx_mbps + '/' + info.net_io.tx_mbps;
+                        }
+                    }
                 }
             }
-
-            html += '<div style="margin-top:10px"><a href="' + info.url + '" style="color:var(--neon-cyan);font-size:0.9em">Open ComfyUI →</a></div>';
-            html += '</div>';
         }
-        html += '</div>';
-        document.getElementById("monitors").innerHTML = html;
-        setupPowerButtons();
     });
 
     fetch("/api/logs").then(r => r.json()).then(data => {
