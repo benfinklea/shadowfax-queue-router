@@ -816,12 +816,12 @@ def index():
 *{box-sizing:border-box}
 body{font-family:'Rajdhani',sans-serif;background:var(--bg-dark);color:#e0e0e0;padding:20px;margin:0;
 background-image:radial-gradient(ellipse at top,#0d1a2d 0%,transparent 50%),
-linear-gradient(180deg,transparent 0%,rgba(0,255,242,0.03) 100%);min-height:100vh}
+linear-gradient(180deg,transparent 0%,rgba(0,255,242,0.03) 100%);min-height:100vh;font-size:18px}
 @media(min-width:768px){body{padding:20px 40px}}
 @media(max-width:767px){
-h1{font-size:1.2em;letter-spacing:2px}
+h1{font-size:1.4em;letter-spacing:2px}
 .gauge-row{gap:10px}
-.gauge{transform:scale(0.85)}
+.gauge{transform:scale(0.9)}
 .gpu-card{padding:15px}
 .io-stats{flex-wrap:wrap;gap:10px}
 .time-range{flex-wrap:wrap}
@@ -830,12 +830,12 @@ h1{font-size:1.2em;letter-spacing:2px}
 body::before{content:'';position:fixed;top:0;left:0;right:0;bottom:0;
 background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,0,0,0.1) 2px,rgba(0,0,0,0.1) 4px);
 pointer-events:none;z-index:9999;opacity:0.3}
-h1{font-family:'Orbitron',monospace;color:var(--neon-cyan);font-size:1.8em;font-weight:900;letter-spacing:4px;
+h1{font-family:'Orbitron',monospace;color:var(--neon-cyan);font-size:2.2em;font-weight:900;letter-spacing:4px;
 text-shadow:var(--glow-cyan);border-bottom:2px solid var(--neon-cyan);padding-bottom:15px;margin-bottom:30px;
 text-transform:uppercase}
 h1::before{content:'◈ ';color:var(--neon-magenta)}
 h1::after{content:' ◈';color:var(--neon-magenta)}
-h3{margin-top:0;color:var(--neon-cyan);font-family:'Orbitron',monospace;font-size:0.9em;letter-spacing:2px;
+h3{margin-top:0;color:var(--neon-cyan);font-family:'Orbitron',monospace;font-size:1.1em;letter-spacing:2px;
 text-transform:uppercase;text-shadow:0 0 10px var(--neon-cyan)}
 h3::before{content:'▸ '}
 .card{background:var(--bg-card);padding:20px;border-radius:4px;margin:20px 0;
@@ -863,7 +863,7 @@ background:linear-gradient(90deg,var(--neon-cyan),var(--neon-magenta),var(--neon
 .gpu-card::after{content:'';position:absolute;top:0;right:0;width:100px;height:100px;
 background:radial-gradient(circle,rgba(0,255,242,0.1) 0%,transparent 70%);pointer-events:none}
 .gpu-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:15px}
-.gpu-name{font-family:'Orbitron',monospace;font-size:1.1em;font-weight:700;text-transform:uppercase;
+.gpu-name{font-family:'Orbitron',monospace;font-size:1.3em;font-weight:700;text-transform:uppercase;
 letter-spacing:2px;color:var(--neon-cyan);text-shadow:0 0 10px var(--neon-cyan)}
 .progress-bar{background:#1a1a2e;border-radius:2px;height:24px;overflow:hidden;margin:5px 0;
 border:1px solid #2a2a4e;position:relative}
@@ -878,21 +878,21 @@ background:linear-gradient(90deg,transparent,rgba(255,255,255,0.4));animation:sh
 .progress-swap{background:linear-gradient(90deg,#ff004444,var(--neon-red));box-shadow:0 0 20px #ff004466}
 .progress-yellow{background:linear-gradient(90deg,#ffaa0044,var(--neon-yellow));box-shadow:0 0 20px #ffff0066}
 .progress-red{background:linear-gradient(90deg,#ff004444,var(--neon-red));box-shadow:0 0 20px #ff004466}
-.io-stats{display:flex;gap:20px;margin-top:15px;font-size:0.9em;padding:10px;background:var(--bg-dark);border-radius:4px;border:1px solid #1a2332}
+.io-stats{display:flex;gap:20px;margin-top:15px;font-size:1.05em;padding:12px;background:var(--bg-dark);border-radius:4px;border:1px solid #1a2332}
 .io-stat{display:flex;align-items:center;gap:8px}
 .io-stat .value{color:var(--neon-cyan);font-weight:bold;font-family:'Orbitron',monospace;text-shadow:0 0 10px var(--neon-cyan)}
 .io-stat.warning .value{color:var(--neon-yellow);text-shadow:0 0 10px var(--neon-yellow)}
 .io-stat.danger .value{color:var(--neon-red);text-shadow:0 0 10px var(--neon-red)}
 .time-range{display:flex;gap:8px;margin-bottom:15px}
-.time-range button{background:var(--bg-panel);color:#888;border:1px solid #2a2a4e;padding:8px 16px;
-border-radius:4px;cursor:pointer;font-family:'Orbitron',monospace;font-size:0.75em;letter-spacing:1px;
+.time-range button{background:var(--bg-panel);color:#888;border:1px solid #2a2a4e;padding:10px 18px;
+border-radius:4px;cursor:pointer;font-family:'Orbitron',monospace;font-size:0.9em;letter-spacing:1px;
 text-transform:uppercase;transition:all 0.3s}
 .time-range button:hover{border-color:var(--neon-cyan);color:var(--neon-cyan);box-shadow:0 0 15px rgba(0,255,242,0.3)}
 .time-range button.active{background:transparent;border-color:var(--neon-cyan);color:var(--neon-cyan);
 box-shadow:var(--glow-cyan)}
 .sparkline-container{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
 .sparkline-box{background:var(--bg-panel);padding:12px;border-radius:4px;border:1px solid #1a2332}
-.sparkline-label{font-size:0.75em;color:#666;margin-bottom:8px;font-family:'Orbitron',monospace;letter-spacing:1px}
+.sparkline-label{font-size:0.9em;color:#888;margin-bottom:8px;font-family:'Orbitron',monospace;letter-spacing:1px}
 .sparkline{height:45px;display:flex;align-items:end;gap:2px}
 .sparkline-bar{background:var(--neon-cyan);min-width:3px;border-radius:1px 1px 0 0;
 transition:height 0.5s cubic-bezier(0.4,0,0.2,1);box-shadow:0 0 5px var(--neon-cyan);animation:spark-glow 2s ease-in-out infinite}
@@ -901,7 +901,7 @@ transition:height 0.5s cubic-bezier(0.4,0,0.2,1);box-shadow:0 0 5px var(--neon-c
 @keyframes spark-glow{0%,100%{opacity:0.85}50%{opacity:1}}
 .gauge-arc{animation:arc-glow 2s ease-in-out infinite}
 @keyframes arc-glow{0%,100%{filter:brightness(1) drop-shadow(0 0 3px currentColor)}50%{filter:brightness(1.2) drop-shadow(0 0 8px currentColor)}}
-.progress-label{display:flex;justify-content:space-between;font-size:0.85em;color:#888;
+.progress-label{display:flex;justify-content:space-between;font-size:1em;color:#888;
 font-family:'Rajdhani',sans-serif;letter-spacing:1px}
 .stat-row{margin:10px 0}
 .queue-badge{background:var(--neon-yellow);color:#000;padding:3px 10px;border-radius:2px;font-size:0.8em;
@@ -910,12 +910,12 @@ font-family:'Orbitron',monospace;font-weight:bold;box-shadow:0 0 10px var(--neon
 .gauge-row{display:flex;gap:15px;margin:20px 0;justify-content:center;flex-wrap:wrap}
 .gauge{text-align:center;position:relative}
 .gauge svg{filter:drop-shadow(0 0 10px var(--neon-cyan))}
-.gauge-label{font-family:'Orbitron',monospace;font-size:0.7em;color:#666;margin-top:8px;
+.gauge-label{font-family:'Orbitron',monospace;font-size:0.85em;color:#888;margin-top:8px;
 letter-spacing:2px;text-transform:uppercase}
-.gauge-value{font-family:'Orbitron',monospace;font-size:1.1em;font-weight:bold;margin-top:4px;
+.gauge-value{font-family:'Orbitron',monospace;font-size:1.3em;font-weight:bold;margin-top:4px;
 color:var(--neon-cyan);text-shadow:0 0 10px var(--neon-cyan)}
 .power-btn{background:transparent;color:var(--neon-yellow);border:1px solid var(--neon-yellow);
-padding:8px 16px;border-radius:4px;cursor:pointer;font-family:'Orbitron',monospace;font-size:0.75em;
+padding:10px 18px;border-radius:4px;cursor:pointer;font-family:'Orbitron',monospace;font-size:0.9em;
 letter-spacing:1px;text-transform:uppercase;transition:all 0.3s;margin-top:10px}
 .power-btn:hover{background:var(--neon-yellow);color:#000;box-shadow:var(--glow-yellow)}
 .job-time{color:#666;font-size:0.9em}
@@ -965,7 +965,7 @@ function progressBar(percent, cls, id) {
     return '<div class="progress-bar"><div id="' + barId + '" class="progress-fill ' + barClass + '" style="width:' + percent + '%"></div></div>';
 }
 
-function renderGauge(value, min, max, label, unit, showLimit, size) {
+function renderGauge(value, min, max, label, unit, showLimit, size, reverseColors) {
     const s = size || 1;
     const w = Math.round(120 * s);
     const h = Math.round(70 * s);
@@ -986,10 +986,18 @@ function renderGauge(value, min, max, label, unit, showLimit, size) {
     const dashOffset = arcLength * (1 - percent / 100);
 
     // Color based on percentage
-    let color = '#39ff14';  // neon green
-    let glow = '#39ff14';
-    if (percent > 90) { color = '#ff0044'; glow = '#ff0044'; }
-    else if (percent > 70) { color = '#ffff00'; glow = '#ffff00'; }
+    let color, glow;
+    if (reverseColors) {
+        // For utilization: low is bad, high is good
+        if (percent < 5) { color = '#ff0044'; glow = '#ff0044'; }        // Red: idle
+        else if (percent < 25) { color = '#ffff00'; glow = '#ffff00'; }  // Yellow: light use
+        else { color = '#39ff14'; glow = '#39ff14'; }                     // Green: working!
+    } else {
+        // Normal: low is good, high is bad
+        if (percent > 90) { color = '#ff0044'; glow = '#ff0044'; }
+        else if (percent > 70) { color = '#ffff00'; glow = '#ffff00'; }
+        else { color = '#39ff14'; glow = '#39ff14'; }
+    }
 
     const displayValue = showLimit ? Math.round(value) + '/' + max + unit : Math.round(value) + unit;
 
@@ -1066,7 +1074,7 @@ function refresh() {
             if (info.online && info.gpu) {
                 // Gauges in 2x2 grid: GPU Util + CPU on top, GPU Temp + GPU Power below
                 html += '<div class="gauge-row">';
-                html += renderGauge(info.gpu_util, 0, 100, "GPU Util", "%", false, 1.2);
+                html += renderGauge(info.gpu_util, 0, 100, "GPU Util", "%", false, 1.2, true);
                 html += renderGauge(info.cpu_percent, 0, 100, "CPU Util", "%", false);
                 html += '</div>';
                 html += '<div class="gauge-row">';
@@ -1125,7 +1133,7 @@ function refresh() {
                 if (info.cpu_percent !== null || info.gpu_watts !== null) {
                     html += '<div style="color:#d9a54a;font-size:0.9em;margin-bottom:10px">ComfyUI offline - showing system metrics</div>';
                     html += '<div class="gauge-row">';
-                    html += renderGauge(info.gpu_util, 0, 100, "GPU Util", "%", false, 1.2);
+                    html += renderGauge(info.gpu_util, 0, 100, "GPU Util", "%", false, 1.2, true);
                     html += renderGauge(info.cpu_percent, 0, 100, "CPU Util", "%", false);
                     html += '</div>';
                     html += '<div class="gauge-row">';
