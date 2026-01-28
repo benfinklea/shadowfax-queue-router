@@ -900,14 +900,30 @@ function progressBar(percent, cls) {
     return '<div class="progress-bar"><div class="progress-fill ' + cls + '" style="width:' + percent + '%;' + style + '"></div></div>';
 }
 
-function renderGauge(value, limit, max, label, unit, showLimit) {
+function renderGauge(value, min, max, label, unit, showLimit, size) {
+    const s = size || 1;
+    const w = Math.round(100 * s);
+    const h = Math.round(50 * s);
+    const needleH = Math.round(42 * s);
+    const centerSize = Math.round(14 * s);
+    const maskPct = 80;
+
+    const sizeStyle = 'width:' + w + 'px';
+    const dialStyle = 'width:' + w + 'px;height:' + h + 'px';
+    const needleStyle = 'height:' + needleH + 'px;margin-left:-' + (1.5 * s) + 'px;width:' + (3 * s) + 'px';
+    const centerStyle = 'width:' + centerSize + 'px;height:' + centerSize + 'px;margin-left:-' + (centerSize/2) + 'px;bottom:-' + (centerSize/2 - 2) + 'px';
+
     if (value === null) {
-        return '<div class="gauge"><div class="gauge-dial"><div class="gauge-bg"></div><div class="gauge-mask"></div><div class="gauge-needle" style="transform:rotate(-90deg)"></div><div class="gauge-center"></div></div><div class="gauge-label">' + label + '</div><div class="gauge-value">--</div></div>';
+        return '<div class="gauge" style="' + sizeStyle + '"><div class="gauge-dial" style="' + dialStyle + '"><div class="gauge-bg"></div><div class="gauge-mask"></div><div class="gauge-needle" style="transform:rotate(-90deg);' + needleStyle + '"></div><div class="gauge-center" style="' + centerStyle + '"></div></div><div class="gauge-label">' + label + '</div><div class="gauge-value">--</div></div>';
     }
-    const percent = Math.min(100, (value / max) * 100);
+
+    // Calculate percentage based on min-max range
+    const clampedValue = Math.max(min, Math.min(max, value));
+    const percent = ((clampedValue - min) / (max - min)) * 100;
     const angle = -90 + (percent * 1.8);
     const displayValue = showLimit ? Math.round(value) + '/' + max + unit : Math.round(value) + unit;
-    return '<div class="gauge"><div class="gauge-dial"><div class="gauge-bg"></div><div class="gauge-mask"></div><div class="gauge-needle" style="transform:rotate(' + angle + 'deg)"></div><div class="gauge-center"></div></div><div class="gauge-label">' + label + '</div><div class="gauge-value">' + displayValue + '</div></div>';
+
+    return '<div class="gauge" style="' + sizeStyle + '"><div class="gauge-dial" style="' + dialStyle + '"><div class="gauge-bg"></div><div class="gauge-mask"></div><div class="gauge-needle" style="transform:rotate(' + angle + 'deg);' + needleStyle + '"></div><div class="gauge-center" style="' + centerStyle + '"></div></div><div class="gauge-label">' + label + '</div><div class="gauge-value">' + displayValue + '</div></div>';
 }
 
 function setupPowerButtons() {
@@ -970,12 +986,12 @@ function refresh() {
             if (info.online && info.gpu) {
                 // Gauges in 2x2 grid: GPU Util + CPU on top, GPU Temp + GPU Power below
                 html += '<div class="gauge-row">';
-                html += renderGauge(info.gpu_util, 100, 100, "GPU Util", "%", false);
-                html += renderGauge(info.cpu_percent, 100, 100, "CPU Util", "%", false);
+                html += renderGauge(info.gpu_util, 0, 100, "GPU Util", "%", false, 1.2);
+                html += renderGauge(info.cpu_percent, 0, 100, "CPU Util", "%", false);
                 html += '</div>';
                 html += '<div class="gauge-row">';
-                html += renderGauge(info.gpu_temp, 90, 90, "GPU Temp", "°C", false);
-                html += renderGauge(info.gpu_watts, info.gpu_power_limit, info.gpu_power_max, "GPU Power", "W", true);
+                html += renderGauge(info.gpu_temp, 24, 90, "GPU Temp", "°C", false);
+                html += renderGauge(info.gpu_watts, 0, info.gpu_power_max, "GPU Power", "W", true);
                 html += '</div>';
                 html += '<button class="power-btn" data-target="' + name + '" data-current="' + info.gpu_power_limit + '" data-max="' + info.gpu_power_max + '">⚡ Set Power Limit</button>';
 
@@ -1029,12 +1045,12 @@ function refresh() {
                 if (info.cpu_percent !== null || info.gpu_watts !== null) {
                     html += '<div style="color:#d9a54a;font-size:0.9em;margin-bottom:10px">ComfyUI offline - showing system metrics</div>';
                     html += '<div class="gauge-row">';
-                    html += renderGauge(info.gpu_util, 100, 100, "GPU Util", "%", false);
-                    html += renderGauge(info.cpu_percent, 100, 100, "CPU Util", "%", false);
+                    html += renderGauge(info.gpu_util, 0, 100, "GPU Util", "%", false, 1.2);
+                    html += renderGauge(info.cpu_percent, 0, 100, "CPU Util", "%", false);
                     html += '</div>';
                     html += '<div class="gauge-row">';
-                    html += renderGauge(info.gpu_temp, 90, 90, "GPU Temp", "°C", false);
-                    html += renderGauge(info.gpu_watts, info.gpu_power_limit, info.gpu_power_max, "GPU Power", "W", true);
+                    html += renderGauge(info.gpu_temp, 24, 90, "GPU Temp", "°C", false);
+                    html += renderGauge(info.gpu_watts, 0, info.gpu_power_max, "GPU Power", "W", true);
                     html += '</div>';
                     if (info.gpu_watts !== null) {
                         html += '<button class="power-btn" data-target="' + name + '" data-current="' + info.gpu_power_limit + '" data-max="' + info.gpu_power_max + '">⚡ Set Power Limit</button>';
