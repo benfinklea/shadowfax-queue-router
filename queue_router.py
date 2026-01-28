@@ -801,64 +801,127 @@ def set_power_limit():
 @app.route("/")
 def index():
     """Dashboard home page."""
-    return '''<!DOCTYPE html><html><head><title>Shadowfax Queue Router</title>
+    return '''<!DOCTYPE html><html><head><title>SHADOWFAX // QUEUE ROUTER</title>
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Rajdhani:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
-body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#1a1a2e;color:#eee;padding:40px;max-width:1000px;margin:0 auto}
-h1{color:#5a8a4a;border-bottom:2px solid #5a8a4a;padding-bottom:10px}
-h3{margin-top:0;color:#ccc}
-.card{background:#16213e;padding:20px;border-radius:8px;margin:20px 0}
-.online{color:#5a8a4a;font-weight:bold}.offline{color:#d94a4a;font-weight:bold}
-.job{padding:8px 12px;border-left:3px solid #5a8a4a;margin:5px 0;background:#0f0f1a;border-radius:0 4px 4px 0}
-.job.video{border-color:#d9a54a}
-.job.completed{opacity:0.8}
-pre{background:#0f0f1a;padding:15px;border-radius:5px;overflow-x:auto}
-table{width:100%;border-collapse:collapse}td,th{padding:10px;text-align:left;border-bottom:1px solid #333}
-.target-name{font-weight:bold;text-transform:capitalize}
-.gpu-card{background:#0f0f1a;padding:15px;border-radius:8px;margin:10px 0}
-.gpu-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
-.gpu-name{font-size:1.1em;font-weight:bold;text-transform:capitalize}
-.progress-bar{background:#333;border-radius:4px;height:20px;overflow:hidden;margin:5px 0}
-.progress-fill{height:100%;transition:width 0.3s}
-.progress-vram{background:linear-gradient(90deg,#5a8a4a,#8ac45a)}
-.progress-ram{background:linear-gradient(90deg,#5a8a4a,#8ac45a)}
-.progress-disk{background:linear-gradient(90deg,#5a8a4a,#8ac45a)}
-.progress-swap{background:linear-gradient(90deg,#8a4a4a,#c45a5a)}
-.io-stats{display:flex;gap:15px;margin-top:10px;font-size:0.85em;color:#888}
-.io-stat{display:flex;align-items:center;gap:5px}
-.io-stat .value{color:#5a8a4a;font-weight:bold}
-.io-stat.warning .value{color:#d9a54a}
-.io-stat.danger .value{color:#d94a4a}
-.history-section{margin-top:20px}
-.time-range{display:flex;gap:5px;margin-bottom:10px}
-.time-range button{background:#333;color:#ccc;border:1px solid #555;padding:6px 12px;border-radius:4px;cursor:pointer;font-size:0.8em}
-.time-range button:hover{background:#444}
-.time-range button.active{background:#5a8a4a;border-color:#5a8a4a;color:#fff}
-.sparkline-container{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}
-.sparkline-box{background:#0f0f1a;padding:10px;border-radius:6px}
-.sparkline-label{font-size:0.75em;color:#888;margin-bottom:5px}
-.sparkline{height:40px;display:flex;align-items:end;gap:1px}
-.sparkline-bar{background:#5a8a4a;min-width:2px;border-radius:1px 1px 0 0;transition:height 0.2s}
-.sparkline-bar.high{background:#d9a54a}
-.sparkline-bar.critical{background:#d94a4a}
-.progress-label{display:flex;justify-content:space-between;font-size:0.85em;color:#888}
-.stat-row{margin:8px 0}
-.queue-badge{background:#d9a54a;color:#000;padding:2px 8px;border-radius:10px;font-size:0.8em}
-.queue-badge.empty{background:#333;color:#888}
-.gauge-row{display:flex;gap:20px;margin-top:15px;justify-content:center}
-.gauge{text-align:center;width:100px}
-.gauge-dial{position:relative;width:100px;height:50px;border-radius:100px 100px 0 0;overflow:hidden;background:#222}
-.gauge-bg{position:absolute;width:100%;height:200%;border-radius:50%;background:conic-gradient(from 0.75turn,#5a8a4a 0deg,#5a8a4a 126deg,#d9a54a 126deg,#d9a54a 162deg,#d94a4a 162deg,#d94a4a 180deg,transparent 180deg)}
-.gauge-mask{position:absolute;bottom:0;left:10%;width:80%;height:80%;background:#0f0f1a;border-radius:100px 100px 0 0}
-.gauge-needle{position:absolute;bottom:0;left:50%;width:3px;height:42px;background:linear-gradient(to top,#fff 0%,#fff 70%,#d94a4a 100%);transform-origin:bottom center;transform:rotate(-90deg);transition:transform 0.3s;border-radius:2px;margin-left:-1.5px}
-.gauge-center{position:absolute;bottom:-5px;left:50%;width:14px;height:14px;background:#333;border:2px solid #555;border-radius:50%;margin-left:-7px}
-.gauge-label{font-size:0.75em;color:#888;margin-top:8px}
-.gauge-value{font-size:1em;font-weight:bold;margin-top:2px}
-.power-btn{background:#3a3a3a;color:#ccc;border:1px solid #555;padding:6px 12px;border-radius:4px;cursor:pointer;font-size:0.85em;margin-top:8px}
-.power-btn:hover{background:#4a4a4a;border-color:#666}
-.job-time{color:#888;font-size:0.9em}
-.job-duration{color:#5a8a4a;font-weight:bold}
+:root{
+--neon-cyan:#00fff2;--neon-magenta:#ff00ff;--neon-blue:#00a8ff;--neon-green:#39ff14;
+--neon-yellow:#ffff00;--neon-orange:#ff6600;--neon-red:#ff0044;
+--bg-dark:#0a0a0f;--bg-card:#0d1117;--bg-panel:#161b22;
+--glow-cyan:0 0 10px #00fff2,0 0 20px #00fff2,0 0 40px #00fff288;
+--glow-green:0 0 10px #39ff14,0 0 20px #39ff14,0 0 40px #39ff1488;
+--glow-red:0 0 10px #ff0044,0 0 20px #ff0044,0 0 40px #ff004488;
+--glow-yellow:0 0 10px #ffff00,0 0 20px #ffff00,0 0 40px #ffff0088;
+}
+*{box-sizing:border-box}
+body{font-family:'Rajdhani',sans-serif;background:var(--bg-dark);color:#e0e0e0;padding:20px;margin:0;
+background-image:radial-gradient(ellipse at top,#0d1a2d 0%,transparent 50%),
+linear-gradient(180deg,transparent 0%,rgba(0,255,242,0.03) 100%);min-height:100vh}
+@media(min-width:768px){body{padding:20px 40px}}
+@media(max-width:767px){
+h1{font-size:1.2em;letter-spacing:2px}
+.gauge-row{gap:10px}
+.gauge{transform:scale(0.85)}
+.gpu-card{padding:15px}
+.io-stats{flex-wrap:wrap;gap:10px}
+.time-range{flex-wrap:wrap}
+.sparkline-container{grid-template-columns:1fr 1fr}
+}
+body::before{content:'';position:fixed;top:0;left:0;right:0;bottom:0;
+background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,0,0,0.1) 2px,rgba(0,0,0,0.1) 4px);
+pointer-events:none;z-index:9999;opacity:0.3}
+h1{font-family:'Orbitron',monospace;color:var(--neon-cyan);font-size:1.8em;font-weight:900;letter-spacing:4px;
+text-shadow:var(--glow-cyan);border-bottom:2px solid var(--neon-cyan);padding-bottom:15px;margin-bottom:30px;
+text-transform:uppercase}
+h1::before{content:'◈ ';color:var(--neon-magenta)}
+h1::after{content:' ◈';color:var(--neon-magenta)}
+h3{margin-top:0;color:var(--neon-cyan);font-family:'Orbitron',monospace;font-size:0.9em;letter-spacing:2px;
+text-transform:uppercase;text-shadow:0 0 10px var(--neon-cyan)}
+h3::before{content:'▸ '}
+.card{background:var(--bg-card);padding:20px;border-radius:4px;margin:20px 0;
+border:1px solid #1a2332;box-shadow:0 0 20px rgba(0,255,242,0.1),inset 0 0 60px rgba(0,0,0,0.3)}
+.card::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;
+background:linear-gradient(90deg,transparent,var(--neon-cyan),transparent)}
+.online{color:var(--neon-green);font-weight:bold;text-shadow:var(--glow-green);animation:pulse 2s infinite}
+.offline{color:var(--neon-red);font-weight:bold;text-shadow:var(--glow-red);animation:pulse 1s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.7}}
+@keyframes glow-pulse{0%,100%{filter:brightness(1)}50%{filter:brightness(1.3)}}
+.job{padding:10px 15px;border-left:3px solid var(--neon-cyan);margin:8px 0;background:var(--bg-panel);
+border-radius:0 4px 4px 0;font-family:'Rajdhani',sans-serif;transition:all 0.3s}
+.job:hover{background:#1a2332;border-left-color:var(--neon-magenta);box-shadow:0 0 15px rgba(0,255,242,0.2)}
+.job.video{border-color:var(--neon-magenta)}
+.job.completed{opacity:0.7}
+pre{background:var(--bg-panel);padding:15px;border-radius:4px;overflow-x:auto;border:1px solid #1a2332;
+font-family:'Rajdhani',monospace;color:var(--neon-cyan)}
+table{width:100%;border-collapse:collapse}
+td,th{padding:12px;text-align:left;border-bottom:1px solid #1a2332}
+th{color:var(--neon-cyan);font-family:'Orbitron',monospace;font-size:0.8em;letter-spacing:1px}
+.gpu-card{background:linear-gradient(135deg,var(--bg-panel) 0%,var(--bg-card) 100%);
+padding:20px;border-radius:8px;margin:10px 0;border:1px solid #1a2332;position:relative;overflow:hidden}
+.gpu-card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;
+background:linear-gradient(90deg,var(--neon-cyan),var(--neon-magenta),var(--neon-cyan))}
+.gpu-card::after{content:'';position:absolute;top:0;right:0;width:100px;height:100px;
+background:radial-gradient(circle,rgba(0,255,242,0.1) 0%,transparent 70%);pointer-events:none}
+.gpu-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:15px}
+.gpu-name{font-family:'Orbitron',monospace;font-size:1.1em;font-weight:700;text-transform:uppercase;
+letter-spacing:2px;color:var(--neon-cyan);text-shadow:0 0 10px var(--neon-cyan)}
+.progress-bar{background:#1a1a2e;border-radius:2px;height:24px;overflow:hidden;margin:5px 0;
+border:1px solid #2a2a4e;position:relative}
+.progress-bar::before{content:'';position:absolute;top:0;left:0;right:0;bottom:0;
+background:repeating-linear-gradient(90deg,transparent,transparent 10px,rgba(255,255,255,0.03) 10px,rgba(255,255,255,0.03) 20px)}
+.progress-fill{height:100%;transition:width 1s cubic-bezier(0.4,0,0.2,1);position:relative;animation:bar-breathe 3s ease-in-out infinite}
+.progress-fill::after{content:'';position:absolute;top:0;right:0;width:30px;height:100%;
+background:linear-gradient(90deg,transparent,rgba(255,255,255,0.4));animation:shimmer 2s ease-in-out infinite}
+@keyframes bar-breathe{0%,100%{filter:brightness(1)}50%{filter:brightness(1.15)}}
+@keyframes shimmer{0%,100%{opacity:0.3}50%{opacity:0.8}}
+.progress-vram,.progress-ram,.progress-disk{background:linear-gradient(90deg,#00ff8844,var(--neon-green));box-shadow:0 0 20px #39ff1466}
+.progress-swap{background:linear-gradient(90deg,#ff004444,var(--neon-red));box-shadow:0 0 20px #ff004466}
+.progress-yellow{background:linear-gradient(90deg,#ffaa0044,var(--neon-yellow));box-shadow:0 0 20px #ffff0066}
+.progress-red{background:linear-gradient(90deg,#ff004444,var(--neon-red));box-shadow:0 0 20px #ff004466}
+.io-stats{display:flex;gap:20px;margin-top:15px;font-size:0.9em;padding:10px;background:var(--bg-dark);border-radius:4px;border:1px solid #1a2332}
+.io-stat{display:flex;align-items:center;gap:8px}
+.io-stat .value{color:var(--neon-cyan);font-weight:bold;font-family:'Orbitron',monospace;text-shadow:0 0 10px var(--neon-cyan)}
+.io-stat.warning .value{color:var(--neon-yellow);text-shadow:0 0 10px var(--neon-yellow)}
+.io-stat.danger .value{color:var(--neon-red);text-shadow:0 0 10px var(--neon-red)}
+.time-range{display:flex;gap:8px;margin-bottom:15px}
+.time-range button{background:var(--bg-panel);color:#888;border:1px solid #2a2a4e;padding:8px 16px;
+border-radius:4px;cursor:pointer;font-family:'Orbitron',monospace;font-size:0.75em;letter-spacing:1px;
+text-transform:uppercase;transition:all 0.3s}
+.time-range button:hover{border-color:var(--neon-cyan);color:var(--neon-cyan);box-shadow:0 0 15px rgba(0,255,242,0.3)}
+.time-range button.active{background:transparent;border-color:var(--neon-cyan);color:var(--neon-cyan);
+box-shadow:var(--glow-cyan)}
+.sparkline-container{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
+.sparkline-box{background:var(--bg-panel);padding:12px;border-radius:4px;border:1px solid #1a2332}
+.sparkline-label{font-size:0.75em;color:#666;margin-bottom:8px;font-family:'Orbitron',monospace;letter-spacing:1px}
+.sparkline{height:45px;display:flex;align-items:end;gap:2px}
+.sparkline-bar{background:var(--neon-cyan);min-width:3px;border-radius:1px 1px 0 0;
+transition:height 0.5s cubic-bezier(0.4,0,0.2,1);box-shadow:0 0 5px var(--neon-cyan);animation:spark-glow 2s ease-in-out infinite}
+.sparkline-bar.high{background:var(--neon-yellow);box-shadow:0 0 5px var(--neon-yellow)}
+.sparkline-bar.critical{background:var(--neon-red);box-shadow:0 0 5px var(--neon-red)}
+@keyframes spark-glow{0%,100%{opacity:0.85}50%{opacity:1}}
+.gauge-arc{animation:arc-glow 2s ease-in-out infinite}
+@keyframes arc-glow{0%,100%{filter:brightness(1) drop-shadow(0 0 3px currentColor)}50%{filter:brightness(1.2) drop-shadow(0 0 8px currentColor)}}
+.progress-label{display:flex;justify-content:space-between;font-size:0.85em;color:#888;
+font-family:'Rajdhani',sans-serif;letter-spacing:1px}
+.stat-row{margin:10px 0}
+.queue-badge{background:var(--neon-yellow);color:#000;padding:3px 10px;border-radius:2px;font-size:0.8em;
+font-family:'Orbitron',monospace;font-weight:bold;box-shadow:0 0 10px var(--neon-yellow)}
+.queue-badge.empty{background:#2a2a4e;color:#666;box-shadow:none}
+.gauge-row{display:flex;gap:15px;margin:20px 0;justify-content:center;flex-wrap:wrap}
+.gauge{text-align:center;position:relative}
+.gauge svg{filter:drop-shadow(0 0 10px var(--neon-cyan))}
+.gauge-label{font-family:'Orbitron',monospace;font-size:0.7em;color:#666;margin-top:8px;
+letter-spacing:2px;text-transform:uppercase}
+.gauge-value{font-family:'Orbitron',monospace;font-size:1.1em;font-weight:bold;margin-top:4px;
+color:var(--neon-cyan);text-shadow:0 0 10px var(--neon-cyan)}
+.power-btn{background:transparent;color:var(--neon-yellow);border:1px solid var(--neon-yellow);
+padding:8px 16px;border-radius:4px;cursor:pointer;font-family:'Orbitron',monospace;font-size:0.75em;
+letter-spacing:1px;text-transform:uppercase;transition:all 0.3s;margin-top:10px}
+.power-btn:hover{background:var(--neon-yellow);color:#000;box-shadow:var(--glow-yellow)}
+.job-time{color:#666;font-size:0.9em}
+.job-duration{color:var(--neon-green);font-weight:bold;font-family:'Orbitron',monospace;text-shadow:0 0 5px var(--neon-green)}
 </style></head>
-<body><h1>🐴 Shadowfax Queue Router</h1>
+<body><h1>SHADOWFAX // QUEUE ROUTER</h1>
 
 <div class=card id=monitors><h3>📊 Live Monitoring</h3><p>Loading...</p></div>
 <div class=card id=history>
@@ -894,36 +957,53 @@ GET  /api/health  - Health check</pre>
 <script>
 const icons = {gandalf: "🧙", frodo: "🧝", shadowfax: "🐴"};
 
-function progressBar(percent, cls) {
-    const color = percent > 90 ? "#d94a4a" : percent > 70 ? "#d9a54a" : "";
-    const style = color ? "background:" + color : "";
-    return '<div class="progress-bar"><div class="progress-fill ' + cls + '" style="width:' + percent + '%;' + style + '"></div></div>';
+function progressBar(percent, cls, id) {
+    let barClass = cls;
+    if (percent > 90) barClass = 'progress-red';
+    else if (percent > 70) barClass = 'progress-yellow';
+    const barId = id || 'bar-' + Math.random().toString(36).substr(2,9);
+    return '<div class="progress-bar"><div id="' + barId + '" class="progress-fill ' + barClass + '" style="width:' + percent + '%"></div></div>';
 }
 
 function renderGauge(value, min, max, label, unit, showLimit, size) {
     const s = size || 1;
-    const w = Math.round(100 * s);
-    const h = Math.round(50 * s);
-    const needleH = Math.round(42 * s);
-    const centerSize = Math.round(14 * s);
-    const maskPct = 80;
-
-    const sizeStyle = 'width:' + w + 'px';
-    const dialStyle = 'width:' + w + 'px;height:' + h + 'px';
-    const needleStyle = 'height:' + needleH + 'px;margin-left:-' + (1.5 * s) + 'px;width:' + (3 * s) + 'px';
-    const centerStyle = 'width:' + centerSize + 'px;height:' + centerSize + 'px;margin-left:-' + (centerSize/2) + 'px;bottom:-' + (centerSize/2 - 2) + 'px';
+    const w = Math.round(120 * s);
+    const h = Math.round(70 * s);
+    const r = 45 * s;
+    const strokeW = 8 * s;
+    const cx = w / 2;
+    const cy = h - 5;
 
     if (value === null) {
-        return '<div class="gauge" style="' + sizeStyle + '"><div class="gauge-dial" style="' + dialStyle + '"><div class="gauge-bg"></div><div class="gauge-mask"></div><div class="gauge-needle" style="transform:rotate(-90deg);' + needleStyle + '"></div><div class="gauge-center" style="' + centerStyle + '"></div></div><div class="gauge-label">' + label + '</div><div class="gauge-value">--</div></div>';
+        return '<div class="gauge" style="width:' + w + 'px"><svg width="' + w + '" height="' + h + '" viewBox="0 0 ' + w + ' ' + h + '">' +
+            '<path d="M ' + (cx - r) + ' ' + cy + ' A ' + r + ' ' + r + ' 0 0 1 ' + (cx + r) + ' ' + cy + '" fill="none" stroke="#1a2332" stroke-width="' + strokeW + '" stroke-linecap="round"/>' +
+            '</svg><div class="gauge-label">' + label + '</div><div class="gauge-value">--</div></div>';
     }
 
-    // Calculate percentage based on min-max range
     const clampedValue = Math.max(min, Math.min(max, value));
     const percent = ((clampedValue - min) / (max - min)) * 100;
-    const angle = -90 + (percent * 1.8);
+    const arcLength = Math.PI * r;
+    const dashOffset = arcLength * (1 - percent / 100);
+
+    // Color based on percentage
+    let color = '#39ff14';  // neon green
+    let glow = '#39ff14';
+    if (percent > 90) { color = '#ff0044'; glow = '#ff0044'; }
+    else if (percent > 70) { color = '#ffff00'; glow = '#ffff00'; }
+
     const displayValue = showLimit ? Math.round(value) + '/' + max + unit : Math.round(value) + unit;
 
-    return '<div class="gauge" style="' + sizeStyle + '"><div class="gauge-dial" style="' + dialStyle + '"><div class="gauge-bg"></div><div class="gauge-mask"></div><div class="gauge-needle" style="transform:rotate(' + angle + 'deg);' + needleStyle + '"></div><div class="gauge-center" style="' + centerStyle + '"></div></div><div class="gauge-label">' + label + '</div><div class="gauge-value">' + displayValue + '</div></div>';
+    return '<div class="gauge" style="width:' + w + 'px">' +
+        '<svg width="' + w + '" height="' + h + '" viewBox="0 0 ' + w + ' ' + h + '" style="filter:drop-shadow(0 0 10px ' + glow + ')">' +
+        '<defs><linearGradient id="grad-' + label.replace(/\\s/g,'') + '" x1="0%" y1="0%" x2="100%" y2="0%">' +
+        '<stop offset="0%" style="stop-color:#1a2332"/>' +
+        '<stop offset="100%" style="stop-color:#2a3342"/></linearGradient></defs>' +
+        '<path d="M ' + (cx - r) + ' ' + cy + ' A ' + r + ' ' + r + ' 0 0 1 ' + (cx + r) + ' ' + cy + '" fill="none" stroke="url(#grad-' + label.replace(/\\s/g,'') + ')" stroke-width="' + (strokeW + 4) + '" stroke-linecap="round"/>' +
+        '<path class="gauge-arc" d="M ' + (cx - r) + ' ' + cy + ' A ' + r + ' ' + r + ' 0 0 1 ' + (cx + r) + ' ' + cy + '" fill="none" stroke="' + color + '" stroke-width="' + strokeW + '" stroke-linecap="round" stroke-dasharray="' + arcLength + '" stroke-dashoffset="' + dashOffset + '" style="transition:stroke-dashoffset 0.8s ease-out,stroke 0.5s"/>' +
+        '<circle cx="' + cx + '" cy="' + cy + '" r="' + (6 * s) + '" fill="#0a0a0f" stroke="' + color + '" stroke-width="2"/>' +
+        '</svg>' +
+        '<div class="gauge-label">' + label + '</div>' +
+        '<div class="gauge-value" style="color:' + color + ';text-shadow:0 0 10px ' + glow + '">' + displayValue + '</div></div>';
 }
 
 function setupPowerButtons() {
@@ -971,7 +1051,7 @@ function formatJobTime(isoString) {
 
 function refresh() {
     fetch("/api/status").then(r => r.json()).then(data => {
-        let html = '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:15px">';
+        let html = '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:20px">';
 
         for (const [name, info] of Object.entries(data.targets)) {
             const icon = icons[name] || "🖥️";
