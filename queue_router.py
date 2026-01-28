@@ -705,6 +705,19 @@ def get_status():
         }
 
     conn = sqlite3.connect(CONFIG["db_path"])
+
+    # Get jobs today count per target
+    today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    cursor = conn.execute(
+        "SELECT target, COUNT(*) FROM jobs WHERE submitted_at >= ? GROUP BY target",
+        (today_start,)
+    )
+    jobs_today = {row[0]: row[1] for row in cursor.fetchall()}
+
+    # Add jobs_today to each target
+    for name in targets_status:
+        targets_status[name]["jobs_today"] = jobs_today.get(name, 0)
+
     cursor = conn.execute(
         "SELECT id, target, status, submitted_at FROM jobs ORDER BY submitted_at DESC LIMIT 10"
     )
@@ -837,7 +850,6 @@ h1::before{content:'◈ ';color:var(--neon-magenta)}
 h1::after{content:' ◈';color:var(--neon-magenta)}
 h3{margin-top:0;color:var(--neon-cyan);font-family:'Orbitron',monospace;font-size:1.1em;letter-spacing:2px;
 text-transform:uppercase;text-shadow:0 0 10px var(--neon-cyan)}
-h3::before{content:'▸ '}
 .card{background:var(--bg-card);padding:20px;border-radius:4px;margin:20px 0;
 border:1px solid #1a2332;box-shadow:0 0 20px rgba(0,255,242,0.1),inset 0 0 60px rgba(0,0,0,0.3)}
 .card::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;
@@ -1126,9 +1138,11 @@ function refresh() {
             html += '<div class="gpu-card">';
             html += '<div class="gpu-header"><span class="gpu-name">' + icon + ' ' + name + '</span>' + status + '</div>';
 
-            // Queue info below name
+            // Jobs today and queue info below name
             const queueCount = info.queue_running + info.queue_pending;
+            const jobsToday = info.jobs_today || 0;
             html += '<div class="queue-info">';
+            html += '<div class="jobs-today">' + jobsToday + ' jobs today</div>';
             html += '<div class="queue-count">' + queueCount + ' Queued</div>';
             html += '</div>';
 
@@ -1224,10 +1238,10 @@ function refresh() {
     });
 
     fetch("/api/logs").then(r => r.json()).then(data => {
-        // Build filter buttons
-        const targets = [...new Set(data.jobs.map(j => j.target))];
+        // Build filter buttons - show all known targets, not just ones with jobs
+        const knownTargets = ['gandalf', 'frodo'];
         let filterHtml = '<button class="job-filter active" data-target="all">ALL</button>';
-        targets.forEach(t => {
+        knownTargets.forEach(t => {
             const icon = icons[t] || "🖥️";
             filterHtml += '<button class="job-filter" data-target="' + t + '">' + icon + ' ' + t.toUpperCase() + '</button>';
         });
@@ -1256,10 +1270,9 @@ function refresh() {
 
 function renderJobs(targetFilter) {
     const jobs = window.allJobs || [];
-    const jobsToday = window.jobsToday || 0;
     const filtered = targetFilter === 'all' ? jobs : jobs.filter(j => j.target === targetFilter);
 
-    let html = '<div class="jobs-today">' + jobsToday + ' jobs today</div>';
+    let html = '';
     if (filtered.length === 0) {
         html += "<p style='color:#888'>No jobs yet - use the Router button in ComfyUI!</p>";
     } else {
