@@ -151,6 +151,130 @@ def check_job_completion():
 
         time.sleep(5)  # Check every 5 seconds
 
+def sync_comfyui_jobs():
+    """Background thread to sync job history from ComfyUI instances."""
+    # Wait a bit for startup
+    time.sleep(10)
+
+    while True:
+        try:
+            conn = sqlite3.connect(CONFIG["db_path"])
+            jobs_added = 0
+
+            for target_name, target_config in CONFIG["targets"].items():
+                try:
+                    target_url = target_config.get("url")
+                    if not target_url:
+                        continue
+
+                    # Fetch recent history from ComfyUI
+                    response = requests.get(f"{target_url}/history?max_items=50", timeout=10)
+                    if not response.ok:
+                        logger.debug(f"  Failed to fetch history from {target_name}: {response.status_code}")
+                        continue
+
+                    history = response.json()
+
+                    for prompt_id, job_data in history.items():
+                        # Check if this job already exists in our database
+                        cursor = conn.execute("SELECT id FROM jobs WHERE id = ?", (prompt_id[:8],))
+                        if cursor.fetchone():
+                            continue  # Already tracked
+
+                        # Extract job info from ComfyUI history
+                        prompt_info = job_data.get("prompt", [])
+                        status_info = job_data.get("status", {})
+                        outputs = job_data.get("outputs", {})
+
+                        # Get timestamps
+                        status_msgs = status_info.get("status_str", "")
+                        completed = status_info.get("completed", False)
+
+                        # Try to get execution time from status
+                        exec_info = status_info.get("messages", [])
+                        start_time = None
+                        end_time = None
+                        for msg in exec_info:
+                            if len(msg) >= 2:
+                                if msg[0] == "execution_start":
+                                    start_time = msg[1].get("timestamp") if isinstance(msg[1], dict) else None
+                                elif msg[0] == "execution_success":
+                                    end_time = msg[1].get("timestamp") if isinstance(msg[1], dict) else None
+
+                        # Use current time as submitted_at if we don't have better info
+                        # ComfyUI timestamps are in milliseconds, convert to seconds
+                        submitted_at = datetime.now().isoformat()
+                        if start_time:
+                            submitted_at = datetime.fromtimestamp(start_time / 1000).isoformat()
+
+                        completed_at = None
+                        if completed and end_time:
+                            completed_at = datetime.fromtimestamp(end_time / 1000).isoformat()
+                        elif completed:
+                            completed_at = datetime.now().isoformat()
+
+                        # Analyze workflow for model types
+                        model_types = []
+                        is_video = False
+                        estimated_vram = 12  # Default
+
+                        if len(prompt_info) >= 3 and isinstance(prompt_info[2], dict):
+                            workflow = prompt_info[2]
+                            for node_id, node in workflow.items():
+                                class_type = node.get("class_type", "").lower()
+                                inputs = node.get("inputs", {})
+
+                                # Detect model types
+                                if "flux" in class_type or any("flux" in str(v).lower() for v in inputs.values() if isinstance(v, str)):
+                                    if "flux/sd3" not in model_types:
+                                        model_types.append("flux/sd3")
+                                        estimated_vram = max(estimated_vram, 24)
+                                elif "animatediff" in class_type or "wan" in class_type or "video" in class_type:
+                                    if "video" not in model_types:
+                                        model_types.append("video")
+                                        is_video = True
+                                        estimated_vram = max(estimated_vram, 48)
+                                elif "sdxl" in class_type or any("sdxl" in str(v).lower() for v in inputs.values() if isinstance(v, str)):
+                                    if "sdxl" not in model_types:
+                                        model_types.append("sdxl")
+                                        estimated_vram = max(estimated_vram, 12)
+
+                        if not model_types:
+                            model_types = ["standard"]
+
+                        # Build routing hints
+                        routing_hints = json.dumps({
+                            "model_types": model_types,
+                            "is_video": is_video,
+                            "estimated_vram": estimated_vram,
+                            "synced_from_comfyui": True
+                        })
+
+                        # Insert job
+                        job_status = "completed" if completed else "running"
+                        try:
+                            conn.execute(
+                                """INSERT OR IGNORE INTO jobs
+                                   (id, target, status, submitted_at, started_at, completed_at, routing_hints)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                                (prompt_id[:8], target_name, job_status, submitted_at, submitted_at, completed_at, routing_hints)
+                            )
+                            jobs_added += 1
+                        except Exception as insert_err:
+                            logger.error(f"  Failed to insert job {prompt_id[:8]}: {insert_err}")
+
+                    conn.commit()
+
+                except Exception as e:
+                    logger.warning(f"Error syncing jobs from {target_name}: {e}")
+
+            conn.close()
+
+        except Exception as e:
+            logger.error(f"Job sync error: {e}")
+
+        time.sleep(30)  # Sync every 30 seconds
+
 def init_db():
     """Initialize SQLite database for job tracking and metrics history."""
     db_dir = Path(CONFIG["db_path"]).parent
@@ -911,8 +1035,7 @@ transition:height 0.5s cubic-bezier(0.4,0,0.2,1);box-shadow:0 0 5px var(--neon-c
 .sparkline-bar.high{background:var(--neon-yellow);box-shadow:0 0 5px var(--neon-yellow)}
 .sparkline-bar.critical{background:var(--neon-red);box-shadow:0 0 5px var(--neon-red)}
 @keyframes spark-glow{0%,100%{opacity:0.85}50%{opacity:1}}
-.gauge-arc{animation:arc-glow 2s ease-in-out infinite}
-@keyframes arc-glow{0%,100%{filter:brightness(1) drop-shadow(0 0 3px currentColor)}50%{filter:brightness(1.2) drop-shadow(0 0 8px currentColor)}}
+.gauge-arc{}
 .progress-label{display:flex;justify-content:space-between;font-size:1em;color:#888;
 font-family:'Rajdhani',sans-serif;letter-spacing:1px}
 .stat-row{margin:10px 0}
@@ -920,8 +1043,12 @@ font-family:'Rajdhani',sans-serif;letter-spacing:1px}
 font-family:'Orbitron',monospace;font-weight:bold;box-shadow:0 0 10px var(--neon-yellow)}
 .queue-badge.empty{background:#2a2a4e;color:#666;box-shadow:none}
 .gauge-row{display:flex;gap:15px;margin:20px 0;justify-content:center;flex-wrap:wrap}
-.gauge{text-align:center;position:relative}
-.gauge svg{filter:drop-shadow(0 0 10px var(--neon-cyan))}
+.gauge{text-align:center}
+.gauge-dial{position:relative;margin:0 auto;overflow:hidden;background:#1a1a2e;border-radius:999px 999px 0 0}
+.gauge-bg{position:absolute;width:100%;height:200%;border-radius:50%}
+.gauge-mask{position:absolute;bottom:0;left:10%;width:80%;height:80%;background:var(--bg-card);border-radius:999px 999px 0 0}
+.gauge-needle{position:absolute;bottom:0;left:50%;background:linear-gradient(to top,#fff 0%,#fff 60%,var(--neon-cyan) 100%);transform-origin:bottom center;transition:transform 1.5s cubic-bezier(0.4,0,0.2,1);border-radius:2px}
+.gauge-center{position:absolute;bottom:-5px;left:50%;background:#0a0a0f;border:2px solid var(--neon-cyan);border-radius:50%;transition:border-color 0.8s}
 .gauge-label{font-family:'Orbitron',monospace;font-size:0.85em;color:#888;margin-top:8px;
 letter-spacing:2px;text-transform:uppercase}
 .gauge-value{font-family:'Orbitron',monospace;font-size:1.3em;font-weight:bold;margin-top:4px;
@@ -1046,65 +1173,80 @@ function getSwapColor(percent) {
     return '#ff0044';
 }
 
-function renderSwapGauge(value, max, size, id) {
-    // Swap: green only at 0, yellow 0-70%, red >70%
-    let color, glow;
-    if (value === 0) { color = '#39ff14'; glow = '#39ff14'; }
-    else if (value < 70) { color = '#ffff00'; glow = '#ffff00'; }
-    else { color = '#ff0044'; glow = '#ff0044'; }
-    return renderGaugeWithColor(value, 0, max, "SWAP", "%", false, size, color, glow, id);
-}
-
-function renderGaugeWithColor(value, min, max, label, unit, showLimit, size, color, glow, id) {
+function renderGauge(value, min, max, label, unit, showLimit, size, reverseColors, id) {
     const s = size || 1;
-    const w = Math.round(120 * s);
-    const h = Math.round(70 * s);
-    const r = 45 * s;
-    const strokeW = 8 * s;
-    const cx = w / 2;
-    const cy = h - 5;
+    const w = Math.round(100 * s);
+    const h = Math.round(50 * s);
+    const needleH = Math.round(42 * s);
+    const needleW = Math.round(3 * s);
+    const centerSize = Math.round(14 * s);
     const gaugeId = id || 'gauge-' + label.replace(/\\s/g,'');
 
-    if (value === null) {
-        return '<div class="gauge" id="' + gaugeId + '" style="width:' + w + 'px" data-r="' + r + '"><svg width="' + w + '" height="' + h + '" viewBox="0 0 ' + w + ' ' + h + '">' +
-            '<path d="M ' + (cx - r) + ' ' + cy + ' A ' + r + ' ' + r + ' 0 0 1 ' + (cx + r) + ' ' + cy + '" fill="none" stroke="#1a2332" stroke-width="' + strokeW + '" stroke-linecap="round"/>' +
-            '<path class="gauge-arc" r="' + r + '" d="M ' + (cx - r) + ' ' + cy + ' A ' + r + ' ' + r + ' 0 0 1 ' + (cx + r) + ' ' + cy + '" fill="none" stroke-width="' + strokeW + '" stroke-linecap="round" stroke-dasharray="' + (Math.PI * r) + '" style="stroke:#1a2332;stroke-dashoffset:' + (Math.PI * r) + ';transition:stroke-dashoffset 1.5s cubic-bezier(0.4,0,0.2,1),stroke 0.8s"/>' +
-            '<circle cx="' + cx + '" cy="' + cy + '" r="' + (6 * s) + '" fill="#0a0a0f" stroke="#1a2332" stroke-width="2" style="transition:stroke 0.8s"/>' +
-            '</svg><div class="gauge-label">' + label + '</div><div class="gauge-value" style="transition:color 0.8s">--</div></div>';
+    // Calculate angle: -90 (left) to +90 (right)
+    const clampedValue = value !== null ? Math.max(min, Math.min(max, value)) : min;
+    const percent = value !== null ? ((clampedValue - min) / (max - min)) * 100 : 0;
+    const angle = -90 + (percent * 1.8);
+
+    // Determine color based on percent
+    let color;
+    if (reverseColors) {
+        color = getUtilColor(percent);
+    } else {
+        color = getNormalColor(percent);
     }
 
-    const clampedValue = Math.max(min, Math.min(max, value));
-    const percent = ((clampedValue - min) / (max - min)) * 100;
-    const arcLength = Math.PI * r;
-    const dashOffset = arcLength * (1 - percent / 100);
-    const displayValue = showLimit ? Math.round(value) + '/' + max + unit : Math.round(value) + unit;
+    const displayValue = value !== null ? (showLimit ? Math.round(value) + '/' + max + unit : Math.round(value) + unit) : '--';
 
-    return '<div class="gauge" id="' + gaugeId + '" style="width:' + w + 'px" data-r="' + r + '">' +
-        '<svg width="' + w + '" height="' + h + '" viewBox="0 0 ' + w + ' ' + h + '" style="filter:drop-shadow(0 0 10px ' + glow + ')">' +
-        '<defs><linearGradient id="grad-' + gaugeId + '" x1="0%" y1="0%" x2="100%" y2="0%">' +
-        '<stop offset="0%" style="stop-color:#1a2332"/>' +
-        '<stop offset="100%" style="stop-color:#2a3342"/></linearGradient></defs>' +
-        '<path d="M ' + (cx - r) + ' ' + cy + ' A ' + r + ' ' + r + ' 0 0 1 ' + (cx + r) + ' ' + cy + '" fill="none" stroke="url(#grad-' + gaugeId + ')" stroke-width="' + (strokeW + 4) + '" stroke-linecap="round"/>' +
-        '<path class="gauge-arc" r="' + r + '" d="M ' + (cx - r) + ' ' + cy + ' A ' + r + ' ' + r + ' 0 0 1 ' + (cx + r) + ' ' + cy + '" fill="none" stroke-width="' + strokeW + '" stroke-linecap="round" stroke-dasharray="' + arcLength + '" style="stroke:' + color + ';stroke-dashoffset:' + dashOffset + ';transition:stroke-dashoffset 1.5s cubic-bezier(0.4,0,0.2,1),stroke 0.8s"/>' +
-        '<circle cx="' + cx + '" cy="' + cy + '" r="' + (6 * s) + '" fill="#0a0a0f" stroke="' + color + '" stroke-width="2" style="transition:stroke 0.8s"/>' +
-        '</svg>' +
+    // Conic gradient: green 0-70%, yellow 70-90%, red 90-100% (or reversed)
+    let gradient;
+    if (reverseColors) {
+        gradient = 'conic-gradient(from 0.75turn, #d94a4a 0deg, #d94a4a 9deg, #d9a54a 9deg, #d9a54a 45deg, #39ff14 45deg, #39ff14 180deg, transparent 180deg)';
+    } else {
+        gradient = 'conic-gradient(from 0.75turn, #39ff14 0deg, #39ff14 126deg, #d9a54a 126deg, #d9a54a 162deg, #d94a4a 162deg, #d94a4a 180deg, transparent 180deg)';
+    }
+
+    return '<div class="gauge" id="' + gaugeId + '" style="width:' + w + 'px" data-min="' + min + '" data-max="' + max + '">' +
+        '<div class="gauge-dial" style="width:' + w + 'px;height:' + h + 'px">' +
+        '<div class="gauge-bg" style="background:' + gradient + '"></div>' +
+        '<div class="gauge-mask"></div>' +
+        '<div class="gauge-needle" style="width:' + needleW + 'px;height:' + needleH + 'px;margin-left:' + (-needleW/2) + 'px;transform:rotate(' + angle + 'deg);background:linear-gradient(to top,#fff 0%,#fff 60%,' + color + ' 100%)"></div>' +
+        '<div class="gauge-center" style="width:' + centerSize + 'px;height:' + centerSize + 'px;margin-left:' + (-centerSize/2) + 'px;border-color:' + color + '"></div>' +
+        '</div>' +
         '<div class="gauge-label">' + label + '</div>' +
-        '<div class="gauge-value" style="color:' + color + ';text-shadow:0 0 10px ' + glow + ';transition:color 0.8s">' + displayValue + '</div></div>';
+        '<div class="gauge-value" style="color:' + color + ';text-shadow:0 0 10px ' + color + '">' + displayValue + '</div></div>';
 }
 
-function renderGauge(value, min, max, label, unit, showLimit, size, reverseColors, id) {
-    // Color based on percentage
-    const clampedValue = value !== null ? Math.max(min, Math.min(max, value)) : 0;
-    const percent = value !== null ? ((clampedValue - min) / (max - min)) * 100 : 0;
+function renderSwapGauge(value, max, size, id) {
+    // Swap uses different color logic
+    let color;
+    if (value === 0) { color = '#39ff14'; }
+    else if (value < 70) { color = '#d9a54a'; }
+    else { color = '#d94a4a'; }
 
-    let color, glow;
-    if (reverseColors) {
-        color = glow = getUtilColor(percent);
-    } else {
-        color = glow = getNormalColor(percent);
-    }
+    const s = size || 1;
+    const w = Math.round(100 * s);
+    const h = Math.round(50 * s);
+    const needleH = Math.round(42 * s);
+    const needleW = Math.round(3 * s);
+    const centerSize = Math.round(14 * s);
+    const gaugeId = id || 'gauge-swap';
 
-    return renderGaugeWithColor(value, min, max, label, unit, showLimit, size, color, glow, id);
+    const percent = (value / max) * 100;
+    const angle = -90 + (percent * 1.8);
+    const displayValue = Math.round(value) + '%';
+
+    // Swap gradient: green at 0, yellow 0-70%, red >70%
+    const gradient = 'conic-gradient(from 0.75turn, #39ff14 0deg, #39ff14 5deg, #d9a54a 5deg, #d9a54a 126deg, #d94a4a 126deg, #d94a4a 180deg, transparent 180deg)';
+
+    return '<div class="gauge" id="' + gaugeId + '" style="width:' + w + 'px" data-min="0" data-max="' + max + '">' +
+        '<div class="gauge-dial" style="width:' + w + 'px;height:' + h + 'px">' +
+        '<div class="gauge-bg" style="background:' + gradient + '"></div>' +
+        '<div class="gauge-mask"></div>' +
+        '<div class="gauge-needle" style="width:' + needleW + 'px;height:' + needleH + 'px;margin-left:' + (-needleW/2) + 'px;transform:rotate(' + angle + 'deg);background:linear-gradient(to top,#fff 0%,#fff 60%,' + color + ' 100%)"></div>' +
+        '<div class="gauge-center" style="width:' + centerSize + 'px;height:' + centerSize + 'px;margin-left:' + (-centerSize/2) + 'px;border-color:' + color + '"></div>' +
+        '</div>' +
+        '<div class="gauge-label">SWAP</div>' +
+        '<div class="gauge-value" style="color:' + color + ';text-shadow:0 0 10px ' + color + '">' + displayValue + '</div></div>';
 }
 
 function setupPowerButtons() {
@@ -1154,30 +1296,28 @@ function updateGauge(id, value, min, max, unit, showLimit, colorFn) {
     const gauge = document.getElementById(id);
     if (!gauge) return;
 
-    const r = parseFloat(gauge.dataset.r) || 45;
-    const arcLength = Math.PI * r;
     const clampedValue = Math.max(min, Math.min(max, value));
     const percent = ((clampedValue - min) / (max - min)) * 100;
-    const dashOffset = arcLength * (1 - percent / 100);
+    const angle = -90 + (percent * 1.8);
     const color = colorFn(percent);
     const displayValue = showLimit ? Math.round(value) + '/' + max + unit : Math.round(value) + unit;
 
-    const arc = gauge.querySelector('.gauge-arc');
-    const circle = gauge.querySelector('circle');
+    const needle = gauge.querySelector('.gauge-needle');
+    const center = gauge.querySelector('.gauge-center');
     const valueEl = gauge.querySelector('.gauge-value');
-    const svg = gauge.querySelector('svg');
 
-    if (arc) {
-        arc.style.strokeDashoffset = dashOffset;
-        arc.style.stroke = color;
+    if (needle) {
+        needle.style.transform = 'rotate(' + angle + 'deg)';
+        needle.style.background = 'linear-gradient(to top, #fff 0%, #fff 60%, ' + color + ' 100%)';
     }
-    if (circle) circle.style.stroke = color;
+    if (center) {
+        center.style.borderColor = color;
+    }
     if (valueEl) {
         valueEl.textContent = displayValue;
         valueEl.style.color = color;
         valueEl.style.textShadow = '0 0 10px ' + color;
     }
-    if (svg) svg.style.filter = 'drop-shadow(0 0 10px ' + color + ')';
 }
 
 function refresh() {
@@ -1312,9 +1452,14 @@ function refresh() {
                 }
             }
         }
+    }).catch(err => {
+        console.error('Error fetching status:', err);
+        document.getElementById("monitors").innerHTML = "<p style='color:#f44'>Error loading status: " + err.message + "</p>";
     });
 
     fetch("/api/logs").then(r => r.json()).then(data => {
+        const jobs = data.jobs || [];
+
         // Build filter buttons - show all known targets, not just ones with jobs
         const knownTargets = ['gandalf', 'frodo'];
         let filterHtml = '<button class="job-filter active" data-target="all">ALL</button>';
@@ -1326,10 +1471,10 @@ function refresh() {
 
         // Count jobs today
         const today = new Date().toDateString();
-        const jobsToday = data.jobs.filter(j => new Date(j.submitted_at).toDateString() === today).length;
+        const jobsToday = jobs.filter(j => new Date(j.submitted_at).toDateString() === today).length;
 
         // Store jobs data globally for filtering
-        window.allJobs = data.jobs;
+        window.allJobs = jobs;
         window.jobsToday = jobsToday;
 
         // Setup filter click handlers
@@ -1342,6 +1487,9 @@ function refresh() {
         });
 
         renderJobs('all');
+    }).catch(err => {
+        console.error('Error fetching jobs:', err);
+        document.getElementById("job-list").innerHTML = "<p style='color:#f44'>Error loading jobs: " + err.message + "</p>";
     });
 }
 
@@ -1355,7 +1503,8 @@ function renderJobs(targetFilter) {
     } else {
         filtered.slice(0, 15).forEach(j => {
             const cls = j.is_video ? "job video" : (j.status === "completed" ? "job completed" : "job");
-            const models = j.model_types.length ? j.model_types.join(", ") : "standard";
+            const modelTypes = j.model_types || [];
+            const models = modelTypes.length ? modelTypes.join(", ") : "standard";
             const timeStr = formatJobTime(j.submitted_at);
             const icon = icons[j.target] || "🖥️";
             let timing = '<span class="job-time">' + timeStr + '</span>';
@@ -1431,7 +1580,7 @@ function refreshHistory() {
 
 refresh();
 refreshHistory();
-setInterval(refresh, 3000);
+setInterval(refresh, 2000);
 setInterval(refreshHistory, 60000);  // Refresh history every minute
 </script></body></html>'''
 
@@ -1590,6 +1739,10 @@ if __name__ == "__main__":
     # Start background metrics collector
     metrics_thread = threading.Thread(target=collect_metrics, daemon=True)
     metrics_thread.start()
+
+    # Start background job sync from ComfyUI
+    sync_thread = threading.Thread(target=sync_comfyui_jobs, daemon=True)
+    sync_thread.start()
 
     logger.info("")
     logger.info("=" * 60)
