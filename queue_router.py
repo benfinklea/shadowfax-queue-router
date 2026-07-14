@@ -13,6 +13,7 @@ import logging
 import threading
 import time
 import paramiko
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 from flask import Flask, request, jsonify
@@ -26,6 +27,37 @@ PUSHOVER_CONFIG = {
     "sound": "magic"
 }
 
+# Pedernales Electric Cooperative time-of-use rates (effective 2026-03-01).
+# PEC changes these ~twice a year - update the numbers below when they do.
+# Total $/kWh = base_per_kwh + the period charge for that season/hour.
+# Schedule applies every day (no weekday/weekend distinction). Hours are [start, end)
+# in 24h local time; any hour not listed in "peak"/"mid" falls through to off-peak.
+ELECTRIC_RATES = {
+    "base_per_kwh": 0.042476,
+    "currency": "$",
+    "seasons": {
+        # month number -> season key
+        1: "winter", 2: "winter", 12: "winter",
+        3: "shoulder", 4: "shoulder", 5: "shoulder", 10: "shoulder", 11: "shoulder",
+        6: "summer", 7: "summer", 8: "summer", 9: "summer",
+    },
+    "schedule": {
+        "summer": {
+            "off_peak": 0.043481,
+            "mid": {"charge": 0.093169, "hours": [(14, 16), (20, 21)]},
+            "peak": {"charge": 0.161843, "hours": [(16, 20)]},
+        },
+        "shoulder": {
+            "off_peak": 0.043481,
+            "mid": {"charge": 0.086442, "hours": [(17, 21)]},
+        },
+        "winter": {
+            "off_peak": 0.043481,
+            "mid": {"charge": 0.086442, "hours": [(5, 9), (17, 21)]},
+        },
+    },
+}
+
 # Set up logging with clear formatting
 logging.basicConfig(
     level=logging.INFO,
@@ -36,43 +68,105 @@ logger = logging.getLogger("QueueRouter")
 
 app = Flask(__name__)
 CORS(app)
+# Preserve dict insertion order in JSON responses (so targets render gandalf, frodo, pippin)
+app.json.sort_keys = False
 
 # Configuration
 CONFIG = {
     "targets": {
         "gandalf": {
             "url": "http://192.168.1.122:8188",
-            "ssh_host": "gandalf.local",
+            "ssh_host": "192.168.1.122",
             "ssh_user": "ben",
+            "os": "linux",
             "vram_gb": 96,
             "gpu_power_limit": 450,
             "gpu_power_max": 600,
-            "priority": 1,
-            "capabilities": ["video", "flux", "sdxl", "sd15", "llm"],
             "disk_path": "/workspace"
         },
         "frodo": {
-            "url": "http://frodo.local:8188",
-            "ssh_host": "frodo.local",
+            "url": "http://192.168.1.105:8188",
+            "ssh_host": "192.168.1.105",
             "ssh_user": "ben",
-            "vram_gb": 16,
-            "gpu_power_limit": 360,
-            "gpu_power_max": 400,
-            "priority": 2,
-            "capabilities": ["sdxl", "sd15", "flux-schnell"]
+            "os": "linux",
+            "vram_gb": 32,
+            "gpu_power_limit": 575,
+            "gpu_power_max": 600,
+            "disk_path": "/"
+        },
+        "pippin": {
+            "ssh_host": "pippen",
+            "ssh_user": "ben",
+            "os": "mac",
+            "vram_gb": 64,
+            "disk_path": "/"
         }
     },
-    "db_path": "/var/lib/queue-router/jobs.db",
-    "vram_thresholds": {
-        "video": 48,
-        "flux": 24,
-        "sdxl": 12,
-        "sd15": 6
-    }
+    "db_path": "/var/lib/queue-router/jobs.db"
 }
 
-# Track active jobs for completion monitoring
-active_jobs = {}  # {prompt_id: {"job_id": ..., "target": ..., "start_time": ...}}
+# Fleet host row (2026-07-12): the six boxes NOT covered by the GPU target cards.
+# Compact CPU/temp/RAM tiles + reboot buttons at the top of the dashboard.
+# "local": metrics come from this box itself (no SSH). "mac" is for Wake-on-LAN
+# (all farthings have WoL enabled at NIC + BIOS level; sam/shadowfax N/A).
+FLEET_NODES = {
+    "northfarthing": {"ssh_host": "192.168.1.134", "ssh_user": "ben", "wol_mac": "84:47:09:65:43:c3"},
+    "eastfarthing":  {"ssh_host": "192.168.1.137", "ssh_user": "ben", "wol_mac": "84:47:09:62:ef:60"},
+    "southfarthing": {"ssh_host": "192.168.1.136", "ssh_user": "ben", "wol_mac": "84:47:09:65:42:5b"},
+    "westfarthing":  {"ssh_host": "192.168.1.139", "ssh_user": "ben", "wol_mac": "84:47:09:65:42:85"},
+    "shadowfax":     {"local": True},
+    "sam":           {"ssh_host": "100.94.125.84", "ssh_user": "ben"},
+}
+
+# One-shot metrics: cpu% (0.6s /proc/stat delta), ram MB, hottest sensor (milli-C)
+FLEET_METRICS_CMD = (
+    "read -r t1 i1 < <(awk '/^cpu /{print $2+$3+$4+$5+$6+$7+$8, $5+$6}' /proc/stat); "
+    "sleep 0.6; "
+    "read -r t2 i2 < <(awk '/^cpu /{print $2+$3+$4+$5+$6+$7+$8, $5+$6}' /proc/stat); "
+    "dt=$((t2-t1)); di=$((i2-i1)); cpu=$(( dt>0 ? (100*(dt-di))/dt : 0 )); "
+    "read -r rt ru < <(free -m | awk '/^Mem:/{print $2, $3}'); "
+    # temp: prefer the real CPU sensor (k10temp AMD / coretemp Intel), then the
+    # generic ACPI/SoC zone (Pis), only then max-of-everything (NVMe etc. lie hot)
+    "tp=; for h in /sys/class/hwmon/hwmon*; do case \"$(cat $h/name 2>/dev/null)\" in k10temp|coretemp) tp=$(cat $h/temp1_input 2>/dev/null); break;; esac; done; "
+    "[ -z \"$tp\" ] && tp=$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null); "
+    "[ -z \"$tp\" ] && tp=$(cat /sys/class/hwmon/hwmon*/temp1_input 2>/dev/null | sort -rn | head -1); "
+    "echo \"cpu=$cpu ram_used=$ru ram_total=$rt temp=${tp:-0}\""
+)
+
+def get_fleet_node_metrics(name, cfg):
+    """CPU/temp/RAM for one fleet node. Returns dict; online=False on any failure."""
+    out = None
+    try:
+        if cfg.get("local"):
+            import subprocess
+            out = subprocess.run(["bash", "-c", FLEET_METRICS_CMD], capture_output=True,
+                                 text=True, timeout=15).stdout
+        else:
+            client = get_ssh_client(cfg["ssh_host"], cfg.get("ssh_user", "ben"))
+            if client is None:
+                return {"name": name, "online": False, "can_wake": bool(cfg.get("wol_mac"))}
+            # no extra bash -c wrapper: the CMD contains single quotes, and sshd
+            # already hands the command line to the login shell (bash here)
+            _, stdout, _ = client.exec_command(FLEET_METRICS_CMD, timeout=15)
+            out = stdout.read().decode()
+    except Exception as e:
+        logger.debug(f"fleet metrics {name}: {e}")
+        return {"name": name, "online": False, "can_wake": bool(cfg.get("wol_mac"))}
+    m = dict(kv.split("=") for kv in (out or "").split() if "=" in kv)
+    if "cpu" not in m:
+        return {"name": name, "online": False, "can_wake": bool(cfg.get("wol_mac"))}
+    return {
+        "name": name, "online": True,
+        "cpu": int(m.get("cpu", 0)),
+        "ram_used_gb": round(int(m.get("ram_used", 0)) / 1024, 1),
+        "ram_total_gb": round(int(m.get("ram_total", 0)) / 1024, 1),
+        "ram_pct": int(100 * int(m.get("ram_used", 0)) / max(1, int(m.get("ram_total", 1)))),
+        "temp_c": round(int(m.get("temp", 0)) / 1000),
+        "can_wake": bool(cfg.get("wol_mac")),
+    }
+
+# ComfyUI watchdog state
+comfyui_watchdog = {}  # {target: {"consecutive_failures": int, "last_restart": datetime, "was_down": bool}}
 
 def send_notification(title, message):
     """Send push notification via Pushover."""
@@ -97,59 +191,6 @@ def send_notification(title, message):
             logger.warning(f"  Notification failed: {response.text}")
     except Exception as e:
         logger.warning(f"  Notification error: {e}")
-
-def check_job_completion():
-    """Background thread to check for completed jobs."""
-    while True:
-        try:
-            jobs_to_remove = []
-
-            for prompt_id, job_info in list(active_jobs.items()):
-                target = job_info["target"]
-                target_url = CONFIG["targets"].get(target, {}).get("url")
-
-                if not target_url:
-                    continue
-
-                try:
-                    # Check ComfyUI history for this prompt
-                    response = requests.get(f"{target_url}/history/{prompt_id}", timeout=5)
-                    if response.ok:
-                        history = response.json()
-                        if prompt_id in history:
-                            # Job completed!
-                            elapsed = datetime.now() - job_info["start_time"]
-                            duration = f"{int(elapsed.total_seconds() // 60)}m{int(elapsed.total_seconds() % 60)}s"
-
-                            # Update database
-                            conn = sqlite3.connect(CONFIG["db_path"])
-                            conn.execute(
-                                "UPDATE jobs SET status = 'completed', completed_at = ? WHERE id = ?",
-                                (datetime.now().isoformat(), job_info["job_id"])
-                            )
-                            conn.commit()
-                            conn.close()
-
-                            # Send notification
-                            send_notification(
-                                "🎬 Render Complete!",
-                                f"Job: {job_info['job_id']}\nGPU: {target.capitalize()}\nTime: {duration}"
-                            )
-
-                            logger.info(f"  ✅ Job {job_info['job_id']} completed on {target} in {duration}")
-                            jobs_to_remove.append(prompt_id)
-
-                except Exception as e:
-                    logger.debug(f"  Error checking job {prompt_id}: {e}")
-
-            # Remove completed jobs from tracking
-            for prompt_id in jobs_to_remove:
-                active_jobs.pop(prompt_id, None)
-
-        except Exception as e:
-            logger.error(f"Job completion checker error: {e}")
-
-        time.sleep(5)  # Check every 5 seconds
 
 def sync_comfyui_jobs():
     """Background thread to sync job history from ComfyUI instances."""
@@ -371,29 +412,194 @@ def collect_metrics():
 
         time.sleep(METRICS_INTERVAL)
 
+# ComfyUI watchdog settings
+WATCHDOG_INTERVAL = 30           # Check every 30 seconds
+WATCHDOG_FAILURES_BEFORE_RESTART = 3  # 3 consecutive failures (~90s) before restart
+WATCHDOG_RESTART_COOLDOWN = 300  # 5 minutes between restart attempts per target
+
+def restart_comfyui(target_name, target_config):
+    """Restart ComfyUI service on a target via SSH."""
+    ssh_host = target_config.get("ssh_host")
+    ssh_user = target_config.get("ssh_user", "ben")
+    if not ssh_host:
+        return False
+    try:
+        client = get_ssh_client(ssh_host, ssh_user)
+        if client is None:
+            logger.warning(f"  Watchdog: Cannot restart ComfyUI on {target_name}: SSH circuit breaker open")
+            return False
+        stdin, stdout, stderr = client.exec_command("sudo systemctl restart comfyui")
+        exit_status = stdout.channel.recv_exit_status()
+        if exit_status == 0:
+            logger.info(f"  Watchdog: Restarted comfyui.service on {target_name}")
+            return True
+        else:
+            error = stderr.read().decode().strip()
+            logger.error(f"  Watchdog: Failed to restart ComfyUI on {target_name}: {error}")
+            return False
+    except Exception as e:
+        logger.error(f"  Watchdog: SSH error restarting ComfyUI on {target_name}: {e}")
+        return False
+
+def comfyui_watchdog_loop():
+    """Background thread that monitors ComfyUI and auto-restarts if down."""
+    time.sleep(30)  # Wait for startup
+    logger.info("Watchdog: ComfyUI auto-restart monitor started")
+
+    while True:
+        try:
+            for target_name, target_config in CONFIG["targets"].items():
+                url = target_config.get("url")
+                if not url:
+                    continue
+
+                # Initialize state
+                if target_name not in comfyui_watchdog:
+                    comfyui_watchdog[target_name] = {
+                        "consecutive_failures": 0,
+                        "last_restart": datetime.min,
+                        "was_down": False,
+                        "notifications_sent": 0,
+                        "last_notification": datetime.min
+                    }
+                state = comfyui_watchdog[target_name]
+
+                # Check if ComfyUI responds
+                try:
+                    response = requests.get(f"{url}/queue", timeout=5)
+                    is_up = response.ok
+                except Exception:
+                    is_up = False
+
+                if is_up:
+                    if state["was_down"]:
+                        logger.info(f"  Watchdog: {target_name} ComfyUI is back online")
+                    state["consecutive_failures"] = 0
+                    state["was_down"] = False
+                    state["notifications_sent"] = 0
+                else:
+                    state["consecutive_failures"] += 1
+                    state["was_down"] = True
+
+                    if state["consecutive_failures"] == 1:
+                        logger.warning(f"  Watchdog: {target_name} ComfyUI not responding (1st failure)")
+                    elif state["consecutive_failures"] >= WATCHDOG_FAILURES_BEFORE_RESTART:
+                        # Check cooldown
+                        since_last = (datetime.now() - state["last_restart"]).total_seconds()
+                        if since_last < WATCHDOG_RESTART_COOLDOWN:
+                            remaining = int(WATCHDOG_RESTART_COOLDOWN - since_last)
+                            logger.warning(f"  Watchdog: {target_name} still down but cooldown active ({remaining}s remaining)")
+                        else:
+                            logger.warning(f"  Watchdog: {target_name} ComfyUI down for {state['consecutive_failures']} checks, restarting...")
+
+                            # Notification #1: first restart attempt
+                            if state["notifications_sent"] == 0:
+                                send_notification(
+                                    f"🔄 Restarting {target_name.capitalize()} ComfyUI",
+                                    f"ComfyUI on {target_name} unresponsive for ~{state['consecutive_failures'] * WATCHDOG_INTERVAL}s. Auto-restarting."
+                                )
+                                state["notifications_sent"] = 1
+                                state["last_notification"] = datetime.now()
+
+                            # Notification #2: still down after 1 hour, one final reminder
+                            elif state["notifications_sent"] == 1:
+                                since_notif = (datetime.now() - state["last_notification"]).total_seconds()
+                                if since_notif >= 3600:
+                                    send_notification(
+                                        f"⚠️ {target_name.capitalize()} ComfyUI Still Down",
+                                        f"ComfyUI on {target_name} has been down for over an hour despite restart attempts."
+                                    )
+                                    state["notifications_sent"] = 2
+
+                            success = restart_comfyui(target_name, target_config)
+                            state["last_restart"] = datetime.now()
+                            state["consecutive_failures"] = 0
+
+        except Exception as e:
+            logger.error(f"Watchdog error: {e}")
+
+        time.sleep(WATCHDOG_INTERVAL)
+
+
 # SSH connection cache
 ssh_clients = {}
+
+# SSH circuit breaker - prevents connection flood when a host is unreachable
+ssh_circuit = {}  # {key: {"failures": int, "backoff_until": datetime, "backoff_secs": int}}
+SSH_CIRCUIT_MAX_FAILURES = 3
+SSH_CIRCUIT_INITIAL_BACKOFF = 30   # seconds
+SSH_CIRCUIT_MAX_BACKOFF = 300      # 5 minutes
 
 # Disk usage cache (updates every 5 minutes)
 disk_cache = {}  # {host: {"data": {...}, "updated_at": datetime}}
 DISK_CACHE_TTL = 300  # 5 minutes
 
+# /api/fleet cache - it sshes into all 6 fleet-row hosts per call; a short
+# TTL keeps fast/parallel browser polls from multiplying ssh sessions.
+fleet_cache = {"data": None, "ts": 0.0}
+FLEET_CACHE_TTL = 15  # seconds
+fleet_cache_lock = threading.Lock()
+
 # Historical metrics collection interval
 METRICS_INTERVAL = 60  # Collect every 60 seconds
 
 def get_ssh_client(host, user):
-    """Get or create cached SSH client for a host."""
+    """Get or create cached SSH client for a host, with circuit breaker."""
     key = f"{user}@{host}"
+
+    # Circuit breaker: if too many recent failures, skip attempting connection
+    if key in ssh_circuit:
+        cb = ssh_circuit[key]
+        if cb["failures"] >= SSH_CIRCUIT_MAX_FAILURES:
+            if datetime.now() < cb["backoff_until"]:
+                return None  # Circuit open - don't attempt connection
+            else:
+                logger.info(f"SSH circuit breaker: retrying {key} after {cb['backoff_secs']}s backoff")
+
+    # Try cached connection first
     if key in ssh_clients:
         client = ssh_clients[key]
         if client.get_transport() and client.get_transport().is_active():
+            # Working connection - reset circuit breaker
+            if key in ssh_circuit:
+                del ssh_circuit[key]
             return client
 
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(host, username=user, timeout=5)
-    ssh_clients[key] = client
-    return client
+    # Create new connection
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(host, username=user, timeout=5)
+        ssh_clients[key] = client
+
+        # Success - reset circuit breaker
+        if key in ssh_circuit:
+            logger.info(f"SSH circuit breaker: {key} recovered")
+            del ssh_circuit[key]
+
+        return client
+    except Exception as e:
+        # Track failure
+        if key not in ssh_circuit:
+            ssh_circuit[key] = {"failures": 0, "backoff_until": datetime.now(), "backoff_secs": SSH_CIRCUIT_INITIAL_BACKOFF}
+
+        cb = ssh_circuit[key]
+        cb["failures"] += 1
+
+        if cb["failures"] >= SSH_CIRCUIT_MAX_FAILURES:
+            cb["backoff_until"] = datetime.now() + timedelta(seconds=cb["backoff_secs"])
+            logger.warning(f"SSH circuit breaker OPEN for {key}: {cb['failures']} consecutive failures, backing off {cb['backoff_secs']}s")
+            cb["backoff_secs"] = min(cb["backoff_secs"] * 2, SSH_CIRCUIT_MAX_BACKOFF)
+
+        # Clean up bad cached client
+        if key in ssh_clients:
+            try:
+                ssh_clients[key].close()
+            except:
+                pass
+            del ssh_clients[key]
+
+        raise
 
 def get_ssh_metrics(host, user):
     """Get CPU%, GPU power, temperature, utilization, swap, disk I/O, and network I/O via SSH."""
@@ -413,6 +619,8 @@ def get_ssh_metrics(host, user):
     }
     try:
         client = get_ssh_client(host, user)
+        if client is None:
+            return result  # Circuit breaker open, return empty metrics
 
         # Get GPU power draw, current limit, temperature, and utilization
         stdin, stdout, stderr = client.exec_command(
@@ -511,6 +719,8 @@ def get_disk_usage(host, user, path="/"):
     result = {"total_gb": None, "used_gb": None, "percent": None}
     try:
         client = get_ssh_client(host, user)
+        if client is None:
+            return result  # Circuit breaker open, return empty
 
         # Get disk usage for specified path
         stdin, stdout, stderr = client.exec_command(
@@ -538,6 +748,9 @@ def set_gpu_power_limit(host, user, watts):
     """Set GPU power limit via SSH."""
     try:
         client = get_ssh_client(host, user)
+        if client is None:
+            logger.warning(f"Cannot set power limit on {host}: SSH circuit breaker open")
+            return False
         cmd = f"sudo nvidia-smi -pl {int(watts)}"
         stdin, stdout, stderr = client.exec_command(cmd)
         exit_status = stdout.channel.recv_exit_status()
@@ -552,10 +765,136 @@ def set_gpu_power_limit(host, user, watts):
         logger.error(f"SSH error setting power limit on {host}: {e}")
         return False
 
-def get_target_status(target_name, target_config):
-    """Check if a target ComfyUI instance is available and get queue depth + GPU stats."""
+def clear_swap(host, user):
+    """Clear swap by turning it off and back on via SSH."""
+    try:
+        client = get_ssh_client(host, user)
+        if client is None:
+            logger.warning(f"Cannot clear swap on {host}: SSH circuit breaker open")
+            return False
+        cmd = "sudo swapoff -a && sudo swapon -a"
+        stdin, stdout, stderr = client.exec_command(cmd)
+        exit_status = stdout.channel.recv_exit_status()
+        if exit_status == 0:
+            logger.info(f"Cleared swap on {host}")
+            return True
+        else:
+            error = stderr.read().decode().strip()
+            logger.error(f"Failed to clear swap on {host}: {error}")
+            return False
+    except Exception as e:
+        logger.error(f"SSH error clearing swap on {host}: {e}")
+        return False
+
+def get_mac_metrics(host, user):
+    """Get CPU%, GPU utilization, RAM, swap, and disk for a macOS target via SSH.
+
+    macOS has no nvidia-smi/ComfyUI here, so we read native tools:
+    top (CPU), ioreg (GPU util), vm_stat + hw.memsize (RAM), sysctl (swap), df (disk).
+    """
+    result = {
+        "cpu_percent": None,
+        "gpu_util": None,
+        "swap_percent": None,
+        "swap_used_gb": None,
+        "swap_total_gb": None,
+        "ram": None,
+        "disk": None,
+    }
+    try:
+        client = get_ssh_client(host, user)
+        if client is None:
+            return result  # Circuit breaker open
+
+        # CPU utilization = 100 - idle
+        _, stdout, _ = client.exec_command(
+            "top -l 1 -n 0 | awk '/CPU usage/{for(i=1;i<=NF;i++) if($i==\"idle\"){gsub(/%/,\"\",$(i-1)); printf \"%.1f\", 100-$(i-1)}}'"
+        )
+        out = stdout.read().decode().strip()
+        if out:
+            result["cpu_percent"] = round(float(out), 1)
+
+        # GPU utilization via IOAccelerator "Device Utilization %"
+        _, stdout, _ = client.exec_command(
+            "ioreg -r -d1 -c IOAccelerator | grep -o '\"Device Utilization %\"=[0-9]*' | head -1 | grep -o '[0-9]*$'"
+        )
+        out = stdout.read().decode().strip()
+        if out:
+            result["gpu_util"] = float(out)
+
+        # Swap usage: "total = X.00M  used = Y.00M  free = Z.00M"
+        _, stdout, _ = client.exec_command("sysctl -n vm.swapusage")
+        out = stdout.read().decode().strip()
+        m = re.search(r"total = ([\d.]+)M.*used = ([\d.]+)M", out)
+        if m:
+            total_mb = float(m.group(1))
+            used_mb = float(m.group(2))
+            result["swap_total_gb"] = round(total_mb / 1024, 1)
+            result["swap_used_gb"] = round(used_mb / 1024, 1)
+            result["swap_percent"] = round(used_mb / total_mb * 100, 1) if total_mb > 0 else 0
+
+        # RAM: total from hw.memsize, used = (active + wired + compressed) pages
+        _, stdout, _ = client.exec_command("sysctl -n hw.memsize; vm_stat")
+        lines = stdout.read().decode().strip().splitlines()
+        if lines:
+            try:
+                mem_total = int(lines[0].strip())
+            except ValueError:
+                mem_total = 0
+            page_size = 4096
+            pages = {}
+            for line in lines[1:]:
+                ps = re.search(r"page size of (\d+)", line)
+                if ps:
+                    page_size = int(ps.group(1))
+                km = re.match(r"(.+?):\s+(\d+)\.", line)
+                if km:
+                    pages[km.group(1).strip()] = int(km.group(2))
+            used_pages = (pages.get("Pages active", 0)
+                          + pages.get("Pages wired down", 0)
+                          + pages.get("Pages occupied by compressor", 0))
+            used_bytes = used_pages * page_size
+            if mem_total > 0:
+                result["ram"] = {
+                    "total_gb": round(mem_total / (1024**3), 1),
+                    "used_gb": round(used_bytes / (1024**3), 1),
+                    "percent": round(used_bytes / mem_total * 100, 1),
+                }
+
+        # Disk usage for / (df -k = 1024-byte blocks; macOS df lacks -B1)
+        _, stdout, _ = client.exec_command("df -k / | tail -1")
+        parts = stdout.read().decode().strip().split()
+        if len(parts) >= 3:
+            total_kb = int(parts[1])
+            used_kb = int(parts[2])
+            result["disk"] = {
+                "total_gb": round(total_kb / (1024**2), 1),
+                "used_gb": round(used_kb / (1024**2), 1),
+                "percent": round(used_kb / total_kb * 100, 1) if total_kb > 0 else 0,
+            }
+
+    except Exception as e:
+        logger.warning(f"Mac metrics error for {host}: {e}")
+        key = f"{user}@{host}"
+        if key in ssh_clients:
+            try:
+                ssh_clients[key].close()
+            except:
+                pass
+            del ssh_clients[key]
+
+    return result
+
+
+def get_target_status(target_name, target_config, fast=False):
+    """Check a target's availability and gather live metrics.
+
+    Linux targets are probed via ComfyUI HTTP + SSH (nvidia-smi). Mac targets
+    have no ComfyUI here, so they report online via SSH and use native metrics.
+    """
     result = {
         "online": False,
+        "os": target_config.get("os", "linux"),
         "queue_running": 0,
         "queue_pending": 0,
         "gpu": None,
@@ -571,6 +910,31 @@ def get_target_status(target_name, target_config):
         "disk_io": None,
         "net_io": None
     }
+
+    # macOS targets: no ComfyUI/nvidia-smi, gather native metrics over SSH
+    if target_config.get("os") == "mac":
+        if "ssh_host" in target_config:
+            try:
+                m = get_mac_metrics(
+                    target_config["ssh_host"],
+                    target_config.get("ssh_user", "ben")
+                )
+                # Online if we got any live reading back over SSH
+                if m.get("cpu_percent") is not None or m.get("ram") is not None:
+                    result["online"] = True
+                result["cpu_percent"] = m.get("cpu_percent")
+                result["gpu_util"] = m.get("gpu_util")
+                result["ram"] = m.get("ram")
+                result["disk"] = m.get("disk")
+                if m.get("swap_total_gb") is not None:
+                    result["swap"] = {
+                        "total_gb": m["swap_total_gb"],
+                        "used_gb": m["swap_used_gb"],
+                        "percent": m["swap_percent"]
+                    }
+            except Exception as e:
+                logger.warning(f"{target_name} Mac metrics unreachable: {e}")
+        return result
 
     # Try ComfyUI HTTP endpoints
     try:
@@ -622,6 +986,9 @@ def get_target_status(target_name, target_config):
     except Exception as e:
         logger.warning(f"{target_name} ComfyUI unreachable: {e}")
 
+    if fast and not result["online"]:
+        return result
+
     # Get SSH metrics (CPU, GPU power, temp, util, swap, I/O) - independent of ComfyUI status
     if "ssh_host" in target_config:
         try:
@@ -671,162 +1038,48 @@ def get_target_status(target_name, target_config):
 
     return result
 
-def choose_target(routing_hints):
-    """Choose the best target based on VRAM needs and queue depth."""
-    estimated_vram = routing_hints.get("estimated_vram", 8)
-    is_video = routing_hints.get("is_video", False)
-    model_types = routing_hints.get("model_types", [])
-    node_count = routing_hints.get("node_count", 0)
-
-    logger.info(f"  Workflow: vram_needed={estimated_vram}GB, video={is_video}, models={model_types}, nodes={node_count}")
-
-    # Force video to Gandalf (needs 96GB)
-    if is_video or estimated_vram > 20:
-        target = "gandalf"
-        status = get_target_status(target, CONFIG["targets"][target])
-        if status["online"]:
-            reason = f"Video/large model -> requires {CONFIG['targets'][target]['vram_gb']}GB VRAM"
-            return target, reason
-        else:
-            logger.error("  ERROR: Gandalf offline but required for this workflow")
-            return None, "Gandalf is offline and this workflow requires it"
-
-    # For smaller jobs, check queue depths
-    candidates = []
-    for name, config in CONFIG["targets"].items():
-        if config["vram_gb"] >= estimated_vram:
-            status = get_target_status(name, config)
-            if status["online"]:
-                total_queue = status["queue_running"] + status["queue_pending"]
-                candidates.append({
-                    "name": name,
-                    "config": config,
-                    "queue_depth": total_queue,
-                    "priority": config["priority"]
-                })
-                logger.info(f"  Checking {name}: {total_queue} queued, {config['vram_gb']}GB VRAM")
-
-    if not candidates:
-        logger.error("  ERROR: No suitable targets available")
-        return None, "No suitable targets available"
-
-    # Sort by queue depth, then priority
-    candidates.sort(key=lambda x: (x["queue_depth"], x["priority"]))
-    chosen = candidates[0]
-    reason = f"Least busy ({chosen['queue_depth']} queued), {chosen['config']['vram_gb']}GB VRAM"
-
-    return chosen["name"], reason
-
-def submit_to_target(target_name, workflow_data):
-    """Submit the workflow to the chosen ComfyUI instance."""
-    target_config = CONFIG["targets"][target_name]
-
-    response = requests.post(
-        f"{target_config['url']}/prompt",
-        json={
-            "prompt": workflow_data["prompt"],
-            "client_id": workflow_data.get("client_id", str(uuid.uuid4()))
-        },
-        timeout=30
-    )
-
-    if response.ok:
-        return response.json()
-    else:
-        raise Exception(f"Target returned {response.status_code}: {response.text}")
-
-@app.route("/api/queue", methods=["POST"])
-def queue_job():
-    """Receive a workflow and route it to the best target."""
-    try:
-        data = request.json
-
-        if not data or "prompt" not in data:
-            return jsonify({"error": "Missing prompt data"}), 400
-
-        routing_hints = data.get("routing_hints", {})
-        submitted_from = data.get("submitted_from", "unknown")
-
-        logger.info("")
-        logger.info("=" * 60)
-        logger.info(f"NEW JOB from {submitted_from}")
-        logger.info("=" * 60)
-
-        # Choose target
-        target, reason = choose_target(routing_hints)
-
-        if not target:
-            return jsonify({"error": reason}), 503
-
-        # Generate job ID
-        job_id = str(uuid.uuid4())[:8]
-
-        # Store in database
-        conn = sqlite3.connect(CONFIG["db_path"])
-        conn.execute(
-            """INSERT INTO jobs (id, target, submitted_at, workflow_json, routing_hints)
-               VALUES (?, ?, ?, ?, ?)""",
-            (job_id, target, datetime.now().isoformat(),
-             json.dumps(data.get("workflow", {})),
-             json.dumps(routing_hints))
-        )
-        conn.commit()
-        conn.close()
-
-        # Submit to target
-        result = submit_to_target(target, data)
-        prompt_id = result.get("prompt_id", "unknown")
-
-        # Update job status
-        conn = sqlite3.connect(CONFIG["db_path"])
-        conn.execute(
-            "UPDATE jobs SET status = 'submitted', started_at = ?, result = ? WHERE id = ?",
-            (datetime.now().isoformat(), json.dumps({"prompt_id": prompt_id}), job_id)
-        )
-        conn.commit()
-        conn.close()
-
-        # Track job for completion monitoring
-        if prompt_id != "unknown":
-            active_jobs[prompt_id] = {
-                "job_id": job_id,
-                "target": target,
-                "start_time": datetime.now()
-            }
-
-        target_config = CONFIG["targets"][target]
-
-        logger.info("")
-        logger.info(f"  >>> ROUTED: Job {job_id} --> {target.upper()}")
-        logger.info(f"      Reason: {reason}")
-        logger.info(f"      ComfyUI URL: {target_config['url']}")
-        logger.info(f"      Prompt ID: {prompt_id}")
-        logger.info(f"      Output: {target}'s ComfyUI output folder")
-        logger.info("")
-
-        return jsonify({
-            "job_id": job_id,
-            "target": target,
-            "target_url": target_config["url"],
-            "reason": reason,
-            "prompt_id": prompt_id,
-            "output_location": f"Output will appear in {target}'s ComfyUI output folder"
-        })
-
-    except Exception as e:
-        logger.error(f"Error processing job: {e}")
-        return jsonify({"error": str(e)}), 500
-
 @app.route("/api/status", methods=["GET"])
 def get_status():
     """Get status of all targets and recent jobs."""
     targets_status = {}
-    for name, config in CONFIG["targets"].items():
-        targets_status[name] = {
-            **get_target_status(name, config),
-            "vram_gb": config["vram_gb"],
-            "url": config["url"]
+    with ThreadPoolExecutor(max_workers=max(1, len(CONFIG["targets"]))) as executor:
+        futures = {
+            executor.submit(get_target_status, name, config, True): (name, config)
+            for name, config in CONFIG["targets"].items()
         }
+        results = {}
+        for future in as_completed(futures):
+            name, config = futures[future]
+            try:
+                status = future.result()
+            except Exception as e:
+                logger.warning(f"{name} status unavailable: {e}")
+                status = {
+                    "online": False,
+                    "os": config.get("os", "linux"),
+                    "queue_running": 0,
+                    "queue_pending": 0,
+                    "gpu": None,
+                    "ram": None,
+                    "cpu_percent": None,
+                    "gpu_watts": None,
+                    "gpu_temp": None,
+                    "gpu_util": None,
+                    "gpu_power_limit": config.get("gpu_power_limit", 300),
+                    "gpu_power_max": config.get("gpu_power_max", 400),
+                    "disk": None,
+                    "swap": None,
+                    "disk_io": None,
+                    "net_io": None,
+                }
+            results[name] = {
+                **status,
+                "vram_gb": config.get("vram_gb"),
+                "url": config.get("url")
+            }
+
+    # Preserve CONFIG order (gandalf, frodo, pippin) regardless of completion order
+    targets_status = {name: results[name] for name in CONFIG["targets"] if name in results}
 
     conn = sqlite3.connect(CONFIG["db_path"])
 
@@ -842,6 +1095,16 @@ def get_status():
     for name in targets_status:
         targets_status[name]["jobs_today"] = jobs_today.get(name, 0)
 
+    # Max GPU utilization today per target (from collected metrics)
+    cursor = conn.execute(
+        "SELECT target, MAX(gpu_util) FROM metrics_history WHERE timestamp >= ? GROUP BY target",
+        (today_start,)
+    )
+    max_util_today = {row[0]: row[1] for row in cursor.fetchall()}
+    for name in targets_status:
+        v = max_util_today.get(name)
+        targets_status[name]["max_util_today"] = round(v) if v is not None else None
+
     cursor = conn.execute(
         "SELECT id, target, status, submitted_at FROM jobs ORDER BY submitted_at DESC LIMIT 10"
     )
@@ -855,6 +1118,88 @@ def get_status():
         "targets": targets_status,
         "recent_jobs": recent_jobs
     })
+
+@app.route("/api/fleet", methods=["GET"])
+def get_fleet():
+    """Compact CPU/temp/RAM for the six fleet-row hosts.
+
+    Sshes into every node to gather this, so it's cached for FLEET_CACHE_TTL
+    seconds - back-to-back/parallel polls (multiple tabs, fast refresh) hit
+    the cache instead of opening a fresh ssh session per node per request.
+    """
+    now = time.time()
+    with fleet_cache_lock:
+        if fleet_cache["data"] is not None and (now - fleet_cache["ts"]) < FLEET_CACHE_TTL:
+            return jsonify(fleet_cache["data"])
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=len(FLEET_NODES)) as ex:
+        futs = {ex.submit(get_fleet_node_metrics, n, c): n for n, c in FLEET_NODES.items()}
+        for f in as_completed(futs):
+            r = f.result()
+            results[r["name"]] = r
+    # preserve display order
+    ordered = {n: results[n] for n in FLEET_NODES if n in results}
+
+    with fleet_cache_lock:
+        fleet_cache["data"] = ordered
+        fleet_cache["ts"] = time.time()
+
+    return jsonify(ordered)
+
+@app.route("/api/fleet_power", methods=["POST"])
+def fleet_power():
+    """Reboot a fleet-row host, or WoL-wake an offline farthing."""
+    try:
+        data = request.json
+        node = data.get("node")
+        action = data.get("action")
+        cfg = FLEET_NODES.get(node)
+        if not cfg:
+            return jsonify({"error": "Unknown node"}), 400
+        if action not in ("reboot", "wake", "shutdown"):
+            return jsonify({"error": "Action must be 'reboot', 'shutdown' or 'wake'"}), 400
+        # shutdown only where we can power back on remotely (WoL boxes = the Shire)
+        if action == "shutdown" and not cfg.get("wol_mac"):
+            return jsonify({"error": "Shutdown disabled for this node (no WoL to bring it back)"}), 400
+
+        if action == "wake":
+            mac = cfg.get("wol_mac")
+            if not mac:
+                return jsonify({"error": "No WoL MAC for this node"}), 400
+            import subprocess
+            for _ in range(3):
+                subprocess.run(["wakeonlan", "-i", "192.168.1.255", mac],
+                               capture_output=True, timeout=10)
+            logger.info(f"Sent WoL magic packets to {node} ({mac})")
+            return jsonify({"success": True, "node": node, "action": "wake"})
+
+        # reboot / shutdown
+        if cfg.get("local"):
+            import subprocess
+            logger.info("Self-reboot requested from dashboard")
+            send_notification("🔄 Shadowfax reboot", "Dashboard-triggered self reboot")
+            subprocess.Popen(["bash", "-c", "sleep 2; sudo -n systemctl reboot"])
+            return jsonify({"success": True, "node": node, "action": "reboot"})
+        client = get_ssh_client(cfg["ssh_host"], cfg.get("ssh_user", "ben"))
+        if client is None:
+            return jsonify({"error": f"SSH circuit breaker open for {node}"}), 503
+        cmd = "sudo -n reboot" if action == "reboot" else "sudo -n poweroff"
+        client.exec_command(cmd)
+        logger.info(f"Sent {action} to {node} ({cfg['ssh_host']})")
+        icon = "🔄" if action == "reboot" else "🔴"
+        send_notification(f"{icon} {node.capitalize()} {action}", f"Dashboard-triggered {action} of {node}")
+        key = f"{cfg.get('ssh_user', 'ben')}@{cfg['ssh_host']}"
+        if key in ssh_clients:
+            try:
+                ssh_clients[key].close()
+            except:
+                pass
+            del ssh_clients[key]
+        return jsonify({"success": True, "node": node, "action": action})
+    except Exception as e:
+        logger.error(f"fleet_power error: {e}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/api/logs", methods=["GET"])
 def get_logs():
@@ -935,10 +1280,87 @@ def set_power_limit():
         logger.error(f"Error setting power limit: {e}")
         return jsonify({"error": str(e)}), 500
 
+@app.route("/api/clear_swap", methods=["POST"])
+def api_clear_swap():
+    """Clear swap for a target."""
+    try:
+        data = request.json
+        target = data.get("target")
+        if target not in CONFIG["targets"]:
+            return jsonify({"error": "Unknown target"}), 400
+
+        target_config = CONFIG["targets"][target]
+        success = clear_swap(
+            target_config["ssh_host"],
+            target_config.get("ssh_user", "ben")
+        )
+
+        if success:
+            return jsonify({"success": True, "target": target})
+        else:
+            return jsonify({"error": "Failed to clear swap"}), 500
+    except Exception as e:
+        logger.error(f"Error clearing swap: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/power", methods=["POST"])
+def api_power():
+    """Reboot or shut down a target machine."""
+    try:
+        data = request.json
+        target = data.get("target")
+        action = data.get("action")  # "reboot" or "shutdown"
+
+        if target not in CONFIG["targets"]:
+            return jsonify({"error": "Unknown target"}), 400
+        if action not in ("reboot", "shutdown"):
+            return jsonify({"error": "Action must be 'reboot' or 'shutdown'"}), 400
+
+        target_config = CONFIG["targets"][target]
+        ssh_host = target_config.get("ssh_host")
+        ssh_user = target_config.get("ssh_user", "ben")
+
+        if not ssh_host:
+            return jsonify({"error": "No SSH host configured for target"}), 400
+
+        cmd = "sudo reboot" if action == "reboot" else "sudo poweroff"
+
+        try:
+            client = get_ssh_client(ssh_host, ssh_user)
+            if client is None:
+                return jsonify({"error": f"SSH circuit breaker open for {target}"}), 503
+
+            stdin, stdout, stderr = client.exec_command(cmd)
+            # Don't wait for exit status - the machine is going down
+            logger.info(f"Sent {action} command to {target} ({ssh_host})")
+            send_notification(
+                f"{'🔄' if action == 'reboot' else '🔴'} {target.capitalize()} {action}",
+                f"Sent {action} command to {target}"
+            )
+
+            # Remove cached SSH client since host is going down
+            key = f"{ssh_user}@{ssh_host}"
+            if key in ssh_clients:
+                try:
+                    ssh_clients[key].close()
+                except:
+                    pass
+                del ssh_clients[key]
+
+            return jsonify({"success": True, "target": target, "action": action})
+
+        except Exception as e:
+            logger.error(f"SSH error during {action} on {target}: {e}")
+            return jsonify({"error": str(e)}), 500
+
+    except Exception as e:
+        logger.error(f"Error in power action: {e}")
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/")
 def index():
     """Dashboard home page."""
-    return '''<!DOCTYPE html><html><head><title>SHADOWFAX // QUEUE ROUTER</title>
+    return '''<!DOCTYPE html><html><head><title>SHADOWFAX // FLEET MONITOR</title>
 <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Rajdhani:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
 :root{
@@ -969,7 +1391,7 @@ background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,0,0
 pointer-events:none;z-index:9999;opacity:0.3}
 h1{font-family:'Orbitron',monospace;color:var(--neon-cyan);font-size:2.2em;font-weight:900;letter-spacing:4px;
 text-shadow:var(--glow-cyan);border-bottom:2px solid var(--neon-cyan);padding-bottom:15px;margin-bottom:30px;
-text-transform:uppercase}
+text-transform:uppercase;text-align:center}
 h1::before{content:'◈ ';color:var(--neon-magenta)}
 h1::after{content:' ◈';color:var(--neon-magenta)}
 h3{margin-top:0;color:var(--neon-cyan);font-family:'Orbitron',monospace;font-size:1.1em;letter-spacing:2px;
@@ -978,7 +1400,7 @@ text-transform:uppercase;text-shadow:0 0 10px var(--neon-cyan)}
 border:1px solid #1a2332;box-shadow:0 0 20px rgba(0,255,242,0.1),inset 0 0 60px rgba(0,0,0,0.3)}
 .card::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;
 background:linear-gradient(90deg,transparent,var(--neon-cyan),transparent)}
-.online{color:var(--neon-green);font-weight:bold;text-shadow:var(--glow-green);animation:pulse 2s infinite}
+.online{color:var(--neon-green);font-weight:bold;text-shadow:var(--glow-green)}
 .offline{color:var(--neon-red);font-weight:bold;text-shadow:var(--glow-red);animation:pulse 1s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.7}}
 @keyframes glow-pulse{0%,100%{filter:brightness(1)}50%{filter:brightness(1.3)}}
@@ -1005,9 +1427,11 @@ letter-spacing:2px;color:var(--neon-cyan);text-shadow:0 0 10px var(--neon-cyan)}
 border:1px solid #2a2a4e;position:relative}
 .progress-bar::before{content:'';position:absolute;top:0;left:0;right:0;bottom:0;
 background:repeating-linear-gradient(90deg,transparent,transparent 10px,rgba(255,255,255,0.03) 10px,rgba(255,255,255,0.03) 20px)}
-.progress-fill{height:100%;transition:width 2s cubic-bezier(0.25,0.1,0.25,1);position:relative;animation:bar-breathe 4s ease-in-out infinite}
+.progress-fill{height:100%;transition:width 2s cubic-bezier(0.25,0.1,0.25,1);position:relative}
 .progress-fill::after{content:'';position:absolute;top:0;right:0;width:30px;height:100%;
-background:linear-gradient(90deg,transparent,rgba(255,255,255,0.4));animation:shimmer 2s ease-in-out infinite}
+background:linear-gradient(90deg,transparent,rgba(255,255,255,0.4));opacity:0.3}
+.progress-fill.progress-red{animation:bar-breathe 4s ease-in-out infinite}
+.progress-fill.progress-red::after{animation:shimmer 2s ease-in-out infinite}
 @keyframes bar-breathe{0%,100%{filter:brightness(1)}50%{filter:brightness(1.15)}}
 @keyframes shimmer{0%,100%{opacity:0.3}50%{opacity:0.8}}
 .progress-vram,.progress-ram,.progress-disk{background:linear-gradient(90deg,#00ff8844,var(--neon-green));box-shadow:0 0 20px #39ff1466}
@@ -1029,11 +1453,17 @@ box-shadow:var(--glow-cyan)}
 .sparkline-container{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
 .sparkline-box{background:var(--bg-panel);padding:12px;border-radius:4px;border:1px solid #1a2332}
 .sparkline-label{font-size:0.9em;color:#888;margin-bottom:8px;font-family:'Orbitron',monospace;letter-spacing:1px}
-.sparkline{height:45px;display:flex;align-items:end;gap:2px}
-.sparkline-bar{background:var(--neon-cyan);min-width:3px;border-radius:1px 1px 0 0;
-transition:height 0.5s cubic-bezier(0.4,0,0.2,1);box-shadow:0 0 5px var(--neon-cyan);animation:spark-glow 2s ease-in-out infinite}
+.sparkline{height:45px;display:flex;align-items:end;gap:2px;width:100%;overflow:hidden}
+.sparkline-bar{background:var(--neon-cyan);flex:1 1 0;min-width:0;border-radius:1px 1px 0 0;
+transition:height 0.5s cubic-bezier(0.4,0,0.2,1);box-shadow:0 0 5px var(--neon-cyan)}
 .sparkline-bar.high{background:var(--neon-yellow);box-shadow:0 0 5px var(--neon-yellow)}
-.sparkline-bar.critical{background:var(--neon-red);box-shadow:0 0 5px var(--neon-red)}
+.sparkline-bar.critical{background:var(--neon-red);box-shadow:0 0 5px var(--neon-red);animation:spark-glow 1.2s ease-in-out infinite}
+.history-machine{padding:15px 18px;border-radius:6px;margin-bottom:16px;border:1px solid #1a2332;overflow:hidden}
+.history-machine.alt-0{background:rgba(0,255,242,0.04)}
+.history-machine.alt-1{background:rgba(255,0,255,0.05)}
+.max-util{color:var(--neon-green);text-shadow:0 0 8px var(--neon-green);font-family:'Orbitron',monospace}
+.cost{color:var(--neon-green);font-family:'Orbitron',monospace;text-shadow:0 0 6px var(--neon-green)}
+#energy td,#energy-fleet td{font-size:0.95em}
 @keyframes spark-glow{0%,100%{opacity:0.85}50%{opacity:1}}
 .gauge-arc{}
 .progress-label{display:flex;justify-content:space-between;font-size:1em;color:#888;
@@ -1057,6 +1487,10 @@ color:var(--neon-cyan);text-shadow:0 0 10px var(--neon-cyan)}
 padding:10px 18px;border-radius:4px;cursor:pointer;font-family:'Orbitron',monospace;font-size:0.9em;
 letter-spacing:1px;text-transform:uppercase;transition:all 0.3s;margin-top:10px}
 .power-btn:hover{background:var(--neon-yellow);color:#000;box-shadow:var(--glow-yellow)}
+.swap-btn{background:transparent;color:var(--neon-cyan);border:1px solid var(--neon-cyan);
+padding:10px 18px;border-radius:4px;cursor:pointer;font-family:'Orbitron',monospace;font-size:0.9em;
+letter-spacing:1px;text-transform:uppercase;transition:all 0.3s;margin-top:10px;margin-left:10px}
+.swap-btn:hover{background:var(--neon-cyan);color:#000;box-shadow:var(--glow-cyan)}
 .job-time{color:#666;font-size:0.9em}
 .job-duration{color:var(--neon-green);font-weight:bold;font-family:'Orbitron',monospace;text-shadow:0 0 5px var(--neon-green)}
 .job-filters{display:flex;gap:8px;margin-bottom:15px;flex-wrap:wrap}
@@ -1067,8 +1501,43 @@ border-radius:4px;cursor:pointer;font-family:'Orbitron',monospace;font-size:0.85
 .queue-info{margin:10px 0 15px 0;font-family:'Orbitron',monospace;font-size:0.95em}
 .queue-count{color:var(--neon-yellow);text-shadow:0 0 8px var(--neon-yellow)}
 .jobs-today{color:#888;font-size:0.85em;margin-top:4px}
+.machine-power{display:flex;gap:6px;align-items:center}
+.machine-power button{background:transparent;border:1px solid #2a2a4e;color:#888;padding:4px 10px;
+border-radius:4px;cursor:pointer;font-family:'Orbitron',monospace;font-size:0.7em;
+letter-spacing:1px;text-transform:uppercase;transition:all 0.3s}
+.machine-power .reboot-btn:hover{border-color:var(--neon-yellow);color:var(--neon-yellow);box-shadow:0 0 10px rgba(255,255,0,0.3)}
+.machine-power .shutdown-btn:hover{border-color:var(--neon-red);color:var(--neon-red);box-shadow:0 0 10px rgba(255,0,68,0.3)}
+.fleet-row{display:grid;grid-template-columns:repeat(6,1fr);gap:8px}
+@media(max-width:900px){.fleet-row{grid-template-columns:repeat(3,1fr)}}
+@media(max-width:520px){.fleet-row{grid-template-columns:repeat(2,1fr)}}
+.fleet-tile{background:var(--bg-panel);border:1px solid #1a2332;border-radius:6px;padding:8px 10px;
+position:relative;overflow:hidden;font-size:0.78em;line-height:1.5}
+.fleet-tile::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;
+background:linear-gradient(90deg,var(--neon-green),transparent)}
+.fleet-tile.off::before{background:linear-gradient(90deg,var(--neon-red),transparent)}
+.fleet-tile.off{opacity:0.65}
+.ft-name{font-family:'Orbitron',monospace;font-size:0.85em;letter-spacing:1px;color:var(--neon-cyan);
+text-transform:uppercase;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:2px}
+.ft-stat{display:flex;justify-content:space-between;color:#9ab}
+.ft-stat b{font-family:'Orbitron',monospace;font-weight:400;color:var(--neon-green)}
+.ft-stat b.warn{color:var(--neon-yellow)}
+.ft-stat b.hot{color:var(--neon-red)}
+.ft-btn{width:100%;margin-top:5px;background:transparent;color:#667;border:1px solid #2a2a4e;
+padding:3px 0;border-radius:3px;cursor:pointer;font-family:'Orbitron',monospace;font-size:0.75em;
+letter-spacing:1px;text-transform:uppercase;transition:all 0.3s}
+.ft-btn:hover{border-color:var(--neon-yellow);color:var(--neon-yellow);box-shadow:0 0 8px rgba(255,255,0,0.3)}
+.ft-btn.wake:hover{border-color:var(--neon-green);color:var(--neon-green);box-shadow:0 0 8px rgba(57,255,20,0.3)}
+.ft-btns{display:flex;gap:4px;margin-top:5px}
+.ft-btns .ft-btn{margin-top:0;flex:1;padding:3px 0;font-size:0.72em}
+.ft-btn.down:hover{border-color:var(--neon-red);color:var(--neon-red);box-shadow:0 0 8px rgba(255,0,68,0.3)}
+.ft-btn:disabled{opacity:0.25;cursor:default}
+.ft-btn:disabled:hover{border-color:#2a2a4e;color:#667;box-shadow:none}
 </style></head>
-<body><h1>SHADOWFAX // QUEUE ROUTER</h1>
+<body><h1>SHADOWFAX // FLEET MONITOR</h1>
+
+<div class=card id=fleet-hosts style="padding:12px 15px;margin:12px 0">
+<div id=fleet-row class=fleet-row><p style="grid-column:1/-1;color:#667;margin:0">Scanning fleet hosts...</p></div>
+</div>
 
 <div class=card id=monitors><p>Loading...</p></div>
 <div class=card id=history>
@@ -1081,32 +1550,138 @@ border-radius:4px;cursor:pointer;font-family:'Orbitron',monospace;font-size:0.85
 </div>
 <div id="sparklines"><p>Loading history...</p></div>
 </div>
-<div class=card id=jobs>
-<h3>📋 Recent Jobs</h3>
-<div class="job-filters" id="job-filters"></div>
-<div id="job-list"><p>Loading...</p></div>
+
+<div class=card id=energy>
+<h3>⚡ Energy &amp; Cost — by Machine</h3>
+<div id="energy-by-machine"><p>Loading...</p></div>
+<p style="margin-top:12px;color:#666;font-size:0.8em">GPU power only (nvidia-smi) at PEC time-of-use rates. Excludes CPU/PSU overhead; Macs report no wattage.</p>
 </div>
 
-<div class=card><h3>🗺️ Routing Logic</h3>
+<div class=card><h3>🖥️ Fleet</h3>
 <table>
-<tr><th>Workflow Type</th><th>VRAM Needed</th><th>Routes To</th><th>Reason</th></tr>
-<tr><td>🎬 Video (AnimateDiff, Wan, etc)</td><td>&gt;48GB</td><td><b style="color:#d9a54a">GANDALF</b></td><td>Only GPU with enough VRAM</td></tr>
-<tr><td>🌊 Flux (full)</td><td>~24GB</td><td><b style="color:#d9a54a">GANDALF</b></td><td>Exceeds Frodo's 16GB</td></tr>
-<tr><td>⚡ Flux Schnell</td><td>~12GB</td><td><b style="color:#5a8a4a">Least busy</b></td><td>Load balanced</td></tr>
-<tr><td>🎨 SDXL</td><td>~12GB</td><td><b style="color:#5a8a4a">Least busy</b></td><td>Load balanced</td></tr>
-<tr><td>🖼️ SD 1.5</td><td>~6GB</td><td><b style="color:#5a8a4a">Least busy</b></td><td>Load balanced</td></tr>
+<tr><th>Machine</th><th>Hardware</th><th>GPU</th><th>Role</th></tr>
+<tr><td>🧙 <b>Gandalf</b></td><td>Ryzen 9 9950X · 256GB</td><td><b style="color:#d9a54a">RTX PRO 6000 · 96GB</b></td><td>Video + heavy generation</td></tr>
+<tr><td>🧝 <b>Frodo</b></td><td>Core i9-9900K · 128GB</td><td><b style="color:#5a8a4a">RTX 5090 · 32GB</b></td><td>Flux / SDXL generation</td></tr>
+<tr><td>🍎 <b>Pippin</b></td><td>Mac Studio M1 Max · 64GB</td><td><b style="color:#5a8a4a">32-core Apple GPU</b></td><td>Mac workloads</td></tr>
 </table>
-<p style="margin-top:15px;color:#888"><b>Load Balancing:</b> For jobs that fit on either GPU, Shadowfax picks the target with the shortest queue. If queues are equal, Gandalf (priority 1) is preferred.</p>
 </div>
 
-<div class=card><h3>📡 API Endpoints</h3><pre>POST /api/queue   - Submit workflow from ComfyUI
-GET  /api/status  - Get target status and recent jobs
-GET  /api/logs    - Get detailed job history
+<div class=card id=energy-fleet>
+<h3>⚡ Fleet Energy &amp; Cost — All Machines</h3>
+<div id="energy-fleet-body"><p>Loading...</p></div>
+</div>
+
+<div class=card><h3>📡 API Endpoints</h3><pre>GET  /api/status  - Target status + live metrics
+GET  /api/logs    - Job / usage history
+GET  /api/history - Historical metrics (range=hour|day|week|month)
+GET  /api/energy  - GPU energy + time-of-use cost (day/week/month)
 GET  /api/health  - Health check</pre>
 </div>
 
 <script>
-const icons = {gandalf: "🧙", frodo: "🧝", shadowfax: "🐴"};
+const icons = {gandalf: "🧙", frodo: "🧝", pippin: "🍎", shadowfax: "🐴"};
+const fleetIcons = {northfarthing: "🌾", eastfarthing: "🌾", southfarthing: "🌾", westfarthing: "🌾", shadowfax: "🐴", sam: "🌱"};
+
+function tempClass(t) { return t >= 85 ? "hot" : (t >= 70 ? "warn" : ""); }
+function pctClass(p) { return p >= 90 ? "hot" : (p >= 70 ? "warn" : ""); }
+
+let fleetInitialized = false;
+
+function fleetTileHtml(name, n) {
+    const icon = fleetIcons[name] || '🖥️';
+    let html = '<div class="fleet-tile' + (n.online ? '' : ' off') + '" id="fleet-tile-' + name + '">';
+    html += '<div class="ft-name">' + icon + ' ' + name + '</div>';
+    if (n.online) {
+        html += '<div class="ft-stat"><span>CPU</span><b class="' + pctClass(n.cpu) + '" id="ft-cpu-' + name + '">' + n.cpu + '%</b></div>';
+        html += '<div class="ft-stat"><span>TEMP</span><b class="' + tempClass(n.temp_c) + '" id="ft-temp-' + name + '">' + n.temp_c + '°C</b></div>';
+        html += '<div class="ft-stat"><span>RAM</span><b class="' + pctClass(n.ram_pct) + '" id="ft-ram-' + name + '">' + n.ram_used_gb + '/' + n.ram_total_gb + 'G</b></div>';
+    } else {
+        html += '<div class="ft-stat"><span style="color:var(--neon-red)">OFFLINE</span><b></b></div>';
+        html += '<div class="ft-stat"><span>&nbsp;</span><b></b></div>';
+        html += '<div class="ft-stat"><span>&nbsp;</span><b></b></div>';
+    }
+    if (n.can_wake) {
+        // Shire boxes: full power control — shutdown / restart / wake
+        html += '<div class="ft-btns">';
+        html += '<button class="ft-btn down" ' + (n.online ? '' : 'disabled ') + 'onclick="fleetPower(\\'' + name + '\\', \\'shutdown\\')" title="Shut down">⏻ Off</button>';
+        html += '<button class="ft-btn" ' + (n.online ? '' : 'disabled ') + 'onclick="fleetPower(\\'' + name + '\\', \\'reboot\\')" title="Restart">⟳ Boot</button>';
+        html += '<button class="ft-btn wake" ' + (n.online ? 'disabled ' : '') + 'onclick="fleetPower(\\'' + name + '\\', \\'wake\\')" title="Wake up">⚡ Wake</button>';
+        html += '</div>';
+    } else if (n.online) {
+        html += '<button class="ft-btn" onclick="fleetPower(\\'' + name + '\\', \\'reboot\\')">⟳ Reboot</button>';
+    } else {
+        html += '<button class="ft-btn" disabled>—</button>';
+    }
+    html += '</div>';
+    return html;
+}
+
+function refreshFleet() {
+    fetch('/api/fleet').then(r => r.json()).then(data => {
+        if (!fleetInitialized) {
+            let html = '';
+            for (const [name, n] of Object.entries(data)) {
+                html += fleetTileHtml(name, n);
+            }
+            document.getElementById('fleet-row').innerHTML = html;
+            for (const [name, n] of Object.entries(data)) {
+                const tile = document.getElementById('fleet-tile-' + name);
+                if (tile) tile.dataset.shape = n.online + ':' + n.can_wake;
+            }
+            fleetInitialized = true;
+            return;
+        }
+        // UPDATE PATH: only touch a tile when something about it changed
+        // (online/offline flips the button set, so those still get rebuilt;
+        // pure stat ticks update text in place).
+        for (const [name, n] of Object.entries(data)) {
+            const tile = document.getElementById('fleet-tile-' + name);
+            const key = n.online + ':' + n.can_wake;
+            if (!tile || tile.dataset.shape !== key) {
+                const html = fleetTileHtml(name, n);
+                if (tile) {
+                    tile.outerHTML = html;
+                } else {
+                    document.getElementById('fleet-row').insertAdjacentHTML('beforeend', html);
+                }
+                const newTile = document.getElementById('fleet-tile-' + name);
+                if (newTile) newTile.dataset.shape = key;
+                continue;
+            }
+            if (n.online) {
+                const cpuEl = document.getElementById('ft-cpu-' + name);
+                if (cpuEl && cpuEl.textContent !== n.cpu + '%') {
+                    cpuEl.textContent = n.cpu + '%';
+                    cpuEl.className = pctClass(n.cpu);
+                }
+                const tempEl = document.getElementById('ft-temp-' + name);
+                if (tempEl && tempEl.textContent !== n.temp_c + '°C') {
+                    tempEl.textContent = n.temp_c + '°C';
+                    tempEl.className = tempClass(n.temp_c);
+                }
+                const ramEl = document.getElementById('ft-ram-' + name);
+                const ramText = n.ram_used_gb + '/' + n.ram_total_gb + 'G';
+                if (ramEl && ramEl.textContent !== ramText) {
+                    ramEl.textContent = ramText;
+                    ramEl.className = pctClass(n.ram_pct);
+                }
+            }
+        }
+    }).catch(() => {});
+}
+
+function fleetPower(node, action) {
+    if (action === 'reboot' && !confirm('Reboot ' + node + (node === 'shadowfax' ? ' (this dashboard will go dark for ~2 min)' : '') + '?')) return;
+    if (action === 'shutdown' && !confirm('SHUT DOWN ' + node + '? It will stay off until you hit Wake.')) return;
+    fetch('/api/fleet_power', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({node: node, action: action})
+    }).then(r => r.json()).then(d => {
+        if (d.error) { alert('Failed: ' + d.error); return; }
+        if (action === 'wake') alert('Magic packets sent to ' + node + ' — it should appear within ~90s.');
+    }).catch(e => alert('Request failed: ' + e));
+}
 
 function progressBar(percent, cls, id) {
     let barClass = cls;
@@ -1122,6 +1697,9 @@ function updateProgressBar(id, percent, baseClass) {
         let barClass = baseClass;
         if (percent > 90) barClass = 'progress-red';
         else if (percent > 70) barClass = 'progress-yellow';
+        const key = barClass + ':' + percent;
+        if (el.dataset.lastVal === key) return;  // unchanged - skip the write
+        el.dataset.lastVal = key;
         el.className = 'progress-fill ' + barClass;
         el.style.width = percent + '%';
     }
@@ -1130,6 +1708,10 @@ function updateProgressBar(id, percent, baseClass) {
 // Track if initial render is done
 let initialized = false;
 let lastData = null;
+
+// Error tracking for auto-reload
+let consecutiveErrors = 0;
+let reloadCountdown = null;
 
 // Smoothly update a gauge arc
 function updateGaugeArc(id, percent, color) {
@@ -1249,33 +1831,99 @@ function renderSwapGauge(value, max, size, id) {
         '<div class="gauge-value" style="color:' + color + ';text-shadow:0 0 10px ' + color + '">' + displayValue + '</div></div>';
 }
 
-function setupPowerButtons() {
-    document.querySelectorAll('.power-btn').forEach(btn => {
-        btn.onclick = function() {
-            const target = this.dataset.target;
-            const current = this.dataset.current;
-            const max = this.dataset.max;
-            const watts = prompt('Set GPU power limit for ' + target + ' (100-' + max + 'W):', current);
-            if (watts === null) return;
-            const w = parseInt(watts);
-            if (isNaN(w) || w < 100 || w > max) {
-                alert('Invalid value. Must be between 100 and ' + max);
-                return;
+// Event delegation for all action buttons
+document.addEventListener('click', function(e) {
+    const btn = e.target.closest('button');
+    if (!btn) return;
+
+    if (btn.classList.contains('power-btn')) {
+        const target = btn.dataset.target;
+        const current = btn.dataset.current;
+        const max = parseInt(btn.dataset.max);
+        const watts = prompt('Set GPU power limit for ' + target + ' (100-' + max + 'W):', current);
+        if (watts === null) return;
+        const w = parseInt(watts);
+        if (isNaN(w) || w < 100 || w > max) {
+            alert('Invalid value. Must be between 100 and ' + max);
+            return;
+        }
+        fetch('/api/power_limit', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({target: target, watts: w})
+        }).then(r => r.json()).then(data => {
+            if (data.success) { refresh(); }
+            else { alert('Failed: ' + (data.error || 'Unknown error')); }
+        }).catch(err => alert('Error: ' + err));
+    }
+
+    if (btn.classList.contains('swap-btn')) {
+        const target = btn.dataset.target;
+        if (!confirm('Clear swap on ' + target + '? This forces swapped data back into RAM.')) return;
+        btn.disabled = true;
+        btn.textContent = 'Clearing...';
+        fetch('/api/clear_swap', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({target: target})
+        }).then(r => r.json()).then(data => {
+            if (data.success) {
+                btn.textContent = 'Cleared!';
+                setTimeout(() => { btn.textContent = 'Clear Swap'; btn.disabled = false; }, 2000);
+            } else {
+                alert('Failed: ' + (data.error || 'Unknown error'));
+                btn.textContent = 'Clear Swap'; btn.disabled = false;
             }
-            fetch('/api/power_limit', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({target: target, watts: w})
-            }).then(r => r.json()).then(data => {
-                if (data.success) {
-                    refresh();
-                } else {
-                    alert('Failed: ' + (data.error || 'Unknown error'));
-                }
-            }).catch(err => alert('Error: ' + err));
-        };
-    });
-}
+        }).catch(err => {
+            alert('Error: ' + err);
+            btn.textContent = 'Clear Swap'; btn.disabled = false;
+        });
+    }
+
+    if (btn.classList.contains('reboot-btn')) {
+        const target = btn.dataset.target;
+        btn.disabled = true;
+        btn.textContent = '...';
+        fetch('/api/power', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({target: target, action: 'reboot'})
+        }).then(r => r.json()).then(data => {
+            if (data.success) {
+                btn.textContent = 'Sent';
+                setTimeout(() => { btn.innerHTML = '&#x21bb;'; btn.disabled = false; }, 3000);
+            } else {
+                alert('Reboot failed: ' + (data.error || 'Unknown error'));
+                btn.innerHTML = '&#x21bb;'; btn.disabled = false;
+            }
+        }).catch(err => {
+            alert('Error: ' + err);
+            btn.innerHTML = '&#x21bb;'; btn.disabled = false;
+        });
+    }
+
+    if (btn.classList.contains('shutdown-btn')) {
+        const target = btn.dataset.target;
+        if (!confirm('Are you sure you want to shut down ' + target + '?')) return;
+        btn.disabled = true;
+        btn.textContent = '...';
+        fetch('/api/power', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({target: target, action: 'shutdown'})
+        }).then(r => r.json()).then(data => {
+            if (data.success) {
+                btn.textContent = 'Sent';
+            } else {
+                alert('Shutdown failed: ' + (data.error || 'Unknown error'));
+                btn.innerHTML = '&#x23FB;'; btn.disabled = false;
+            }
+        }).catch(err => {
+            alert('Error: ' + err);
+            btn.innerHTML = '&#x23FB;'; btn.disabled = false;
+        });
+    }
+});
 
 function formatJobTime(isoString) {
     if (!isoString) return "";
@@ -1301,6 +1949,10 @@ function updateGauge(id, value, min, max, unit, showLimit, colorFn) {
     const angle = -90 + (percent * 1.8);
     const color = colorFn(percent);
     const displayValue = showLimit ? Math.round(value) + '/' + max + unit : Math.round(value) + unit;
+
+    const key = Math.round(angle * 10) + ':' + color + ':' + displayValue;
+    if (gauge.dataset.lastVal === key) return;  // unchanged - skip the write
+    gauge.dataset.lastVal = key;
 
     const needle = gauge.querySelector('.gauge-needle');
     const center = gauge.querySelector('.gauge-center');
@@ -1330,17 +1982,52 @@ function refresh() {
                 const icon = icons[name] || "🖥️";
                 const status = info.online ? '<span class="online">ONLINE</span>' : '<span class="offline">OFFLINE</span>';
 
-                html += '<div class="gpu-card" id="card-' + name + '">';
-                html += '<div class="gpu-header"><span class="gpu-name">' + icon + ' ' + name + '</span><span id="status-' + name + '">' + status + '</span></div>';
+                const isMac = info.os === 'mac';
 
-                const queueCount = info.queue_running + info.queue_pending;
-                const jobsToday = info.jobs_today || 0;
+                html += '<div class="gpu-card" id="card-' + name + '">';
+                html += '<div class="gpu-header"><span class="gpu-name">' + icon + ' ' + name + '</span>';
+                html += '<div style="display:flex;align-items:center;gap:10px"><span id="status-' + name + '">' + status + '</span>';
+                if (!isMac) {
+                    html += '<div class="machine-power">';
+                    html += '<button class="reboot-btn" data-target="' + name + '" title="Reboot">&#x21bb;</button>';
+                    html += '<button class="shutdown-btn" data-target="' + name + '" title="Shut Down">&#x23FB;</button>';
+                    html += '</div>';
+                }
+                html += '</div></div>';
+
+                const maxUtil = (info.max_util_today === null || info.max_util_today === undefined) ? '--' : info.max_util_today;
                 html += '<div class="queue-info">';
-                html += '<div class="jobs-today" id="jobs-today-' + name + '">' + jobsToday + ' jobs today</div>';
-                html += '<div class="queue-count" id="queue-' + name + '">' + queueCount + ' Queued</div>';
+                html += '<div class="max-util" id="maxutil-' + name + '">' + maxUtil + '% max utilization today</div>';
                 html += '</div>';
 
-                if (info.online && info.gpu) {
+                if (info.online && isMac) {
+                    html += '<div class="gauge-row">';
+                    html += renderGauge(info.gpu_util, 0, 100, "GPU UTIL", "%", false, 1.5, true, 'util-' + name);
+                    html += renderGauge(info.cpu_percent, 0, 100, "CPU", "%", false, 1.5, false, 'cpu-' + name);
+                    html += '</div>';
+                    html += '<div class="gauge-row">';
+                    const swapPct = info.swap ? info.swap.percent : 0;
+                    html += renderSwapGauge(swapPct, 100, 1, 'swap-' + name);
+                    html += '</div>';
+
+                    if (info.ram) {
+                        html += '<div class="stat-row">';
+                        html += '<div class="progress-label"><span>🧠 Memory</span><span id="ram-label-' + name + '">' + info.ram.used_gb + ' / ' + info.ram.total_gb + ' GB</span></div>';
+                        html += progressBar(info.ram.percent, "progress-ram", 'ram-' + name);
+                        html += '</div>';
+                    }
+
+                    if (info.disk) {
+                        const diskUsed = info.disk.total_gb >= 1000 ? (info.disk.used_gb / 1024).toFixed(1) + ' TB' : info.disk.used_gb + ' GB';
+                        const diskTotal = info.disk.total_gb >= 1000 ? (info.disk.total_gb / 1024).toFixed(1) + ' TB' : info.disk.total_gb + ' GB';
+                        html += '<div class="stat-row">';
+                        html += '<div class="progress-label"><span>💿 Disk</span><span id="disk-label-' + name + '">' + diskUsed + ' / ' + diskTotal + '</span></div>';
+                        html += progressBar(info.disk.percent, "progress-disk", 'disk-' + name);
+                        html += '</div>';
+                    }
+
+                    html += '<div style="margin-top:10px;font-size:0.85em;color:#888">Apple M1 Max · 64GB Unified · 32-core GPU</div>';
+                } else if (info.online && info.gpu) {
                     html += '<div class="gauge-row">';
                     html += renderGauge(info.gpu_util, 0, 100, "GPU UTIL", "%", false, 1.5, true, 'util-' + name);
                     html += renderGauge(info.gpu_watts, 0, info.gpu_power_max, "POWER", "W", true, 1.5, false, 'power-' + name);
@@ -1352,6 +2039,7 @@ function refresh() {
                     html += renderSwapGauge(swapPct, 100, 1, 'swap-' + name);
                     html += '</div>';
                     html += '<button class="power-btn" data-target="' + name + '" data-current="' + info.gpu_power_limit + '" data-max="' + info.gpu_power_max + '">⚡ Set Power Limit</button>';
+                    html += '<button class="swap-btn" data-target="' + name + '">🧹 Clear Swap</button>';
 
                     html += '<div class="stat-row">';
                     html += '<div class="progress-label"><span>🎮 VRAM</span><span id="vram-label-' + name + '">' + info.gpu.vram_used_gb + ' / ' + info.gpu.vram_total_gb + ' GB</span></div>';
@@ -1387,26 +2075,46 @@ function refresh() {
                     html += '<div style="margin-top:10px;font-size:0.85em;color:#888">' + info.gpu.name + (info.gpu.cuda_version ? ' (CUDA ' + info.gpu.cuda_version + ')' : '') + '</div>';
                 }
 
-                html += '<div style="margin-top:10px"><a href="' + info.url + '" style="color:var(--neon-cyan);font-size:0.9em">Open ComfyUI →</a></div>';
+                if (info.url) {
+                    html += '<div style="margin-top:10px"><a href="' + info.url + '" target="comfyui-' + name + '" style="color:var(--neon-cyan);font-size:0.9em">Open ComfyUI →</a></div>';
+                }
                 html += '</div>';
             }
             html += '</div>';
             document.getElementById("monitors").innerHTML = html;
-            setupPowerButtons();
             initialized = true;
 
         } else {
             // UPDATE PATH: Just update values in place
             for (const [name, info] of Object.entries(data.targets)) {
-                // Update queue info
-                const queueCount = info.queue_running + info.queue_pending;
-                const jobsToday = info.jobs_today || 0;
-                const queueEl = document.getElementById('queue-' + name);
-                const jobsTodayEl = document.getElementById('jobs-today-' + name);
-                if (queueEl) queueEl.textContent = queueCount + ' Queued';
-                if (jobsTodayEl) jobsTodayEl.textContent = jobsToday + ' jobs today';
+                // Update max utilization today
+                const maxUtilEl = document.getElementById('maxutil-' + name);
+                if (maxUtilEl) {
+                    const maxUtil = (info.max_util_today === null || info.max_util_today === undefined) ? '--' : info.max_util_today;
+                    maxUtilEl.textContent = maxUtil + '% max utilization today';
+                }
 
-                if (info.online && info.gpu) {
+                if (info.online && info.os === 'mac') {
+                    updateGauge('util-' + name, info.gpu_util, 0, 100, '%', false, getUtilColor);
+                    updateGauge('cpu-' + name, info.cpu_percent, 0, 100, '%', false, getNormalColor);
+                    const swapPct = info.swap ? info.swap.percent : 0;
+                    updateGauge('swap-' + name, swapPct, 0, 100, '%', false, getSwapColor);
+
+                    if (info.ram) {
+                        updateProgressBar('ram-' + name, info.ram.percent, 'progress-ram');
+                        const ramLabel = document.getElementById('ram-label-' + name);
+                        if (ramLabel) ramLabel.textContent = info.ram.used_gb + ' / ' + info.ram.total_gb + ' GB';
+                    }
+                    if (info.disk) {
+                        updateProgressBar('disk-' + name, info.disk.percent, 'progress-disk');
+                        const diskLabel = document.getElementById('disk-label-' + name);
+                        if (diskLabel) {
+                            const diskUsed = info.disk.total_gb >= 1000 ? (info.disk.used_gb / 1024).toFixed(1) + ' TB' : info.disk.used_gb + ' GB';
+                            const diskTotal = info.disk.total_gb >= 1000 ? (info.disk.total_gb / 1024).toFixed(1) + ' TB' : info.disk.total_gb + ' GB';
+                            diskLabel.textContent = diskUsed + ' / ' + diskTotal;
+                        }
+                    }
+                } else if (info.online && info.gpu) {
                     // Update gauges
                     updateGauge('util-' + name, info.gpu_util, 0, 100, '%', false, getUtilColor);
                     updateGauge('power-' + name, info.gpu_watts, 0, info.gpu_power_max, 'W', true, getNormalColor);
@@ -1452,69 +2160,44 @@ function refresh() {
                 }
             }
         }
+        // Success - reset error tracking
+        consecutiveErrors = 0;
+        if (reloadCountdown) {
+            clearInterval(reloadCountdown);
+            reloadCountdown = null;
+        }
     }).catch(err => {
         console.error('Error fetching status:', err);
-        document.getElementById("monitors").innerHTML = "<p style='color:#f44'>Error loading status: " + err.message + "</p>";
-    });
+        consecutiveErrors++;
 
-    fetch("/api/logs").then(r => r.json()).then(data => {
-        const jobs = data.jobs || [];
+        // Show error with auto-reload countdown
+        let secondsLeft = 5;
+        const updateMessage = () => {
+            document.getElementById("monitors").innerHTML =
+                "<p style='color:#f44'>Error loading status: " + err.message + "</p>" +
+                "<p style='color:#888'>Retrying in <span id='countdown'>" + secondsLeft + "</span> seconds...</p>";
+        };
+        updateMessage();
 
-        // Build filter buttons - show all known targets, not just ones with jobs
-        const knownTargets = ['gandalf', 'frodo'];
-        let filterHtml = '<button class="job-filter active" data-target="all">ALL</button>';
-        knownTargets.forEach(t => {
-            const icon = icons[t] || "🖥️";
-            filterHtml += '<button class="job-filter" data-target="' + t + '">' + icon + ' ' + t.toUpperCase() + '</button>';
-        });
-        document.getElementById("job-filters").innerHTML = filterHtml;
+        // Clear any existing countdown
+        if (reloadCountdown) clearInterval(reloadCountdown);
 
-        // Count jobs today
-        const today = new Date().toDateString();
-        const jobsToday = jobs.filter(j => new Date(j.submitted_at).toDateString() === today).length;
-
-        // Store jobs data globally for filtering
-        window.allJobs = jobs;
-        window.jobsToday = jobsToday;
-
-        // Setup filter click handlers
-        document.querySelectorAll('.job-filter').forEach(btn => {
-            btn.onclick = function() {
-                document.querySelectorAll('.job-filter').forEach(b => b.classList.remove('active'));
-                this.classList.add('active');
-                renderJobs(this.dataset.target);
-            };
-        });
-
-        renderJobs('all');
-    }).catch(err => {
-        console.error('Error fetching jobs:', err);
-        document.getElementById("job-list").innerHTML = "<p style='color:#f44'>Error loading jobs: " + err.message + "</p>";
-    });
-}
-
-function renderJobs(targetFilter) {
-    const jobs = window.allJobs || [];
-    const filtered = targetFilter === 'all' ? jobs : jobs.filter(j => j.target === targetFilter);
-
-    let html = '';
-    if (filtered.length === 0) {
-        html += "<p style='color:#888'>No jobs yet - use the Router button in ComfyUI!</p>";
-    } else {
-        filtered.slice(0, 15).forEach(j => {
-            const cls = j.is_video ? "job video" : (j.status === "completed" ? "job completed" : "job");
-            const modelTypes = j.model_types || [];
-            const models = modelTypes.length ? modelTypes.join(", ") : "standard";
-            const timeStr = formatJobTime(j.submitted_at);
-            const icon = icons[j.target] || "🖥️";
-            let timing = '<span class="job-time">' + timeStr + '</span>';
-            if (j.status === "completed" && j.duration) {
-                timing += ' <span class="job-duration">⏱ ' + j.duration + '</span>';
+        // Start countdown
+        reloadCountdown = setInterval(() => {
+            secondsLeft--;
+            const el = document.getElementById('countdown');
+            if (el) el.textContent = secondsLeft;
+            if (secondsLeft <= 0) {
+                clearInterval(reloadCountdown);
+                reloadCountdown = null;
+                // After 3 consecutive errors, do a full page reload
+                if (consecutiveErrors >= 3) {
+                    location.reload();
+                }
             }
-            html += '<div class="' + cls + '"><b>' + j.id + '</b> → ' + icon + ' <b style="text-transform:capitalize">' + j.target + '</b> | ' + models + ' | ' + timing + '</div>';
-        });
-    }
-    document.getElementById("job-list").innerHTML = html;
+        }, 1000);
+    });
+
 }
 
 let currentRange = 'hour';
@@ -1555,17 +2238,20 @@ function refreshHistory() {
     fetch('/api/history?range=' + currentRange).then(r => r.json()).then(data => {
         let html = '';
 
+        let idx = 0;
         for (const [target, points] of Object.entries(data.data)) {
             const icon = icons[target] || '🖥️';
-            html += '<div style="margin-bottom:20px"><h4 style="margin:0 0 10px 0;color:#ccc">' + icon + ' ' + target.charAt(0).toUpperCase() + target.slice(1) + '</h4>';
+            html += '<div class="history-machine alt-' + (idx % 2) + '"><h4 style="margin:0 0 12px 0;color:#ccc">' + icon + ' ' + target.charAt(0).toUpperCase() + target.slice(1) + '</h4>';
             html += '<div class="sparkline-container">';
             html += renderSparkline(points, 'gpu_util', 100, '🎮 GPU Util %');
             html += renderSparkline(points, 'cpu_percent', 100, '💻 CPU %');
             html += renderSparkline(points, 'gpu_temp', 90, '🌡️ Temp °C');
             html += renderSparkline(points, 'vram_percent', 100, '🎮 VRAM %');
+            html += renderSparkline(points, 'ram_percent', 100, '🧠 RAM %');
             html += renderSparkline(points, 'swap_percent', 100, '⚠️ Swap %');
             html += renderSparkline(points, 'queue_depth', null, '📋 Queue');
             html += '</div></div>';
+            idx++;
         }
 
         if (!html) {
@@ -1578,11 +2264,175 @@ function refreshHistory() {
     });
 }
 
+function fmtCell(ec) {
+    if (!ec) return '<span style="color:#555">--</span>';
+    return '<b style="color:var(--neon-cyan)">' + ec.kwh.toFixed(2) + '</b> kWh<br><b class="cost">$' + ec.cost.toFixed(2) + '</b>';
+}
+
+function refreshEnergy() {
+    fetch('/api/energy').then(r => r.json()).then(data => {
+        const order = ['gandalf', 'frodo', 'pippin'];
+        const names = order.filter(n => n in data.by_machine)
+            .concat(Object.keys(data.by_machine).filter(n => !order.includes(n)));
+
+        // Per-machine table
+        let rows = '<table><tr><th>Machine</th><th>Today</th><th>This Week</th><th>This Month</th></tr>';
+        names.forEach(name => {
+            const m = data.by_machine[name];
+            const icon = icons[name] || '🖥️';
+            const label = name.charAt(0).toUpperCase() + name.slice(1);
+            if (!m || m.metered === false) {
+                rows += '<tr><td>' + icon + ' <b>' + label + '</b></td>'
+                     + '<td colspan="3" style="color:#666">no power sensor (Mac - needs sudo powermetrics)</td></tr>';
+            } else {
+                rows += '<tr><td>' + icon + ' <b>' + label + '</b></td><td>' + fmtCell(m.day)
+                     + '</td><td>' + fmtCell(m.week) + '</td><td>' + fmtCell(m.month) + '</td></tr>';
+            }
+        });
+        rows += '</table>';
+        document.getElementById('energy-by-machine').innerHTML = rows;
+
+        // Fleet aggregate
+        const f = data.fleet;
+        let fleet = '<table><tr><th>Period</th><th>GPU Energy</th><th>Cost</th></tr>';
+        [['Today', 'day'], ['This Week', 'week'], ['This Month', 'month']].forEach(([lbl, k]) => {
+            fleet += '<tr><td><b>' + lbl + '</b></td><td><b style="color:var(--neon-cyan)">'
+                  + f[k].kwh.toFixed(2) + '</b> kWh</td><td><b class="cost">$' + f[k].cost.toFixed(2) + '</b></td></tr>';
+        });
+        fleet += '</table>';
+        fleet += '<p style="margin-top:10px;color:#666;font-size:0.8em">Base ' + data.base_per_kwh.toFixed(6)
+              + ' $/kWh + PEC time-of-use. ' + data.note + '</p>';
+        document.getElementById('energy-fleet-body').innerHTML = fleet;
+    }).catch(err => {
+        document.getElementById('energy-by-machine').innerHTML = '<p style="color:#d94a4a">Error loading energy: ' + err + '</p>';
+    });
+}
+
+// --- Polling control: pause everything when the tab isn't visible, resume ---
+// --- with an immediate refresh when it becomes visible again.              ---
+let statusTimer = null, fleetTimer = null, historyTimer = null, energyTimer = null;
+
+function startPolling() {
+    if (!statusTimer) statusTimer = setInterval(refresh, 12000);     // queue/GPU state: 12s
+    if (!fleetTimer) fleetTimer = setInterval(refreshFleet, 45000);  // ssh fleet stats: 45s
+    if (!historyTimer) historyTimer = setInterval(refreshHistory, 60000);
+    if (!energyTimer) energyTimer = setInterval(refreshEnergy, 60000);
+}
+
+function stopPolling() {
+    clearInterval(statusTimer); statusTimer = null;
+    clearInterval(fleetTimer); fleetTimer = null;
+    clearInterval(historyTimer); historyTimer = null;
+    clearInterval(energyTimer); energyTimer = null;
+}
+
+document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+        stopPolling();
+    } else {
+        // Immediate catch-up refresh, then resume the interval cadence.
+        refresh();
+        refreshFleet();
+        refreshHistory();
+        refreshEnergy();
+        startPolling();
+    }
+});
+
 refresh();
 refreshHistory();
-setInterval(refresh, 2000);
-setInterval(refreshHistory, 60000);  // Refresh history every minute
+refreshEnergy();
+refreshFleet();
+if (!document.hidden) startPolling();
 </script></body></html>'''
+
+def rate_for(dt):
+    """Total $/kWh (base + time-of-use period charge) for a given datetime."""
+    season = ELECTRIC_RATES["seasons"].get(dt.month, "shoulder")
+    sched = ELECTRIC_RATES["schedule"][season]
+    base = ELECTRIC_RATES["base_per_kwh"]
+    hour = dt.hour
+    for tier in ("peak", "mid"):
+        info = sched.get(tier)
+        if info:
+            for start, end in info["hours"]:
+                if start <= hour < end:
+                    return base + info["charge"]
+    return base + sched["off_peak"]
+
+
+def energy_cost_since(conn, target, since):
+    """Integrate GPU energy (kWh) and $ cost for a target since a datetime.
+
+    Trapezoidal integration over the sampled gpu_watts series. Gaps larger than
+    GAP_CAP seconds (host offline / restart) are clamped so downtime is not
+    counted as steady draw. Cost uses the TOU rate at each segment's start time.
+    """
+    GAP_CAP = 300  # seconds
+    cursor = conn.execute(
+        "SELECT timestamp, gpu_watts FROM metrics_history "
+        "WHERE target = ? AND timestamp >= ? AND gpu_watts IS NOT NULL "
+        "ORDER BY timestamp ASC",
+        (target, since.isoformat())
+    )
+    rows = cursor.fetchall()
+    kwh = 0.0
+    cost = 0.0
+    prev_t = None
+    prev_w = None
+    for ts, w in rows:
+        try:
+            t = datetime.fromisoformat(ts)
+        except (ValueError, TypeError):
+            continue
+        if prev_t is not None:
+            dt_s = min((t - prev_t).total_seconds(), GAP_CAP)
+            if dt_s > 0:
+                seg_kwh = ((prev_w + w) / 2.0) * (dt_s / 3600.0) / 1000.0
+                kwh += seg_kwh
+                cost += seg_kwh * rate_for(prev_t)
+        prev_t = t
+        prev_w = w
+    return {"kwh": round(kwh, 3), "cost": round(cost, 2)}
+
+
+@app.route("/api/energy", methods=["GET"])
+def get_energy():
+    """GPU energy (kWh) and time-of-use cost per machine and fleet-wide,
+    for the current day, week (since Monday), and month (since the 1st)."""
+    now = datetime.now()
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    week_start = day_start - timedelta(days=day_start.weekday())  # Monday 00:00
+    month_start = day_start.replace(day=1)
+    windows = {"day": day_start, "week": week_start, "month": month_start}
+
+    conn = sqlite3.connect(CONFIG["db_path"])
+    by_machine = {}
+    fleet = {w: {"kwh": 0.0, "cost": 0.0} for w in windows}
+    for name, cfg in CONFIG["targets"].items():
+        # Macs report no wattage (powermetrics needs sudo), so they aren't metered
+        if cfg.get("os") == "mac":
+            by_machine[name] = {"metered": False}
+            continue
+        by_machine[name] = {"metered": True}
+        for wname, wstart in windows.items():
+            ec = energy_cost_since(conn, name, wstart)
+            by_machine[name][wname] = ec
+            fleet[wname]["kwh"] += ec["kwh"]
+            fleet[wname]["cost"] += ec["cost"]
+    conn.close()
+
+    for w in fleet:
+        fleet[w]["kwh"] = round(fleet[w]["kwh"], 3)
+        fleet[w]["cost"] = round(fleet[w]["cost"], 2)
+
+    return jsonify({
+        "base_per_kwh": ELECTRIC_RATES["base_per_kwh"],
+        "note": "GPU power only (nvidia-smi); excludes CPU/PSU overhead. Macs report no wattage.",
+        "by_machine": by_machine,
+        "fleet": fleet,
+    })
+
 
 @app.route("/api/health", methods=["GET"])
 def health():
@@ -1694,6 +2544,9 @@ def get_history():
 
             result[target] = aggregated
 
+    # Only surface configured targets, in CONFIG order (gandalf, frodo, pippin)
+    result = {t: result[t] for t in CONFIG["targets"] if t in result}
+
     return jsonify({
         "range": range_param,
         "data": result
@@ -1732,10 +2585,6 @@ def aggregate_bucket(bucket):
 if __name__ == "__main__":
     init_db()
 
-    # Start background job completion checker
-    completion_thread = threading.Thread(target=check_job_completion, daemon=True)
-    completion_thread.start()
-
     # Start background metrics collector
     metrics_thread = threading.Thread(target=collect_metrics, daemon=True)
     metrics_thread.start()
@@ -1744,9 +2593,13 @@ if __name__ == "__main__":
     sync_thread = threading.Thread(target=sync_comfyui_jobs, daemon=True)
     sync_thread.start()
 
+    # Start ComfyUI watchdog (auto-restart if down)
+    watchdog_thread = threading.Thread(target=comfyui_watchdog_loop, daemon=True)
+    watchdog_thread.start()
+
     logger.info("")
     logger.info("=" * 60)
-    logger.info("  SHADOWFAX QUEUE ROUTER")
+    logger.info("  SHADOWFAX FLEET MONITOR")
     logger.info("=" * 60)
     logger.info(f"  Listening: http://0.0.0.0:5000")
     logger.info(f"  Dashboard: http://shadowfax.local")
