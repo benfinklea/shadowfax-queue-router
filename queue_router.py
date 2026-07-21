@@ -79,6 +79,7 @@ CONFIG = {
             "ssh_host": "192.168.1.122",
             "ssh_user": "ben",
             "os": "linux",
+            "net": "eth",
             "vram_gb": 96,
             "gpu_power_limit": 450,
             "gpu_power_max": 600,
@@ -89,6 +90,7 @@ CONFIG = {
             "ssh_host": "192.168.1.105",
             "ssh_user": "ben",
             "os": "linux",
+            "net": "eth",
             "vram_gb": 32,
             "gpu_power_limit": 575,
             "gpu_power_max": 600,
@@ -98,6 +100,7 @@ CONFIG = {
             "ssh_host": "pippen",
             "ssh_user": "ben",
             "os": "mac",
+            "net": "eth",
             "vram_gb": 64,
             "disk_path": "/"
         }
@@ -110,13 +113,28 @@ CONFIG = {
 # "local": metrics come from this box itself (no SSH). "mac" is for Wake-on-LAN
 # (all farthings have WoL enabled at NIC + BIOS level; sam/shadowfax N/A).
 FLEET_NODES = {
-    "northfarthing": {"ssh_host": "192.168.1.134", "ssh_user": "ben", "wol_mac": "84:47:09:65:43:c3"},
-    "eastfarthing":  {"ssh_host": "192.168.1.137", "ssh_user": "ben", "wol_mac": "84:47:09:62:ef:60"},
-    "southfarthing": {"ssh_host": "192.168.1.136", "ssh_user": "ben", "wol_mac": "84:47:09:65:42:5b"},
-    "westfarthing":  {"ssh_host": "192.168.1.139", "ssh_user": "ben", "wol_mac": "84:47:09:65:42:85"},
-    "shadowfax":     {"local": True},
-    "sam":           {"ssh_host": "100.94.125.84", "ssh_user": "ben"},
+    "northfarthing": {"ssh_host": "192.168.1.147", "ssh_user": "ben", "wol_mac": "84:47:09:65:43:c0", "net": "eth"},
+    "eastfarthing":  {"ssh_host": "192.168.1.145", "ssh_user": "ben", "wol_mac": "84:47:09:62:ef:69", "net": "eth"},
+    "southfarthing": {"ssh_host": "192.168.1.146", "ssh_user": "ben", "wol_mac": "84:47:09:65:42:58", "net": "eth"},
+    "westfarthing":  {"ssh_host": "192.168.1.138", "ssh_user": "ben", "wol_mac": "84:47:09:65:42:88", "net": "eth"},
+    "shadowfax":     {"local": True, "net": "wifi"},
+    "sam":           {"ssh_host": "192.168.1.135", "ssh_user": "ben", "net": "wifi"},
 }
+
+# --- Glance-view additions (2026-07-19): CI queue depth + local model-route
+# health. Goal: "the Shire is flapping" should read as ONE clear signal
+# instead of an OK/FAIL/OK phone-push flap. Both secrets below are read live
+# over SSH from gandalf every poll (cached) - NEVER hardcoded here - reusing
+# the exact same ben@gandalf SSH channel already used above for reboot/power
+# actions. That keeps this file free of any GitHub token or gateway key.
+GITHUB_CI_REPO = "armbrain-io/armbrain"
+GH_TOKEN_ENV_PATH = "/opt/overflow-controller/gh-token.env"   # same file the Shire autoscaler mints/refreshes every 15 min
+GATEWAY_KEY_ENV_PATH = "~/.config/gandalf-gateway/fleet.env"  # canonical fleet gateway key (per infra rules)
+GATEWAY_MODELS_URL = "http://gandalf.local:4000/v1/models"
+# The 🔒 local-only routes from the fleet gateway table - the ones that should
+# always be up. (opus/sonnet/codex/gemini/etc. are external and expected to
+# come and go with vendor availability, so they're left off this glance tile.)
+LOCAL_GATEWAY_ROUTES = ["fast", "code", "code-glm", "reason", "coder", "big", "cheap"]
 
 # One-shot metrics: cpu% (0.6s /proc/stat delta), ram MB, hottest sensor (milli-C)
 FLEET_METRICS_CMD = (
@@ -144,19 +162,20 @@ def get_fleet_node_metrics(name, cfg):
         else:
             client = get_ssh_client(cfg["ssh_host"], cfg.get("ssh_user", "ben"))
             if client is None:
-                return {"name": name, "online": False, "can_wake": bool(cfg.get("wol_mac"))}
+                return {"name": name, "online": False, "can_wake": bool(cfg.get("wol_mac")), "net": cfg.get("net")}
             # no extra bash -c wrapper: the CMD contains single quotes, and sshd
             # already hands the command line to the login shell (bash here)
             _, stdout, _ = client.exec_command(FLEET_METRICS_CMD, timeout=15)
             out = stdout.read().decode()
     except Exception as e:
         logger.debug(f"fleet metrics {name}: {e}")
-        return {"name": name, "online": False, "can_wake": bool(cfg.get("wol_mac"))}
+        return {"name": name, "online": False, "can_wake": bool(cfg.get("wol_mac")), "net": cfg.get("net")}
     m = dict(kv.split("=") for kv in (out or "").split() if "=" in kv)
     if "cpu" not in m:
-        return {"name": name, "online": False, "can_wake": bool(cfg.get("wol_mac"))}
+        return {"name": name, "online": False, "can_wake": bool(cfg.get("wol_mac")), "net": cfg.get("net")}
     return {
         "name": name, "online": True,
+        "net": cfg.get("net"),
         "cpu": int(m.get("cpu", 0)),
         "ram_used_gb": round(int(m.get("ram_used", 0)) / 1024, 1),
         "ram_total_gb": round(int(m.get("ram_total", 0)) / 1024, 1),
@@ -167,6 +186,45 @@ def get_fleet_node_metrics(name, cfg):
 
 # ComfyUI watchdog state
 comfyui_watchdog = {}  # {target: {"consecutive_failures": int, "last_restart": datetime, "was_down": bool}}
+
+# --- Display hysteresis for the /api/status dashboard board (2026-07-18) ---
+# Problem: gandalf/frodo run heavy CI jobs and can answer the ComfyUI /queue
+# and /system_stats HTTP checks slowly. A single slow response was flipping
+# them to OFFLINE (red) on the dashboard even though they were healthy and
+# just busy, alarming Ben with a false "fleet is down" read.
+# Fix: a target must fail TWO CONSECUTIVE probes (i.e. be unreachable across
+# two ~12s poll cycles, ~24s) before the DASHBOARD shows it as OFFLINE. Any
+# single successful probe immediately clears it back to ONLINE. This only
+# smooths the /api/status display - it does NOT touch the raw probe used for
+# metrics collection/DB (collect_metrics), so historical data stays accurate.
+OFFLINE_FAIL_THRESHOLD = 2
+_target_display_health = {name: {"consecutive_failures": 0, "displayed_online": True} for name in CONFIG["targets"]}
+_target_display_health_lock = threading.Lock()
+
+def apply_display_hysteresis(name, raw_online):
+    """Smooth one target's raw online/offline reading for display purposes.
+
+    Requires OFFLINE_FAIL_THRESHOLD consecutive raw failures before the
+    dashboard shows OFFLINE; any raw success clears it back to ONLINE right away.
+    """
+    with _target_display_health_lock:
+        h = _target_display_health.setdefault(
+            name, {"consecutive_failures": 0, "displayed_online": True}
+        )
+        if raw_online:
+            h["consecutive_failures"] = 0
+            h["displayed_online"] = True
+        else:
+            h["consecutive_failures"] += 1
+            if h["consecutive_failures"] >= OFFLINE_FAIL_THRESHOLD:
+                h["displayed_online"] = False
+            # else: still just show the last known-good state - probably busy,
+            # not actually down. logger line below makes this visible in journalctl.
+            logger.info(
+                f"{name}: probe failed ({h['consecutive_failures']}/{OFFLINE_FAIL_THRESHOLD} "
+                f"before dashboard shows OFFLINE) - displayed_online={h['displayed_online']}"
+            )
+        return h["displayed_online"]
 
 def send_notification(title, message):
     """Send push notification via Pushover."""
@@ -786,6 +844,128 @@ def clear_swap(host, user):
         logger.error(f"SSH error clearing swap on {host}: {e}")
         return False
 
+# --- CI queue depth + model-route health (2026-07-19) -----------------------
+# Secrets are never stored/hardcoded here. Both are read live, over the same
+# ben@gandalf SSH channel already used above for reboot/power actions, from
+# their existing canonical files - then cached briefly so a burst of page
+# loads/tab polls doesn't multiply SSH sessions, GitHub API calls, or gateway
+# hits.
+_secret_cache = {}  # {"path:VAR": {"value": str, "ts": float}}
+_secret_cache_lock = threading.Lock()
+
+def _read_remote_env_value(var_name, remote_path, ttl):
+    """Read one KEY=VALUE line out of a file on gandalf via SSH, cached for `ttl`s.
+
+    Returns None (never raises) on any failure - callers must treat that as
+    "signal unavailable right now", not "value is empty/off".
+    """
+    cache_key = f"{remote_path}:{var_name}"
+    now = time.time()
+    with _secret_cache_lock:
+        cached = _secret_cache.get(cache_key)
+        if cached and (now - cached["ts"]) < ttl:
+            return cached["value"]
+    value = None
+    try:
+        client = get_ssh_client(CONFIG["targets"]["gandalf"]["ssh_host"], CONFIG["targets"]["gandalf"]["ssh_user"])
+        if client is not None:
+            _, stdout, _ = client.exec_command(f"grep '^{var_name}=' {remote_path} | head -1", timeout=10)
+            line = stdout.read().decode().strip()
+            if "=" in line:
+                value = line.split("=", 1)[1].strip()
+    except Exception as e:
+        logger.debug(f"Could not read {var_name} from gandalf:{remote_path}: {e}")
+    if value:
+        with _secret_cache_lock:
+            _secret_cache[cache_key] = {"value": value, "ts": now}
+    return value
+
+def get_gh_ci_token():
+    """Shire autoscaler's own GH App installation token (refreshed there every 15 min)."""
+    return _read_remote_env_value("GH_TOKEN", GH_TOKEN_ENV_PATH, ttl=600)
+
+def get_gateway_key():
+    """Fleet gateway master key (static; re-checked occasionally in case it rotates)."""
+    return _read_remote_env_value("LITELLM_MASTER_KEY", GATEWAY_KEY_ENV_PATH, ttl=1800)
+
+ci_queue_cache = {"data": None, "ts": 0.0}
+ci_queue_cache_lock = threading.Lock()
+CI_QUEUE_CACHE_TTL = 45  # seconds - don't hammer the GitHub API
+
+def get_ci_queue_status():
+    """Queued + in-progress GitHub Actions run counts for armbrain-io/armbrain -
+    the same queue-depth signal the Shire autoscaler watches to decide whether
+    to wake reserve boxes."""
+    now = time.time()
+    with ci_queue_cache_lock:
+        if ci_queue_cache["data"] is not None and (now - ci_queue_cache["ts"]) < CI_QUEUE_CACHE_TTL:
+            return ci_queue_cache["data"]
+
+    result = {"available": False, "queued": 0, "in_progress": 0, "repo": GITHUB_CI_REPO}
+    token = get_gh_ci_token()
+    if token:
+        try:
+            headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
+            base = f"https://api.github.com/repos/{GITHUB_CI_REPO}/actions/runs"
+            # Only count runs from the last 48h: GitHub sometimes strands
+            # "queued" runs forever when a PR branch is deleted mid-queue
+            # (uncancellable via API — cancel/force-cancel 500). Counting them
+            # would permanently inflate the autoscaler's queue-depth signal.
+            from datetime import datetime, timedelta, timezone
+            cutoff = (datetime.now(timezone.utc) - timedelta(hours=48)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            q = requests.get(base, params={"status": "queued", "per_page": 100, "created": f">={cutoff}"}, headers=headers, timeout=8)
+            ip = requests.get(base, params={"status": "in_progress", "per_page": 100, "created": f">={cutoff}"}, headers=headers, timeout=8)
+            if q.ok and ip.ok:
+                result["available"] = True
+                result["queued"] = q.json().get("total_count", 0)
+                result["in_progress"] = ip.json().get("total_count", 0)
+            else:
+                logger.warning(f"CI queue check: GitHub returned {q.status_code}/{ip.status_code}")
+        except Exception as e:
+            logger.warning(f"CI queue check failed: {e}")
+
+    with ci_queue_cache_lock:
+        ci_queue_cache["data"] = result
+        ci_queue_cache["ts"] = time.time()
+    return result
+
+route_health_cache = {"data": None, "ts": 0.0}
+route_health_cache_lock = threading.Lock()
+ROUTE_HEALTH_CACHE_TTL = 30  # seconds
+
+def get_model_route_health():
+    """Which 🔒 local fleet-gateway routes are live right now vs missing -
+    the "is a model route silently gone" signal."""
+    now = time.time()
+    with route_health_cache_lock:
+        if route_health_cache["data"] is not None and (now - route_health_cache["ts"]) < ROUTE_HEALTH_CACHE_TTL:
+            return route_health_cache["data"]
+
+    routes_live = {name: False for name in LOCAL_GATEWAY_ROUTES}
+    available = False
+    key = get_gateway_key()
+    if key:
+        try:
+            resp = requests.get(GATEWAY_MODELS_URL, headers={"Authorization": f"Bearer {key}"}, timeout=6)
+            if resp.ok:
+                live_ids = {m.get("id") for m in resp.json().get("data", [])}
+                for name in LOCAL_GATEWAY_ROUTES:
+                    routes_live[name] = name in live_ids
+                available = True
+            else:
+                logger.warning(f"Model route check: gateway returned {resp.status_code}")
+        except Exception as e:
+            logger.warning(f"Model route check failed: {e}")
+
+    result = {
+        "available": available,
+        "routes": [{"name": name, "live": routes_live[name]} for name in LOCAL_GATEWAY_ROUTES],
+    }
+    with route_health_cache_lock:
+        route_health_cache["data"] = result
+        route_health_cache["ts"] = time.time()
+    return result
+
 def get_mac_metrics(host, user):
     """Get CPU%, GPU utilization, RAM, swap, and disk for a macOS target via SSH.
 
@@ -939,7 +1119,11 @@ def get_target_status(target_name, target_config, fast=False):
     # Try ComfyUI HTTP endpoints
     try:
         # Get queue status
-        response = requests.get(f"{target_config['url']}/queue", timeout=5)
+        # Timeout raised 5s -> 10s (2026-07-18): gandalf/frodo run heavy CI jobs
+        # and can be slow to answer while busy-but-healthy; 5s was flickering
+        # them to false OFFLINE. See apply_display_hysteresis() for the second
+        # half of this fix (consecutive-failure hysteresis on the display).
+        response = requests.get(f"{target_config['url']}/queue", timeout=10)
         if response.ok:
             data = response.json()
             result["online"] = True
@@ -947,7 +1131,7 @@ def get_target_status(target_name, target_config, fast=False):
             result["queue_pending"] = len(data.get("queue_pending", []))
 
         # Get system stats (GPU, RAM)
-        stats_response = requests.get(f"{target_config['url']}/system_stats", timeout=5)
+        stats_response = requests.get(f"{target_config['url']}/system_stats", timeout=10)
         if stats_response.ok:
             stats = stats_response.json()
 
@@ -1074,7 +1258,11 @@ def get_status():
                 }
             results[name] = {
                 **status,
+                # Display-only smoothing: don't let one slow/busy probe flip
+                # the dashboard to a false OFFLINE alarm (see apply_display_hysteresis).
+                "online": apply_display_hysteresis(name, status["online"]),
                 "vram_gb": config.get("vram_gb"),
+                "net": config.get("net"),
                 "url": config.get("url")
             }
 
@@ -1146,6 +1334,16 @@ def get_fleet():
         fleet_cache["ts"] = time.time()
 
     return jsonify(ordered)
+
+@app.route("/api/ci_queue", methods=["GET"])
+def api_ci_queue():
+    """Queued/running GitHub Actions counts for armbrain-io/armbrain (cached)."""
+    return jsonify(get_ci_queue_status())
+
+@app.route("/api/model_routes", methods=["GET"])
+def api_model_routes():
+    """Live/missing status for each 🔒 local fleet-gateway route (cached)."""
+    return jsonify(get_model_route_health())
 
 @app.route("/api/fleet_power", methods=["POST"])
 def fleet_power():
@@ -1423,6 +1621,7 @@ background:radial-gradient(circle,rgba(0,255,242,0.1) 0%,transparent 70%);pointe
 .gpu-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:15px}
 .gpu-name{font-family:'Orbitron',monospace;font-size:1.3em;font-weight:700;text-transform:uppercase;
 letter-spacing:2px;color:var(--neon-cyan);text-shadow:0 0 10px var(--neon-cyan)}
+.net-badge{font-size:0.65em;opacity:0.85;text-shadow:none;vertical-align:middle}
 .progress-bar{background:#1a1a2e;border-radius:2px;height:24px;overflow:hidden;margin:5px 0;
 border:1px solid #2a2a4e;position:relative}
 .progress-bar::before{content:'';position:absolute;top:0;left:0;right:0;bottom:0;
@@ -1532,11 +1731,36 @@ letter-spacing:1px;text-transform:uppercase;transition:all 0.3s}
 .ft-btn.down:hover{border-color:var(--neon-red);color:var(--neon-red);box-shadow:0 0 8px rgba(255,0,68,0.3)}
 .ft-btn:disabled{opacity:0.25;cursor:default}
 .ft-btn:disabled:hover{border-color:#2a2a4e;color:#667;box-shadow:none}
+.glance-row{display:flex;gap:20px;flex-wrap:wrap;align-items:center}
+.glance-stat{text-align:center;min-width:90px}
+.glance-num{font-family:'Orbitron',monospace;font-size:1.8em;font-weight:700;color:var(--neon-cyan);text-shadow:0 0 10px var(--neon-cyan);line-height:1.1}
+.glance-num.zero{color:var(--neon-green);text-shadow:var(--glow-green)}
+.glance-num.warn{color:var(--neon-yellow);text-shadow:0 0 10px var(--neon-yellow)}
+.glance-num.hot{color:var(--neon-red);text-shadow:var(--glow-red)}
+.glance-label{font-size:0.75em;color:#889;letter-spacing:1px;text-transform:uppercase;margin-top:2px}
+.glance-unavailable{color:#667;font-size:0.9em;font-style:italic}
+.route-pills{display:flex;gap:8px;flex-wrap:wrap}
+.route-pill{font-family:'Orbitron',monospace;font-size:0.8em;letter-spacing:1px;padding:5px 12px;
+border-radius:999px;border:1px solid #2a2a4e;background:var(--bg-panel);color:#889}
+.route-pill.live{color:var(--neon-green);border-color:var(--neon-green);box-shadow:0 0 8px rgba(57,255,20,0.25)}
+.route-pill.missing{color:var(--neon-red);border-color:var(--neon-red);box-shadow:0 0 8px rgba(255,0,68,0.25);animation:pulse 1.5s infinite}
 </style></head>
 <body><h1>SHADOWFAX // FLEET MONITOR</h1>
 
+<div id="fleet-summary" style="margin:4px 0 14px 0;font-size:0.95em;color:#889">Loading fleet summary...</div>
+
 <div class=card id=fleet-hosts style="padding:12px 15px;margin:12px 0">
 <div id=fleet-row class=fleet-row><p style="grid-column:1/-1;color:#667;margin:0">Scanning fleet hosts...</p></div>
+</div>
+
+<div class=card id=ci-queue-card style="padding:12px 15px;margin:12px 0">
+<h3>🚦 CI Queue — armbrain</h3>
+<div id="ci-queue-body"><p style="color:#667;margin:0">Loading CI queue...</p></div>
+</div>
+
+<div class=card id=route-health-card style="padding:12px 15px;margin:12px 0">
+<h3>🛰️ Model Route Health</h3>
+<div id="route-health-body"><p style="color:#667;margin:0">Loading route health...</p></div>
 </div>
 
 <div class=card id=monitors><p>Loading...</p></div>
@@ -1582,15 +1806,49 @@ GET  /api/health  - Health check</pre>
 const icons = {gandalf: "🧙", frodo: "🧝", pippin: "🍎", shadowfax: "🐴"};
 const fleetIcons = {northfarthing: "🌾", eastfarthing: "🌾", southfarthing: "🌾", westfarthing: "🌾", shadowfax: "🐴", sam: "🌱"};
 
+// Core vs Reserve summary (2026-07-18): 5-of-6 reserve boxes down at any given
+// time is EXPECTED (the Shire farthings + sam are spun up on demand, not
+// always-on) but reads at a glance like "everything is down". This banner
+// separates the always-on CORE (gandalf/frodo/pippin from /api/status, plus
+// shadowfax itself from /api/fleet) from the RESERVE/Shire boxes so Ben can
+// see the core is healthy without counting red tiles.
+const CORE_TARGET_NAMES = ['gandalf', 'frodo', 'pippin'];       // from /api/status
+const RESERVE_FLEET_NAMES = ['northfarthing', 'eastfarthing', 'southfarthing', 'westfarthing', 'sam']; // from /api/fleet
+let lastTargetsOnline = {};
+let lastFleetOnline = {};
+
+function updateFleetSummary() {
+    const el = document.getElementById('fleet-summary');
+    if (!el) return;
+    const coreFromTargets = CORE_TARGET_NAMES.filter(n => lastTargetsOnline[n]).length;
+    const shadowfaxUp = lastFleetOnline['shadowfax'] ? 1 : 0;
+    const coreUp = coreFromTargets + shadowfaxUp;
+    const coreTotal = CORE_TARGET_NAMES.length + 1;
+    const reserveUp = RESERVE_FLEET_NAMES.filter(n => lastFleetOnline[n]).length;
+    const reserveTotal = RESERVE_FLEET_NAMES.length;
+    const coreColor = (coreUp === coreTotal) ? 'var(--neon-green)' : 'var(--neon-red)';
+    el.innerHTML =
+        '<b>Core:</b> <span style="color:' + coreColor + ';font-weight:bold">' + coreUp + '/' + coreTotal + ' up</span>' +
+        ' &nbsp;·&nbsp; <b>Reserve (Shire):</b> <span style="color:#8a8">' + reserveUp + '/' + reserveTotal + ' up</span>' +
+        ' <span style="color:#556;font-size:0.85em">— reserve boxes are on-demand, not always-on</span>';
+}
+
 function tempClass(t) { return t >= 85 ? "hot" : (t >= 70 ? "warn" : ""); }
 function pctClass(p) { return p >= 90 ? "hot" : (p >= 70 ? "warn" : ""); }
 
 let fleetInitialized = false;
 
+// Connection-type badge: 🔌 = wired ethernet, 📶 = wifi (from config "net" field)
+function netBadge(net) {
+    if (net === 'eth') return ' <span class="net-badge" title="Wired (Ethernet)">🔌</span>';
+    if (net === 'wifi') return ' <span class="net-badge" title="Wi-Fi">📶</span>';
+    return '';
+}
+
 function fleetTileHtml(name, n) {
     const icon = fleetIcons[name] || '🖥️';
     let html = '<div class="fleet-tile' + (n.online ? '' : ' off') + '" id="fleet-tile-' + name + '">';
-    html += '<div class="ft-name">' + icon + ' ' + name + '</div>';
+    html += '<div class="ft-name">' + icon + ' ' + name + netBadge(n.net) + '</div>';
     if (n.online) {
         html += '<div class="ft-stat"><span>CPU</span><b class="' + pctClass(n.cpu) + '" id="ft-cpu-' + name + '">' + n.cpu + '%</b></div>';
         html += '<div class="ft-stat"><span>TEMP</span><b class="' + tempClass(n.temp_c) + '" id="ft-temp-' + name + '">' + n.temp_c + '°C</b></div>';
@@ -1618,6 +1876,8 @@ function fleetTileHtml(name, n) {
 
 function refreshFleet() {
     fetch('/api/fleet').then(r => r.json()).then(data => {
+        for (const [name, n] of Object.entries(data)) { lastFleetOnline[name] = n.online; }
+        updateFleetSummary();
         if (!fleetInitialized) {
             let html = '';
             for (const [name, n] of Object.entries(data)) {
@@ -1681,6 +1941,54 @@ function fleetPower(node, action) {
         if (d.error) { alert('Failed: ' + d.error); return; }
         if (action === 'wake') alert('Magic packets sent to ' + node + ' — it should appear within ~90s.');
     }).catch(e => alert('Request failed: ' + e));
+}
+
+function ciQueueNumClass(n) { return n === 0 ? 'zero' : (n <= 3 ? 'warn' : 'hot'); }
+
+function refreshCiQueue() {
+    fetch('/api/ci_queue').then(r => r.json()).then(d => {
+        const el = document.getElementById('ci-queue-body');
+        if (!el) return;
+        if (!d.available) {
+            el.innerHTML = '<p class="glance-unavailable">CI signal unavailable right now (token fetch or GitHub API failed) — not necessarily a real outage, just a stale read.</p>';
+            return;
+        }
+        el.innerHTML =
+            '<div class="glance-row">' +
+            '<div class="glance-stat"><div class="glance-num ' + ciQueueNumClass(d.queued) + '">' + d.queued + '</div><div class="glance-label">Queued</div></div>' +
+            '<div class="glance-stat"><div class="glance-num">' + d.in_progress + '</div><div class="glance-label">Running</div></div>' +
+            '<div style="color:#667;font-size:0.85em">' + d.repo + ' — the same queue-depth signal the Shire autoscaler watches</div>' +
+            '</div>';
+    }).catch(() => {
+        const el = document.getElementById('ci-queue-body');
+        if (el) el.innerHTML = '<p class="glance-unavailable">CI queue check failed to load.</p>';
+    });
+}
+
+function refreshRouteHealth() {
+    fetch('/api/model_routes').then(r => r.json()).then(d => {
+        const el = document.getElementById('route-health-body');
+        if (!el) return;
+        if (!d.available) {
+            el.innerHTML = '<p class="glance-unavailable">Gateway unreachable right now (key fetch or gateway ping failed) — not necessarily a real outage, just a stale read.</p>';
+            return;
+        }
+        const missing = d.routes.filter(r => !r.live);
+        let html = '<div class="route-pills">';
+        d.routes.forEach(r => {
+            html += '<span class="route-pill ' + (r.live ? 'live' : 'missing') + '">' + (r.live ? '● ' : '✕ ') + r.name + '</span>';
+        });
+        html += '</div>';
+        if (missing.length) {
+            html += '<p style="margin:8px 0 0 0;color:var(--neon-red)">' + missing.length + ' local route(s) MISSING: ' + missing.map(r => r.name).join(', ') + '</p>';
+        } else {
+            html += '<p style="margin:8px 0 0 0;color:#667;font-size:0.85em">' + d.routes.length + '/' + d.routes.length + ' local routes live</p>';
+        }
+        el.innerHTML = html;
+    }).catch(() => {
+        const el = document.getElementById('route-health-body');
+        if (el) el.innerHTML = '<p class="glance-unavailable">Model route check failed to load.</p>';
+    });
 }
 
 function progressBar(percent, cls, id) {
@@ -1974,6 +2282,8 @@ function updateGauge(id, value, min, max, unit, showLimit, colorFn) {
 
 function refresh() {
     fetch("/api/status").then(r => r.json()).then(data => {
+        for (const [name, info] of Object.entries(data.targets)) { lastTargetsOnline[name] = info.online; }
+        updateFleetSummary();
         // If not initialized, build the full HTML
         if (!initialized) {
             let html = '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:20px">';
@@ -1985,7 +2295,7 @@ function refresh() {
                 const isMac = info.os === 'mac';
 
                 html += '<div class="gpu-card" id="card-' + name + '">';
-                html += '<div class="gpu-header"><span class="gpu-name">' + icon + ' ' + name + '</span>';
+                html += '<div class="gpu-header"><span class="gpu-name">' + icon + ' ' + name + netBadge(info.net) + '</span>';
                 html += '<div style="display:flex;align-items:center;gap:10px"><span id="status-' + name + '">' + status + '</span>';
                 if (!isMac) {
                     html += '<div class="machine-power">';
@@ -2310,13 +2620,15 @@ function refreshEnergy() {
 
 // --- Polling control: pause everything when the tab isn't visible, resume ---
 // --- with an immediate refresh when it becomes visible again.              ---
-let statusTimer = null, fleetTimer = null, historyTimer = null, energyTimer = null;
+let statusTimer = null, fleetTimer = null, historyTimer = null, energyTimer = null, ciQueueTimer = null, routeHealthTimer = null;
 
 function startPolling() {
     if (!statusTimer) statusTimer = setInterval(refresh, 12000);     // queue/GPU state: 12s
     if (!fleetTimer) fleetTimer = setInterval(refreshFleet, 45000);  // ssh fleet stats: 45s
     if (!historyTimer) historyTimer = setInterval(refreshHistory, 60000);
     if (!energyTimer) energyTimer = setInterval(refreshEnergy, 60000);
+    if (!ciQueueTimer) ciQueueTimer = setInterval(refreshCiQueue, 45000);        // matches backend cache TTL
+    if (!routeHealthTimer) routeHealthTimer = setInterval(refreshRouteHealth, 30000);
 }
 
 function stopPolling() {
@@ -2324,6 +2636,8 @@ function stopPolling() {
     clearInterval(fleetTimer); fleetTimer = null;
     clearInterval(historyTimer); historyTimer = null;
     clearInterval(energyTimer); energyTimer = null;
+    clearInterval(ciQueueTimer); ciQueueTimer = null;
+    clearInterval(routeHealthTimer); routeHealthTimer = null;
 }
 
 document.addEventListener('visibilitychange', () => {
@@ -2335,6 +2649,8 @@ document.addEventListener('visibilitychange', () => {
         refreshFleet();
         refreshHistory();
         refreshEnergy();
+        refreshCiQueue();
+        refreshRouteHealth();
         startPolling();
     }
 });
@@ -2343,6 +2659,8 @@ refresh();
 refreshHistory();
 refreshEnergy();
 refreshFleet();
+refreshCiQueue();
+refreshRouteHealth();
 if (!document.hidden) startPolling();
 </script></body></html>'''
 
