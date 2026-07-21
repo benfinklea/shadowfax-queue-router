@@ -117,7 +117,12 @@ FLEET_NODES = {
     "eastfarthing":  {"ssh_host": "192.168.1.145", "ssh_user": "ben", "wol_mac": "84:47:09:62:ef:69", "net": "eth"},
     "southfarthing": {"ssh_host": "192.168.1.146", "ssh_user": "ben", "wol_mac": "84:47:09:65:42:58", "net": "eth"},
     "westfarthing":  {"ssh_host": "192.168.1.138", "ssh_user": "ben", "wol_mac": "84:47:09:65:42:88", "net": "eth"},
-    "shadowfax":     {"local": True, "net": "wifi"},
+    # 2026-07-21: this dashboard now runs on GANDALF (migrated off shadowfax).
+    # shadowfax must be SSH-managed like every other node — leaving it
+    # "local: True" here would make its stats tile show gandalf's numbers and,
+    # far worse, its REBOOT button reboot gandalf. Tailscale IP because
+    # shadowfax's LAN mDNS is unreliable.
+    "shadowfax":     {"ssh_host": "100.70.76.51", "ssh_user": "ben", "net": "wifi"},
     "sam":           {"ssh_host": "192.168.1.135", "ssh_user": "ben", "net": "wifi"},
 }
 
@@ -1374,11 +1379,10 @@ def fleet_power():
 
         # reboot / shutdown
         if cfg.get("local"):
-            import subprocess
-            logger.info("Self-reboot requested from dashboard")
-            send_notification("🔄 Shadowfax reboot", "Dashboard-triggered self reboot")
-            subprocess.Popen(["bash", "-c", "sleep 2; sudo -n systemctl reboot"])
-            return jsonify({"success": True, "node": node, "action": "reboot"})
+            # Hard-disabled 2026-07-21: the dashboard now runs on gandalf, the
+            # fleet hub — a "local" reboot would take down the hub. No node
+            # should be configured local anymore; SSH-manage everything.
+            return jsonify({"error": "Local reboot disabled — this host is the fleet hub"}), 400
         client = get_ssh_client(cfg["ssh_host"], cfg.get("ssh_user", "ben"))
         if client is None:
             return jsonify({"error": f"SSH circuit breaker open for {node}"}), 503
@@ -1558,7 +1562,7 @@ def api_power():
 @app.route("/")
 def index():
     """Dashboard home page."""
-    return '''<!DOCTYPE html><html><head><title>SHADOWFAX // FLEET MONITOR</title>
+    return '''<!DOCTYPE html><html><head><title>GANDALF // FLEET MONITOR</title>
 <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Rajdhani:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
 :root{
@@ -1571,10 +1575,12 @@ def index():
 --glow-yellow:0 0 10px #ffff00,0 0 20px #ffff00,0 0 40px #ffff0088;
 }
 *{box-sizing:border-box}
-body{font-family:'Rajdhani',sans-serif;background:var(--bg-dark);color:#e0e0e0;padding:20px;margin:0;
+@media(min-width:1300px){body{display:grid;grid-template-columns:1fr 1fr;gap:0 14px;align-items:start}
+h1,#fleet-hosts,#ci-queue-card,#route-health-card{grid-column:1/-1}}
+body{font-family:'Rajdhani',sans-serif;background:var(--bg-dark);color:#e0e0e0;padding:10px;margin:0;
 background-image:radial-gradient(ellipse at top,#0d1a2d 0%,transparent 50%),
-linear-gradient(180deg,transparent 0%,rgba(0,255,242,0.03) 100%);min-height:100vh;font-size:18px}
-@media(min-width:768px){body{padding:20px 40px}}
+linear-gradient(180deg,transparent 0%,rgba(0,255,242,0.03) 100%);min-height:100vh;font-size:14px}
+@media(min-width:768px){body{padding:12px 20px}}
 @media(max-width:767px){
 h1{font-size:1.4em;letter-spacing:2px}
 .gauge-row{gap:10px}
@@ -1587,14 +1593,14 @@ h1{font-size:1.4em;letter-spacing:2px}
 body::before{content:'';position:fixed;top:0;left:0;right:0;bottom:0;
 background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,0,0,0.1) 2px,rgba(0,0,0,0.1) 4px);
 pointer-events:none;z-index:9999;opacity:0.3}
-h1{font-family:'Orbitron',monospace;color:var(--neon-cyan);font-size:2.2em;font-weight:900;letter-spacing:4px;
-text-shadow:var(--glow-cyan);border-bottom:2px solid var(--neon-cyan);padding-bottom:15px;margin-bottom:30px;
+h1{font-family:'Orbitron',monospace;color:var(--neon-cyan);font-size:1.3em;font-weight:900;letter-spacing:3px;
+text-shadow:var(--glow-cyan);border-bottom:1px solid var(--neon-cyan);padding-bottom:6px;margin:4px 0 10px;
 text-transform:uppercase;text-align:center}
 h1::before{content:'◈ ';color:var(--neon-magenta)}
 h1::after{content:' ◈';color:var(--neon-magenta)}
 h3{margin-top:0;color:var(--neon-cyan);font-family:'Orbitron',monospace;font-size:1.1em;letter-spacing:2px;
 text-transform:uppercase;text-shadow:0 0 10px var(--neon-cyan)}
-.card{background:var(--bg-card);padding:20px;border-radius:4px;margin:20px 0;
+.card{background:var(--bg-card);padding:12px;border-radius:4px;margin:8px 0;
 border:1px solid #1a2332;box-shadow:0 0 20px rgba(0,255,242,0.1),inset 0 0 60px rgba(0,0,0,0.3)}
 .card::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;
 background:linear-gradient(90deg,transparent,var(--neon-cyan),transparent)}
@@ -1602,23 +1608,23 @@ background:linear-gradient(90deg,transparent,var(--neon-cyan),transparent)}
 .offline{color:var(--neon-red);font-weight:bold;text-shadow:var(--glow-red);animation:pulse 1s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.7}}
 @keyframes glow-pulse{0%,100%{filter:brightness(1)}50%{filter:brightness(1.3)}}
-.job{padding:10px 15px;border-left:3px solid var(--neon-cyan);margin:8px 0;background:var(--bg-panel);
+.job{padding:6px 10px;border-left:3px solid var(--neon-cyan);margin:8px 0;background:var(--bg-panel);
 border-radius:0 4px 4px 0;font-family:'Rajdhani',sans-serif;transition:all 0.3s}
 .job:hover{background:#1a2332;border-left-color:var(--neon-magenta);box-shadow:0 0 15px rgba(0,255,242,0.2)}
 .job.video{border-color:var(--neon-magenta)}
 .job.completed{opacity:0.7}
-pre{background:var(--bg-panel);padding:15px;border-radius:4px;overflow-x:auto;border:1px solid #1a2332;
+pre{background:var(--bg-panel);padding:8px;border-radius:4px;overflow-x:auto;border:1px solid #1a2332;
 font-family:'Rajdhani',monospace;color:var(--neon-cyan)}
 table{width:100%;border-collapse:collapse}
-td,th{padding:12px;text-align:left;border-bottom:1px solid #1a2332}
+td,th{padding:5px 8px;text-align:left;border-bottom:1px solid #1a2332}
 th{color:var(--neon-cyan);font-family:'Orbitron',monospace;font-size:0.8em;letter-spacing:1px}
 .gpu-card{background:linear-gradient(135deg,var(--bg-panel) 0%,var(--bg-card) 100%);
-padding:20px;border-radius:8px;margin:10px 0;border:1px solid #1a2332;position:relative;overflow:hidden}
+padding:12px;border-radius:8px;margin:6px 0;border:1px solid #1a2332;position:relative;overflow:hidden}
 .gpu-card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;
 background:linear-gradient(90deg,var(--neon-cyan),var(--neon-magenta),var(--neon-cyan))}
 .gpu-card::after{content:'';position:absolute;top:0;right:0;width:100px;height:100px;
 background:radial-gradient(circle,rgba(0,255,242,0.1) 0%,transparent 70%);pointer-events:none}
-.gpu-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:15px}
+.gpu-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
 .gpu-name{font-family:'Orbitron',monospace;font-size:1.3em;font-weight:700;text-transform:uppercase;
 letter-spacing:2px;color:var(--neon-cyan);text-shadow:0 0 10px var(--neon-cyan)}
 .net-badge{font-size:0.65em;opacity:0.85;text-shadow:none;vertical-align:middle}
@@ -1637,13 +1643,13 @@ background:linear-gradient(90deg,transparent,rgba(255,255,255,0.4));opacity:0.3}
 .progress-swap{background:linear-gradient(90deg,#ff004444,var(--neon-red));box-shadow:0 0 20px #ff004466}
 .progress-yellow{background:linear-gradient(90deg,#ffaa0044,var(--neon-yellow));box-shadow:0 0 20px #ffff0066}
 .progress-red{background:linear-gradient(90deg,#ff004444,var(--neon-red));box-shadow:0 0 20px #ff004466}
-.io-stats{display:flex;gap:20px;margin-top:15px;font-size:1.05em;padding:12px;background:var(--bg-dark);border-radius:4px;border:1px solid #1a2332}
+.io-stats{display:flex;gap:12px;margin-top:8px;font-size:1em;padding:8px;background:var(--bg-dark);border-radius:4px;border:1px solid #1a2332}
 .io-stat{display:flex;align-items:center;gap:8px}
 .io-stat .value{color:var(--neon-cyan);font-weight:bold;font-family:'Orbitron',monospace;text-shadow:0 0 10px var(--neon-cyan)}
 .io-stat.warning .value{color:var(--neon-yellow);text-shadow:0 0 10px var(--neon-yellow)}
 .io-stat.danger .value{color:var(--neon-red);text-shadow:0 0 10px var(--neon-red)}
 .time-range{display:flex;gap:8px;margin-bottom:15px}
-.time-range button{background:var(--bg-panel);color:#888;border:1px solid #2a2a4e;padding:10px 18px;
+.time-range button{background:var(--bg-panel);color:#888;border:1px solid #2a2a4e;padding:5px 10px;
 border-radius:4px;cursor:pointer;font-family:'Orbitron',monospace;font-size:0.9em;letter-spacing:1px;
 text-transform:uppercase;transition:all 0.3s}
 .time-range button:hover{border-color:var(--neon-cyan);color:var(--neon-cyan);box-shadow:0 0 15px rgba(0,255,242,0.3)}
@@ -1652,12 +1658,12 @@ box-shadow:var(--glow-cyan)}
 .sparkline-container{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
 .sparkline-box{background:var(--bg-panel);padding:12px;border-radius:4px;border:1px solid #1a2332}
 .sparkline-label{font-size:0.9em;color:#888;margin-bottom:8px;font-family:'Orbitron',monospace;letter-spacing:1px}
-.sparkline{height:45px;display:flex;align-items:end;gap:2px;width:100%;overflow:hidden}
+.sparkline{height:34px;display:flex;align-items:end;gap:2px;width:100%;overflow:hidden}
 .sparkline-bar{background:var(--neon-cyan);flex:1 1 0;min-width:0;border-radius:1px 1px 0 0;
 transition:height 0.5s cubic-bezier(0.4,0,0.2,1);box-shadow:0 0 5px var(--neon-cyan)}
 .sparkline-bar.high{background:var(--neon-yellow);box-shadow:0 0 5px var(--neon-yellow)}
 .sparkline-bar.critical{background:var(--neon-red);box-shadow:0 0 5px var(--neon-red);animation:spark-glow 1.2s ease-in-out infinite}
-.history-machine{padding:15px 18px;border-radius:6px;margin-bottom:16px;border:1px solid #1a2332;overflow:hidden}
+.history-machine{padding:10px 12px;border-radius:6px;margin-bottom:8px;border:1px solid #1a2332;overflow:hidden}
 .history-machine.alt-0{background:rgba(0,255,242,0.04)}
 .history-machine.alt-1{background:rgba(255,0,255,0.05)}
 .max-util{color:var(--neon-green);text-shadow:0 0 8px var(--neon-green);font-family:'Orbitron',monospace}
@@ -1745,7 +1751,7 @@ border-radius:999px;border:1px solid #2a2a4e;background:var(--bg-panel);color:#8
 .route-pill.live{color:var(--neon-green);border-color:var(--neon-green);box-shadow:0 0 8px rgba(57,255,20,0.25)}
 .route-pill.missing{color:var(--neon-red);border-color:var(--neon-red);box-shadow:0 0 8px rgba(255,0,68,0.25);animation:pulse 1.5s infinite}
 </style></head>
-<body><h1>SHADOWFAX // FLEET MONITOR</h1>
+<body><h1>GANDALF // FLEET MONITOR</h1>
 
 <div id="fleet-summary" style="margin:4px 0 14px 0;font-size:0.95em;color:#889">Loading fleet summary...</div>
 
