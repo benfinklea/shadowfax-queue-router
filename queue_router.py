@@ -1340,6 +1340,73 @@ def get_fleet():
 
     return jsonify(ordered)
 
+
+pipeline_cache = {"data": None, "ts": 0.0}
+pipeline_cache_lock = threading.Lock()
+PIPELINE_CACHE_TTL = 300  # seconds
+
+def get_pipeline_status():
+    """Shipping-pipeline snapshot for armbrain: issues -> PRs -> CI -> merged
+    today -> deployed today. Read-only GitHub queries, cached 5 min."""
+    now = time.time()
+    with pipeline_cache_lock:
+        if pipeline_cache["data"] is not None and (now - pipeline_cache["ts"]) < PIPELINE_CACHE_TTL:
+            return pipeline_cache["data"]
+
+    result = {"available": False, "repo": GITHUB_CI_REPO}
+    token = get_gh_ci_token()
+    if token:
+        try:
+            from datetime import datetime, timezone
+            headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            def search_count(q):
+                r = requests.get("https://api.github.com/search/issues",
+                                 params={"q": q, "per_page": 1}, headers=headers, timeout=8)
+                return r.json().get("total_count", 0) if r.ok else None
+            result["issues_open"] = search_count(f"repo:{GITHUB_CI_REPO} type:issue state:open")
+            result["prs_open"] = search_count(f"repo:{GITHUB_CI_REPO} type:pr state:open")
+            result["merged_today"] = search_count(f"repo:{GITHUB_CI_REPO} type:pr merged:>={today}")
+            ci = get_ci_queue_status()
+            result["ci_queued"] = ci.get("queued", 0) if ci.get("available") else None
+            result["ci_running"] = ci.get("in_progress", 0) if ci.get("available") else None
+            # deploys today (Gateway Deploy workflow)
+            r = requests.get(f"https://api.github.com/repos/{GITHUB_CI_REPO}/actions/runs",
+                             params={"created": f">={today}", "per_page": 100}, headers=headers, timeout=8)
+            dep_ok = dep_fail = dep_live = 0
+            live_started_min = None
+            if r.ok:
+                for run in r.json().get("workflow_runs", []):
+                    if run.get("name") != "Gateway Deploy":
+                        continue
+                    if run.get("status") != "completed":
+                        dep_live += 1
+                        try:
+                            t = datetime.strptime(run.get("run_started_at") or run.get("created_at"),
+                                                  "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                            m = int((datetime.now(timezone.utc) - t).total_seconds() // 60)
+                            live_started_min = m if live_started_min is None else min(live_started_min, m)
+                        except Exception:
+                            pass
+                    elif run.get("conclusion") == "success":
+                        dep_ok += 1
+                    elif run.get("conclusion") not in ("cancelled", "skipped"):
+                        dep_fail += 1
+            result.update({"deploys_ok_today": dep_ok, "deploys_failed_today": dep_fail,
+                           "deploys_in_flight": dep_live, "deploy_started_min": live_started_min})
+            result["available"] = True
+        except Exception as e:
+            logger.warning(f"pipeline status failed: {e}")
+
+    with pipeline_cache_lock:
+        pipeline_cache["data"] = result
+        pipeline_cache["ts"] = time.time()
+    return result
+
+@app.route("/api/pipeline", methods=["GET"])
+def api_pipeline():
+    return jsonify(get_pipeline_status())
+
 @app.route("/api/ci_queue", methods=["GET"])
 def api_ci_queue():
     """Queued/running GitHub Actions counts for armbrain-io/armbrain (cached)."""
@@ -1749,6 +1816,15 @@ letter-spacing:1px;text-transform:uppercase;transition:all 0.3s}
 .route-pill{font-family:'Orbitron',monospace;font-size:0.8em;letter-spacing:1px;padding:5px 12px;
 border-radius:999px;border:1px solid #2a2a4e;background:var(--bg-panel);color:#889}
 .route-pill.live{color:var(--neon-green);border-color:var(--neon-green);box-shadow:0 0 8px rgba(57,255,20,0.25)}
+.pipe-row{display:flex;align-items:stretch;gap:0;flex-wrap:wrap}
+.pipe-stage{background:var(--bg-panel);border:1px solid #1a2332;border-radius:6px;padding:8px 14px;text-align:center;min-width:96px}
+.pipe-stage .pn{font-family:'Orbitron',monospace;font-size:1.5em;font-weight:700;color:var(--neon-cyan);text-shadow:0 0 8px var(--neon-cyan)}
+.pipe-stage .pl{font-size:0.75em;color:#889;letter-spacing:1px;text-transform:uppercase;margin-top:2px}
+.pipe-stage.hot .pn{color:var(--neon-yellow);text-shadow:0 0 8px var(--neon-yellow)}
+.pipe-stage.live .pn{color:var(--neon-green);text-shadow:0 0 8px var(--neon-green);animation:glow-pulse 1.5s infinite}
+.pipe-stage.bad .pn{color:var(--neon-red);text-shadow:0 0 8px var(--neon-red)}
+.pipe-arrow{display:flex;align-items:center;color:var(--neon-magenta);padding:0 8px;font-size:1.3em;text-shadow:0 0 8px var(--neon-magenta)}
+.pipe-sub{font-size:0.72em;color:#667;margin-top:2px}
 .route-pill.missing{color:var(--neon-red);border-color:var(--neon-red);box-shadow:0 0 8px rgba(255,0,68,0.25);animation:pulse 1.5s infinite}
 </style></head>
 <body><h1>GANDALF // FLEET MONITOR</h1>
@@ -1760,8 +1836,8 @@ border-radius:999px;border:1px solid #2a2a4e;background:var(--bg-panel);color:#8
 </div>
 
 <div class=card id=ci-queue-card style="padding:12px 15px;margin:12px 0">
-<h3>🚦 CI Queue — armbrain</h3>
-<div id="ci-queue-body"><p style="color:#667;margin:0">Loading CI queue...</p></div>
+<h3>🏭 Shipping Pipeline — armbrain</h3>
+<div id="ci-queue-body"><p style="color:#667;margin:0">Loading pipeline...</p></div>
 </div>
 
 <div class=card id=route-health-card style="padding:12px 15px;margin:12px 0">
@@ -1952,22 +2028,32 @@ function fleetPower(node, action) {
 function ciQueueNumClass(n) { return n === 0 ? 'zero' : (n <= 3 ? 'warn' : 'hot'); }
 
 function refreshCiQueue() {
-    fetch('/api/ci_queue').then(r => r.json()).then(d => {
+    fetch('/api/pipeline').then(r => r.json()).then(d => {
         const el = document.getElementById('ci-queue-body');
         if (!el) return;
         if (!d.available) {
-            el.innerHTML = '<p class="glance-unavailable">CI signal unavailable right now (token fetch or GitHub API failed) — not necessarily a real outage, just a stale read.</p>';
+            el.innerHTML = '<p class="glance-unavailable">Pipeline signal unavailable right now (token fetch or GitHub API failed) — not necessarily a real outage, just a stale read.</p>';
             return;
         }
-        el.innerHTML =
-            '<div class="glance-row">' +
-            '<div class="glance-stat"><div class="glance-num ' + ciQueueNumClass(d.queued) + '">' + d.queued + '</div><div class="glance-label">Queued</div></div>' +
-            '<div class="glance-stat"><div class="glance-num">' + d.in_progress + '</div><div class="glance-label">Running</div></div>' +
-            '<div style="color:#667;font-size:0.85em">' + d.repo + ' — the same queue-depth signal the Shire autoscaler watches</div>' +
+        const n = v => (v === null || v === undefined) ? '—' : v;
+        const stage = (num, label, cls, sub) =>
+            '<div class="pipe-stage ' + (cls || '') + '"><div class="pn">' + n(num) + '</div>' +
+            '<div class="pl">' + label + '</div>' + (sub ? '<div class="pipe-sub">' + sub + '</div>' : '') + '</div>';
+        const arrow = '<div class="pipe-arrow">▶</div>';
+        const ciCls = (d.ci_queued > 5) ? 'hot' : (d.ci_running > 0 ? 'live' : '');
+        const depLive = d.deploys_in_flight > 0;
+        const depSub = depLive ? ('🚀 ' + d.deploys_in_flight + ' in flight · ' + n(d.deploy_started_min) + 'm')
+                               : (d.deploys_failed_today > 0 ? ('⚠ ' + d.deploys_failed_today + ' failed') : 'all landed');
+        el.innerHTML = '<div class="pipe-row">' +
+            stage(d.issues_open, 'Issues open') + arrow +
+            stage(d.prs_open, 'PRs open') + arrow +
+            stage(n(d.ci_queued) + '/' + n(d.ci_running), 'CI q/run', ciCls) + arrow +
+            stage(d.merged_today, 'Merged today', d.merged_today > 0 ? 'live' : '') + arrow +
+            stage(d.deploys_ok_today, 'Deployed today', depLive ? 'live' : (d.deploys_failed_today > 0 ? 'bad' : ''), depSub) +
             '</div>';
     }).catch(() => {
         const el = document.getElementById('ci-queue-body');
-        if (el) el.innerHTML = '<p class="glance-unavailable">CI queue check failed to load.</p>';
+        if (el) el.innerHTML = '<p class="glance-unavailable">Pipeline check failed to load.</p>';
     });
 }
 
