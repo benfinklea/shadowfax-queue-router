@@ -1643,7 +1643,7 @@ def index():
 }
 *{box-sizing:border-box}
 @media(min-width:1300px){body{display:grid;grid-template-columns:1fr 1fr;gap:0 14px;align-items:start}
-h1,#fleet-hosts,#ci-queue-card,#route-health-card{grid-column:1/-1}}
+h1,#topbar,#monitors,#fleet-hosts,#ci-queue-card,#history{grid-column:1/-1}}
 body{font-family:'Rajdhani',sans-serif;background:var(--bg-dark);color:#e0e0e0;padding:10px;margin:0;
 background-image:radial-gradient(ellipse at top,#0d1a2d 0%,transparent 50%),
 linear-gradient(180deg,transparent 0%,rgba(0,255,242,0.03) 100%);min-height:100vh;font-size:14px}
@@ -1812,8 +1812,8 @@ letter-spacing:1px;text-transform:uppercase;transition:all 0.3s}
 .glance-num.hot{color:var(--neon-red);text-shadow:var(--glow-red)}
 .glance-label{font-size:0.75em;color:#889;letter-spacing:1px;text-transform:uppercase;margin-top:2px}
 .glance-unavailable{color:#667;font-size:0.9em;font-style:italic}
-.route-pills{display:flex;gap:8px;flex-wrap:wrap}
-.route-pill{font-family:'Orbitron',monospace;font-size:0.8em;letter-spacing:1px;padding:5px 12px;
+.route-pills{display:flex;gap:5px;flex-wrap:wrap;align-items:center}
+.route-pill{font-family:'Orbitron',monospace;font-size:0.7em;letter-spacing:1px;padding:2px 9px;
 border-radius:999px;border:1px solid #2a2a4e;background:var(--bg-panel);color:#889}
 .route-pill.live{color:var(--neon-green);border-color:var(--neon-green);box-shadow:0 0 8px rgba(57,255,20,0.25)}
 .pipe-row{display:flex;align-items:stretch;gap:0;flex-wrap:wrap}
@@ -1829,8 +1829,9 @@ border-radius:999px;border:1px solid #2a2a4e;background:var(--bg-panel);color:#8
 </style></head>
 <body><h1>GANDALF // FLEET MONITOR</h1>
 
-<div id="fleet-summary" style="margin:4px 0 14px 0;font-size:0.95em;color:#889">Loading fleet summary...</div>
+<div id="topbar" style="margin:4px 0 14px 0;display:flex;align-items:center;gap:12px;flex-wrap:wrap"><div id="fleet-summary" style="font-size:0.95em;color:#889">Loading fleet summary...</div><div id="route-health-body" style="margin-left:auto"></div></div>
 
+<div class=card id=monitors><p>Loading...</p></div>
 <div class=card id=fleet-hosts style="padding:12px 15px;margin:12px 0">
 <div id=fleet-row class=fleet-row><p style="grid-column:1/-1;color:#667;margin:0">Scanning fleet hosts...</p></div>
 </div>
@@ -1840,22 +1841,6 @@ border-radius:999px;border:1px solid #2a2a4e;background:var(--bg-panel);color:#8
 <div id="ci-queue-body"><p style="color:#667;margin:0">Loading pipeline...</p></div>
 </div>
 
-<div class=card id=route-health-card style="padding:12px 15px;margin:12px 0">
-<h3>🛰️ Model Route Health</h3>
-<div id="route-health-body"><p style="color:#667;margin:0">Loading route health...</p></div>
-</div>
-
-<div class=card id=monitors><p>Loading...</p></div>
-<div class=card id=history>
-<h3>📈 Historical Metrics</h3>
-<div class="time-range">
-<button onclick="setRange('hour')" id="btn-hour" class="active">Last Hour</button>
-<button onclick="setRange('day')" id="btn-day">Last 24h</button>
-<button onclick="setRange('week')" id="btn-week">Last Week</button>
-<button onclick="setRange('month')" id="btn-month">Last Month</button>
-</div>
-<div id="sparklines"><p>Loading history...</p></div>
-</div>
 
 <div class=card id=energy>
 <h3>⚡ Energy &amp; Cost — by Machine</h3>
@@ -1883,6 +1868,18 @@ GET  /api/history - Historical metrics (range=hour|day|week|month)
 GET  /api/energy  - GPU energy + time-of-use cost (day/week/month)
 GET  /api/health  - Health check</pre>
 </div>
+
+<div class=card id=history>
+<h3>📈 Historical Metrics</h3>
+<div class="time-range">
+<button onclick="setRange('hour')" id="btn-hour" class="active">Last Hour</button>
+<button onclick="setRange('day')" id="btn-day">Last 24h</button>
+<button onclick="setRange('week')" id="btn-week">Last Week</button>
+<button onclick="setRange('month')" id="btn-month">Last Month</button>
+</div>
+<div id="sparklines"><p>Loading history...</p></div>
+</div>
+
 
 <script>
 const icons = {gandalf: "🧙", frodo: "🧝", pippin: "🍎", shadowfax: "🐴"};
@@ -2066,15 +2063,14 @@ function refreshRouteHealth() {
             return;
         }
         const missing = d.routes.filter(r => !r.live);
-        let html = '<div class="route-pills">';
+        let html = '<div class="route-pills"><span style="color:#667;font-size:0.75em;letter-spacing:1px">🛰️ ROUTES ' +
+            (d.routes.length - missing.length) + '/' + d.routes.length + '</span>';
         d.routes.forEach(r => {
             html += '<span class="route-pill ' + (r.live ? 'live' : 'missing') + '">' + (r.live ? '● ' : '✕ ') + r.name + '</span>';
         });
         html += '</div>';
         if (missing.length) {
-            html += '<p style="margin:8px 0 0 0;color:var(--neon-red)">' + missing.length + ' local route(s) MISSING: ' + missing.map(r => r.name).join(', ') + '</p>';
-        } else {
-            html += '<p style="margin:8px 0 0 0;color:#667;font-size:0.85em">' + d.routes.length + '/' + d.routes.length + ' local routes live</p>';
+            html += '<div style="color:var(--neon-red);font-size:0.8em;text-align:right">' + missing.length + ' MISSING: ' + missing.map(r => r.name).join(', ') + '</div>';
         }
         el.innerHTML = html;
     }).catch(() => {
