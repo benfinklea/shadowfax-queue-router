@@ -79,6 +79,10 @@ CONFIG = {
             "ssh_host": "192.168.1.122",
             "ssh_user": "ben",
             "os": "linux",
+            "model_status_urls": [
+                ("running", "http://127.0.0.1:8889/running"),
+                ("models", "http://127.0.0.1:8891/v1/models"),
+            ],
             "vram_gb": 96,
             "gpu_power_limit": 450,
             "gpu_power_max": 600,
@@ -89,6 +93,9 @@ CONFIG = {
             "ssh_host": "192.168.1.105",
             "ssh_user": "ben",
             "os": "linux",
+            "model_status_urls": [
+                ("models", "http://192.168.1.105:8890/v1/models"),
+            ],
             "vram_gb": 32,
             "gpu_power_limit": 575,
             "gpu_power_max": 600,
@@ -771,6 +778,135 @@ def get_ssh_metrics(host, user):
     return result
 
 
+loaded_models_cache = {}
+loaded_models_cache_lock = threading.Lock()
+LOADED_MODELS_CACHE_TTL = 15
+
+MODEL_DISPLAY_NAMES = {
+    "devstral-small-2-24b": "Devstral-Small-2 24B",
+    "gemma4-26b": "Gemma4 26B",
+    "glm-4.5-air": "GLM-4.5-Air 106B",
+    "qwen3-235b-a22b": "Qwen3-235B-A22B",
+    "qwen3-coder-next": "Qwen3-Coder-Next 80B",
+    "qwen3.6-35b-a3b": "Qwen3.6-35B-A3B",
+}
+
+
+def _model_display_name(model_id):
+    """Turn live server IDs into stable, readable dashboard labels."""
+    if model_id.startswith("qwen-daily-"):
+        return "Qwen3.6-35B-A3B Q8_0"
+    return MODEL_DISPLAY_NAMES.get(model_id, model_id)
+
+
+def _served_model_ids(target_config):
+    """Read models that are actually running/served, never the gateway route list."""
+    model_ids = []
+    available = False
+    for source_type, url in target_config.get("model_status_urls", []):
+        try:
+            response = requests.get(url, timeout=4)
+            response.raise_for_status()
+            payload = response.json()
+            available = True
+            records = payload.get("running", []) if source_type == "running" else (
+                payload.get("data") or payload.get("models") or []
+            )
+            for record in records:
+                model_id = record if isinstance(record, str) else (
+                    record.get("id") or record.get("model") or record.get("name")
+                )
+                if model_id and model_id not in model_ids:
+                    model_ids.append(model_id)
+        except Exception as e:
+            logger.debug(f"model status unavailable at {url}: {e}")
+    return available, model_ids
+
+
+def _model_processes(target_name, target_config):
+    """Return live llama-server processes and their nvidia-smi VRAM footprints."""
+    command = (
+        "nvidia-smi --query-compute-apps=pid,process_name,used_memory "
+        "--format=csv,noheader,nounits"
+    )
+    rows = []
+    if target_name == "gandalf":
+        import subprocess
+        output = subprocess.run(
+            command.split(), capture_output=True, text=True, timeout=5, check=False
+        ).stdout
+        read_cmdline = lambda pid: Path(f"/proc/{pid}/cmdline").read_bytes().replace(
+            b"\x00", b" "
+        ).decode(errors="ignore")
+    else:
+        client = get_ssh_client(
+            target_config["ssh_host"], target_config.get("ssh_user", "ben")
+        )
+        if client is None:
+            return rows
+        _, stdout, _ = client.exec_command(command, timeout=5)
+        output = stdout.read().decode(errors="ignore")
+
+        def read_cmdline(pid):
+            _, cmdout, _ = client.exec_command(
+                f"tr '\\0' ' ' < /proc/{pid}/cmdline 2>/dev/null", timeout=4
+            )
+            return cmdout.read().decode(errors="ignore")
+
+    for line in output.splitlines():
+        parts = [part.strip() for part in line.split(",", 2)]
+        if len(parts) != 3 or not parts[0].isdigit() or "llama-server" not in parts[1]:
+            continue
+        try:
+            rows.append({
+                "pid": int(parts[0]),
+                "vram_mb": int(parts[2]),
+                "cmdline": read_cmdline(int(parts[0])),
+            })
+        except (OSError, ValueError):
+            continue
+    return rows
+
+
+def get_loaded_models(target_name, target_config):
+    """Live served-model names paired with their real per-process VRAM use."""
+    now = time.time()
+    with loaded_models_cache_lock:
+        cached = loaded_models_cache.get(target_name)
+        if cached and now - cached["ts"] < LOADED_MODELS_CACHE_TTL:
+            return cached["data"]
+
+    result = {"available": False, "models": []}
+    try:
+        result["available"], model_ids = _served_model_ids(target_config)
+        processes = _model_processes(target_name, target_config) if result["available"] else []
+        unused = list(processes)
+        for model_id in model_ids:
+            normalized_id = re.sub(r"[^a-z0-9]", "", model_id.lower())
+            match = next(
+                (
+                    proc for proc in unused
+                    if model_id.lower() in proc["cmdline"].lower()
+                    or normalized_id in re.sub(r"[^a-z0-9]", "", proc["cmdline"].lower())
+                ),
+                None,
+            )
+            if match is None and len(model_ids) == 1 and len(unused) == 1:
+                match = unused[0]
+            if match is not None:
+                unused.remove(match)
+            result["models"].append({
+                "name": _model_display_name(model_id),
+                "vram_gb": round(match["vram_mb"] / 1024, 1) if match else None,
+            })
+    except Exception as e:
+        logger.debug(f"loaded-model check failed for {target_name}: {e}")
+
+    with loaded_models_cache_lock:
+        loaded_models_cache[target_name] = {"data": result, "ts": time.time()}
+    return result
+
+
 def get_disk_usage(host, user, path="/"):
     """Get disk usage via SSH with caching (updates every 5 minutes)."""
     cache_key = f"{user}@{host}:{path}"
@@ -1152,7 +1288,8 @@ def get_target_status(target_name, target_config, fast=False):
         "disk": None,
         "swap": None,
         "disk_io": None,
-        "net_io": None
+        "net_io": None,
+        "loaded_models": None
     }
 
     # macOS targets: no ComfyUI/nvidia-smi, gather native metrics over SSH
@@ -1295,6 +1432,9 @@ def get_target_status(target_name, target_config, fast=False):
             )
             if disk_usage.get("total_gb"):
                 result["disk"] = disk_usage
+
+            if target_name in ("gandalf", "frodo"):
+                result["loaded_models"] = get_loaded_models(target_name, target_config)
         except Exception as e:
             logger.warning(f"{target_name} SSH unreachable: {e}")
 
@@ -1743,6 +1883,12 @@ transition:height 0.5s cubic-bezier(0.4,0,0.2,1);box-shadow:0 0 5px var(--neon-c
 .gauge-arc{}
 .progress-label{display:flex;justify-content:space-between;font-size:1em;color:#888;
 font-family:'Rajdhani',sans-serif;letter-spacing:1px}
+.loaded-models{margin-top:7px;padding:7px 9px;border-left:2px solid var(--neon-cyan);
+background:rgba(0,255,242,0.04);font-size:0.85em;color:#889}
+.loaded-model-title{font-family:'Orbitron',monospace;font-size:0.72em;letter-spacing:1px;color:#667}
+.loaded-model{display:flex;justify-content:space-between;gap:12px;margin-top:3px}
+.loaded-model-name{color:var(--neon-cyan);font-weight:bold}
+.loaded-model-vram{color:var(--neon-green);white-space:nowrap}
 .stat-row{margin:10px 0}
 .queue-badge{background:var(--neon-yellow);color:#000;padding:3px 10px;border-radius:2px;font-size:0.8em;
 font-family:'Orbitron',monospace;font-weight:bold;box-shadow:0 0 10px var(--neon-yellow)}
@@ -2074,6 +2220,21 @@ function progressBar(percent, cls, id) {
     if (percent > 90) barClass = 'progress-red';
     else if (percent > 70) barClass = 'progress-yellow';
     return '<div class="progress-bar"><div id="' + id + '" class="progress-fill ' + barClass + '" data-percent="' + percent + '" style="width:' + percent + '%"></div></div>';
+}
+
+function loadedModelsHtml(lm) {
+    if (!lm || !lm.available) {
+        return '<div class="loaded-model-title">LOADED IN VRAM</div><div style="margin-top:3px">Live model status unavailable</div>';
+    }
+    if (!lm.models || !lm.models.length) {
+        return '<div class="loaded-model-title">LOADED IN VRAM</div><div style="margin-top:3px">No served model loaded</div>';
+    }
+    return '<div class="loaded-model-title">LOADED IN VRAM · LIVE</div>' + lm.models.map(model =>
+        '<div class="loaded-model"><span class="loaded-model-name">● ' + model.name + '</span>' +
+        '<span class="loaded-model-vram">' +
+        (model.vram_gb === null || model.vram_gb === undefined ? 'VRAM measuring…' : model.vram_gb.toFixed(1) + ' GB VRAM') +
+        '</span></div>'
+    ).join('');
 }
 
 // Update existing progress bars smoothly
@@ -2432,6 +2593,9 @@ function refresh() {
                     html += '<div class="stat-row">';
                     html += '<div class="progress-label"><span>🎮 VRAM</span><span id="vram-label-' + name + '">' + info.gpu.vram_used_gb + ' / ' + info.gpu.vram_total_gb + ' GB</span></div>';
                     html += progressBar(info.gpu.vram_percent, "progress-vram", 'vram-' + name);
+                    if (name === 'gandalf' || name === 'frodo') {
+                        html += '<div class="loaded-models" id="loaded-models-' + name + '">' + loadedModelsHtml(info.loaded_models) + '</div>';
+                    }
                     html += '</div>';
 
                     if (info.ram) {
@@ -2515,6 +2679,14 @@ function refresh() {
                     updateProgressBar('vram-' + name, info.gpu.vram_percent, 'progress-vram');
                     const vramLabel = document.getElementById('vram-label-' + name);
                     if (vramLabel) vramLabel.textContent = info.gpu.vram_used_gb + ' / ' + info.gpu.vram_total_gb + ' GB';
+                    const loadedModelsEl = document.getElementById('loaded-models-' + name);
+                    if (loadedModelsEl) {
+                        const loadedHtml = loadedModelsHtml(info.loaded_models);
+                        if (loadedModelsEl.dataset.lastVal !== loadedHtml) {
+                            loadedModelsEl.dataset.lastVal = loadedHtml;
+                            loadedModelsEl.innerHTML = loadedHtml;
+                        }
+                    }
 
                     if (info.ram) {
                         updateProgressBar('ram-' + name, info.ram.percent, 'progress-ram');
