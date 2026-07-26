@@ -656,13 +656,17 @@ def get_ssh_client(host, user):
         raise
 
 def get_ssh_metrics(host, user):
-    """Get CPU%, GPU power, temperature, utilization, swap, disk I/O, and network I/O via SSH."""
+    """Get CPU, GPU, swap, disk I/O, and network I/O metrics via SSH."""
     result = {
         "cpu_percent": None,
+        "gpu_name": None,
         "gpu_watts": None,
         "gpu_power_limit": None,
         "gpu_temp": None,
         "gpu_util": None,
+        "vram_total_gb": None,
+        "vram_used_gb": None,
+        "vram_percent": None,
         "swap_percent": None,
         "swap_used_gb": None,
         "swap_total_gb": None,
@@ -676,20 +680,29 @@ def get_ssh_metrics(host, user):
         if client is None:
             return result  # Circuit breaker open, return empty metrics
 
-        # Get GPU power draw, current limit, temperature, and utilization
+        # Include GPU identity and VRAM here so cards do not depend on ComfyUI's
+        # /system_stats endpoint to render their gauges.
         stdin, stdout, stderr = client.exec_command(
-            "nvidia-smi --query-gpu=power.draw,power.limit,temperature.gpu,utilization.gpu --format=csv,noheader,nounits"
+            "nvidia-smi --query-gpu=name,power.draw,power.limit,temperature.gpu,"
+            "utilization.gpu,memory.total,memory.used --format=csv,noheader,nounits"
         )
         gpu_output = stdout.read().decode().strip()
         if gpu_output:
-            parts = gpu_output.split(",")
-            if len(parts) >= 2:
-                result["gpu_watts"] = float(parts[0].strip())
-                result["gpu_power_limit"] = float(parts[1].strip())
-            if len(parts) >= 3:
-                result["gpu_temp"] = float(parts[2].strip())
-            if len(parts) >= 4:
-                result["gpu_util"] = float(parts[3].strip())
+            parts = [part.strip() for part in gpu_output.split(",")]
+            if len(parts) >= 7:
+                result["gpu_name"] = parts[0]
+                result["gpu_watts"] = float(parts[1])
+                result["gpu_power_limit"] = float(parts[2])
+                result["gpu_temp"] = float(parts[3])
+                result["gpu_util"] = float(parts[4])
+                vram_total_mb = float(parts[5])
+                vram_used_mb = float(parts[6])
+                result["vram_total_gb"] = round(vram_total_mb / 1024, 1)
+                result["vram_used_gb"] = round(vram_used_mb / 1024, 1)
+                result["vram_percent"] = (
+                    round(vram_used_mb / vram_total_mb * 100, 1)
+                    if vram_total_mb > 0 else 0
+                )
 
         # Get CPU usage using top (parse idle and subtract from 100)
         stdin, stdout, stderr = client.exec_command(
@@ -1221,9 +1234,6 @@ def get_target_status(target_name, target_config, fast=False):
     except Exception as e:
         logger.warning(f"{target_name} ComfyUI unreachable: {e}")
 
-    if fast and not result["online"]:
-        return result
-
     # Get SSH metrics (CPU, GPU power, temp, util, swap, I/O) - independent of ComfyUI status
     if "ssh_host" in target_config:
         try:
@@ -1237,6 +1247,23 @@ def get_target_status(target_name, target_config, fast=False):
             result["gpu_util"] = ssh_metrics.get("gpu_util")
             if ssh_metrics.get("gpu_power_limit"):
                 result["gpu_power_limit"] = ssh_metrics["gpu_power_limit"]
+
+            # /api/status uses this data even when ComfyUI is intentionally down.
+            # Previously its fast path returned before SSH, leaving Frodo's dial
+            # values null despite the machine and nvidia-smi being healthy.
+            if any(ssh_metrics.get(key) is not None for key in (
+                "cpu_percent", "gpu_watts", "gpu_temp", "gpu_util"
+            )):
+                result["online"] = True
+
+            if result["gpu"] is None and ssh_metrics.get("vram_total_gb") is not None:
+                result["gpu"] = {
+                    "name": ssh_metrics.get("gpu_name") or "Unknown",
+                    "cuda_version": None,
+                    "vram_total_gb": ssh_metrics["vram_total_gb"],
+                    "vram_used_gb": ssh_metrics["vram_used_gb"],
+                    "vram_percent": ssh_metrics["vram_percent"],
+                }
 
             # Swap usage
             if ssh_metrics.get("swap_total_gb") is not None:
