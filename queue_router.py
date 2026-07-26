@@ -1825,10 +1825,6 @@ border-radius:999px;border:1px solid #2a2a4e;background:var(--bg-panel);color:#8
 
 <div id="fleet-summary" style="margin:4px 0 14px 0;font-size:0.95em;color:#889">Loading fleet summary...</div>
 
-<div class=card id=fleet-hosts style="padding:12px 15px;margin:12px 0">
-<div id=fleet-row class=fleet-row><p style="grid-column:1/-1;color:#667;margin:0">Scanning fleet hosts...</p></div>
-</div>
-
 <div class=card id=ci-queue-card style="padding:12px 15px;margin:12px 0">
 <h3>🚦 CI Queue — armbrain</h3>
 <div id="ci-queue-body"><p style="color:#667;margin:0">Loading CI queue...</p></div>
@@ -1840,6 +1836,10 @@ border-radius:999px;border:1px solid #2a2a4e;background:var(--bg-panel);color:#8
 </div>
 
 <div class=card id=monitors><p>Loading...</p></div>
+<div class=card id=fleet-hosts style="padding:12px 15px;margin:12px 0">
+<div id=fleet-row class=fleet-row><p style="grid-column:1/-1;color:#667;margin:0">Scanning fleet hosts...</p></div>
+</div>
+
 <div class=card id=history>
 <h3>📈 Historical Metrics</h3>
 <div class="time-range">
