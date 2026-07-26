@@ -1,9 +1,0 @@
-# Manual .bak checkpointing is what we are replacing with real commits.
-# 14 of these had accumulated by 2026-07-25 while the file went a week
-# without a commit. Keep them out of the repo; use git history instead.
-*.bak
-*.bak-*
-__pycache__/
-venv/
-.DS_Store
-._.DS_Store
