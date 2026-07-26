@@ -13,7 +13,7 @@ import logging
 import threading
 import time
 import paramiko
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 from datetime import datetime, timedelta
 from pathlib import Path
 from flask import Flask, request, jsonify
@@ -600,6 +600,8 @@ DISK_CACHE_TTL = 300  # 5 minutes
 fleet_cache = {"data": None, "ts": 0.0}
 FLEET_CACHE_TTL = 15  # seconds
 fleet_cache_lock = threading.Lock()
+STATUS_PROBE_TIMEOUT = 15  # Keep one unreachable SSH host from blocking /api/status
+SSH_COMMAND_TIMEOUT = 5
 
 # Historical metrics collection interval
 METRICS_INTERVAL = 60  # Collect every 60 seconds
@@ -630,7 +632,9 @@ def get_ssh_client(host, user):
     try:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(host, username=user, timeout=5)
+        client.connect(
+            host, username=user, timeout=5, banner_timeout=5, auth_timeout=5
+        )
         ssh_clients[key] = client
 
         # Success - reset circuit breaker
@@ -691,7 +695,8 @@ def get_ssh_metrics(host, user):
         # /system_stats endpoint to render their gauges.
         stdin, stdout, stderr = client.exec_command(
             "nvidia-smi --query-gpu=name,power.draw,power.limit,temperature.gpu,"
-            "utilization.gpu,memory.total,memory.used --format=csv,noheader,nounits"
+            "utilization.gpu,memory.total,memory.used --format=csv,noheader,nounits",
+            timeout=SSH_COMMAND_TIMEOUT,
         )
         gpu_output = stdout.read().decode().strip()
         if gpu_output:
@@ -713,7 +718,8 @@ def get_ssh_metrics(host, user):
 
         # Get CPU usage using top (parse idle and subtract from 100)
         stdin, stdout, stderr = client.exec_command(
-            "top -bn1 | grep '%Cpu' | sed 's/,/ /g' | awk '{for(i=1;i<=NF;i++) if($i==\"id\") print 100-$(i-1)}'"
+            "top -bn1 | grep '%Cpu' | sed 's/,/ /g' | awk '{for(i=1;i<=NF;i++) if($i==\"id\") print 100-$(i-1)}'",
+            timeout=SSH_COMMAND_TIMEOUT,
         )
         cpu_output = stdout.read().decode().strip()
         if cpu_output:
@@ -721,7 +727,8 @@ def get_ssh_metrics(host, user):
 
         # Get swap usage
         stdin, stdout, stderr = client.exec_command(
-            "free -b | grep Swap | awk '{print $2, $3}'"
+            "free -b | grep Swap | awk '{print $2, $3}'",
+            timeout=SSH_COMMAND_TIMEOUT,
         )
         swap_output = stdout.read().decode().strip()
         if swap_output:
@@ -736,7 +743,8 @@ def get_ssh_metrics(host, user):
         # Get disk I/O (using iostat if available, fallback to /proc/diskstats)
         stdin, stdout, stderr = client.exec_command(
             "iostat -d -k 1 2 2>/dev/null | tail -n +7 | head -1 | awk '{print $3, $4}' || "
-            "cat /proc/diskstats | awk '/nvme0n1 |sda /{print $6*512/1024, $10*512/1024}' | head -1"
+            "cat /proc/diskstats | awk '/nvme0n1 |sda /{print $6*512/1024, $10*512/1024}' | head -1",
+            timeout=SSH_COMMAND_TIMEOUT,
         )
         disk_io_output = stdout.read().decode().strip()
         if disk_io_output:
@@ -747,13 +755,15 @@ def get_ssh_metrics(host, user):
 
         # Get network I/O (bytes per second on primary interface)
         stdin, stdout, stderr = client.exec_command(
-            "cat /proc/net/dev | grep -E 'eth0|eno|enp' | head -1 | awk '{print $2, $10}'"
+            "cat /proc/net/dev | grep -E 'eth0|eno|enp' | head -1 | awk '{print $2, $10}'",
+            timeout=SSH_COMMAND_TIMEOUT,
         )
         net_output1 = stdout.read().decode().strip()
         if net_output1:
             time.sleep(0.5)
             stdin, stdout, stderr = client.exec_command(
-                "cat /proc/net/dev | grep -E 'eth0|eno|enp' | head -1 | awk '{print $2, $10}'"
+                "cat /proc/net/dev | grep -E 'eth0|eno|enp' | head -1 | awk '{print $2, $10}'",
+                timeout=SSH_COMMAND_TIMEOUT,
             )
             net_output2 = stdout.read().decode().strip()
             if net_output2:
@@ -927,7 +937,8 @@ def get_disk_usage(host, user, path="/"):
 
         # Get disk usage for specified path
         stdin, stdout, stderr = client.exec_command(
-            f"df -B1 {path} | tail -1 | awk '{{print $2, $3, $5}}'"
+            f"df -B1 {path} | tail -1 | awk '{{print $2, $3, $5}}'",
+            timeout=SSH_COMMAND_TIMEOUT,
         )
         disk_output = stdout.read().decode().strip()
         if disk_output:
@@ -1266,13 +1277,9 @@ def get_mac_metrics(host, user):
     return result
 
 
-def get_target_status(target_name, target_config, fast=False):
-    """Check a target's availability and gather live metrics.
-
-    Linux targets are probed via ComfyUI HTTP + SSH (nvidia-smi). Mac targets
-    have no ComfyUI here, so they report online via SSH and use native metrics.
-    """
-    result = {
+def offline_target_status(target_config):
+    """Full dashboard shape for a target whose live probes failed."""
+    return {
         "online": False,
         "os": target_config.get("os", "linux"),
         "queue_running": 0,
@@ -1289,8 +1296,17 @@ def get_target_status(target_name, target_config, fast=False):
         "swap": None,
         "disk_io": None,
         "net_io": None,
-        "loaded_models": None
+        "loaded_models": None,
     }
+
+
+def get_target_status(target_name, target_config, fast=False):
+    """Check a target's availability and gather live metrics.
+
+    Linux targets are probed via ComfyUI HTTP + SSH (nvidia-smi). Mac targets
+    have no ComfyUI here, so they report online via SSH and use native metrics.
+    """
+    result = offline_target_status(target_config)
 
     # macOS targets: no ComfyUI/nvidia-smi, gather native metrics over SSH
     if target_config.get("os") == "mac":
@@ -1443,81 +1459,95 @@ def get_target_status(target_name, target_config, fast=False):
 @app.route("/api/status", methods=["GET"])
 def get_status():
     """Get status of all targets and recent jobs."""
-    targets_status = {}
-    with ThreadPoolExecutor(max_workers=max(1, len(CONFIG["targets"]))) as executor:
+    results = {
+        name: offline_target_status(config)
+        for name, config in CONFIG["targets"].items()
+    }
+    executor = ThreadPoolExecutor(max_workers=max(1, len(CONFIG["targets"])))
+    try:
         futures = {
             executor.submit(get_target_status, name, config, True): (name, config)
             for name, config in CONFIG["targets"].items()
         }
-        results = {}
-        for future in as_completed(futures):
+        done, pending = wait(futures, timeout=STATUS_PROBE_TIMEOUT)
+        for future in done:
             name, config = futures[future]
             try:
                 status = future.result()
+                if not isinstance(status, dict):
+                    raise TypeError("target status was not an object")
             except Exception as e:
                 logger.warning(f"{name} status unavailable: {e}")
-                status = {
-                    "online": False,
-                    "os": config.get("os", "linux"),
-                    "queue_running": 0,
-                    "queue_pending": 0,
-                    "gpu": None,
-                    "ram": None,
-                    "cpu_percent": None,
-                    "gpu_watts": None,
-                    "gpu_temp": None,
-                    "gpu_util": None,
-                    "gpu_power_limit": config.get("gpu_power_limit", 300),
-                    "gpu_power_max": config.get("gpu_power_max", 400),
-                    "disk": None,
-                    "swap": None,
-                    "disk_io": None,
-                    "net_io": None,
-                }
-            results[name] = {
-                **status,
-                # Display-only smoothing: don't let one slow/busy probe flip
-                # the dashboard to a false OFFLINE alarm (see apply_display_hysteresis).
-                "online": apply_display_hysteresis(name, status["online"]),
-                "vram_gb": config.get("vram_gb"),
-                "url": config.get("url")
-            }
+                status = offline_target_status(config)
+            results[name] = {**offline_target_status(config), **status}
+        for future in pending:
+            name, _ = futures[future]
+            logger.warning(
+                f"{name} status probe exceeded {STATUS_PROBE_TIMEOUT}s; using offline stub"
+            )
+            future.cancel()
+    finally:
+        # Do not wait for a slow host after the endpoint's response deadline.
+        executor.shutdown(wait=False, cancel_futures=True)
 
     # Preserve CONFIG order (gandalf, frodo, pippin) regardless of completion order
-    targets_status = {name: results[name] for name in CONFIG["targets"] if name in results}
+    targets_status = {
+        name: {
+            **results[name],
+            # Display-only smoothing: don't let one slow/busy probe flip
+            # the dashboard to a false OFFLINE alarm (see apply_display_hysteresis).
+            # A completely empty fail-soft stub is definitively offline.
+            "online": (
+                False
+                if not results[name]["online"] and not any(
+                    results[name].get(key) is not None
+                    for key in ("gpu", "ram", "cpu_percent", "gpu_watts", "gpu_temp")
+                )
+                else apply_display_hysteresis(name, results[name]["online"])
+            ),
+            "vram_gb": config.get("vram_gb"),
+            "url": config.get("url"),
+        }
+        for name, config in CONFIG["targets"].items()
+    }
 
-    conn = sqlite3.connect(CONFIG["db_path"])
-
-    # Get jobs today count per target
     today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-    cursor = conn.execute(
-        "SELECT target, COUNT(*) FROM jobs WHERE submitted_at >= ? GROUP BY target",
-        (today_start,)
-    )
-    jobs_today = {row[0]: row[1] for row in cursor.fetchall()}
+    jobs_today = {}
+    max_util_today = {}
+    recent_jobs = []
+    conn = None
+    try:
+        conn = sqlite3.connect(CONFIG["db_path"])
 
-    # Add jobs_today to each target
+        cursor = conn.execute(
+            "SELECT target, COUNT(*) FROM jobs WHERE submitted_at >= ? GROUP BY target",
+            (today_start,)
+        )
+        jobs_today = {row[0]: row[1] for row in cursor.fetchall()}
+
+        cursor = conn.execute(
+            "SELECT target, MAX(gpu_util) FROM metrics_history WHERE timestamp >= ? GROUP BY target",
+            (today_start,)
+        )
+        max_util_today = {row[0]: row[1] for row in cursor.fetchall()}
+
+        cursor = conn.execute(
+            "SELECT id, target, status, submitted_at FROM jobs ORDER BY submitted_at DESC LIMIT 10"
+        )
+        recent_jobs = [
+            {"id": row[0], "target": row[1], "status": row[2], "submitted_at": row[3]}
+            for row in cursor.fetchall()
+        ]
+    except Exception as e:
+        logger.warning(f"status history unavailable: {e}")
+    finally:
+        if conn is not None:
+            conn.close()
+
     for name in targets_status:
         targets_status[name]["jobs_today"] = jobs_today.get(name, 0)
-
-    # Max GPU utilization today per target (from collected metrics)
-    cursor = conn.execute(
-        "SELECT target, MAX(gpu_util) FROM metrics_history WHERE timestamp >= ? GROUP BY target",
-        (today_start,)
-    )
-    max_util_today = {row[0]: row[1] for row in cursor.fetchall()}
-    for name in targets_status:
         v = max_util_today.get(name)
         targets_status[name]["max_util_today"] = round(v) if v is not None else None
-
-    cursor = conn.execute(
-        "SELECT id, target, status, submitted_at FROM jobs ORDER BY submitted_at DESC LIMIT 10"
-    )
-    recent_jobs = [
-        {"id": row[0], "target": row[1], "status": row[2], "submitted_at": row[3]}
-        for row in cursor.fetchall()
-    ]
-    conn.close()
 
     return jsonify({
         "targets": targets_status,
@@ -2521,13 +2551,14 @@ function updateGauge(id, value, min, max, unit, showLimit, colorFn) {
 
 function refresh() {
     fetch("/api/status").then(r => r.json()).then(data => {
-        for (const [name, info] of Object.entries(data.targets)) { lastTargetsOnline[name] = info.online; }
+        const targets = data.targets || {};
+        for (const [name, info] of Object.entries(targets)) { lastTargetsOnline[name] = info.online; }
         updateFleetSummary();
         // If not initialized, build the full HTML
         if (!initialized) {
             let html = '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:20px">';
 
-            for (const [name, info] of Object.entries(data.targets)) {
+            for (const [name, info] of Object.entries(targets)) {
                 const icon = icons[name] || "🖥️";
                 const status = info.online ? '<span class="online">ONLINE</span>' : '<span class="offline">OFFLINE</span>';
 
@@ -2638,7 +2669,7 @@ function refresh() {
 
         } else {
             // UPDATE PATH: Just update values in place
-            for (const [name, info] of Object.entries(data.targets)) {
+            for (const [name, info] of Object.entries(targets)) {
                 // Update max utilization today
                 const maxUtilEl = document.getElementById('maxutil-' + name);
                 if (maxUtilEl) {
@@ -2799,7 +2830,7 @@ function refreshHistory() {
         let html = '';
 
         let idx = 0;
-        for (const [target, points] of Object.entries(data.data)) {
+        for (const [target, points] of Object.entries(data.data || {})) {
             const icon = icons[target] || '🖥️';
             html += '<div class="history-machine alt-' + (idx % 2) + '"><h4 style="margin:0 0 12px 0;color:#ccc">' + icon + ' ' + target.charAt(0).toUpperCase() + target.slice(1) + '</h4>';
             html += '<div class="sparkline-container">';
@@ -2832,13 +2863,14 @@ function fmtCell(ec) {
 function refreshEnergy() {
     fetch('/api/energy').then(r => r.json()).then(data => {
         const order = ['gandalf', 'frodo', 'pippin'];
-        const names = order.filter(n => n in data.by_machine)
-            .concat(Object.keys(data.by_machine).filter(n => !order.includes(n)));
+        const byMachine = data.by_machine || {};
+        const names = order.filter(n => n in byMachine)
+            .concat(Object.keys(byMachine).filter(n => !order.includes(n)));
 
         // Per-machine table
         let rows = '<table><tr><th>Machine</th><th>Today</th><th>This Week</th><th>This Month</th></tr>';
         names.forEach(name => {
-            const m = data.by_machine[name];
+            const m = byMachine[name];
             const icon = icons[name] || '🖥️';
             const label = name.charAt(0).toUpperCase() + name.slice(1);
             if (!m || m.metered === false) {
@@ -2974,21 +3006,35 @@ def get_energy():
     month_start = day_start.replace(day=1)
     windows = {"day": day_start, "week": week_start, "month": month_start}
 
-    conn = sqlite3.connect(CONFIG["db_path"])
-    by_machine = {}
+    by_machine = {
+        name: (
+            {"metered": False}
+            if cfg.get("os") == "mac"
+            else {
+                "metered": True,
+                **{w: {"kwh": 0.0, "cost": 0.0} for w in windows},
+            }
+        )
+        for name, cfg in CONFIG["targets"].items()
+    }
     fleet = {w: {"kwh": 0.0, "cost": 0.0} for w in windows}
-    for name, cfg in CONFIG["targets"].items():
-        # Macs report no wattage (powermetrics needs sudo), so they aren't metered
-        if cfg.get("os") == "mac":
-            by_machine[name] = {"metered": False}
-            continue
-        by_machine[name] = {"metered": True}
-        for wname, wstart in windows.items():
-            ec = energy_cost_since(conn, name, wstart)
-            by_machine[name][wname] = ec
-            fleet[wname]["kwh"] += ec["kwh"]
-            fleet[wname]["cost"] += ec["cost"]
-    conn.close()
+    conn = None
+    try:
+        conn = sqlite3.connect(CONFIG["db_path"])
+        for name, cfg in CONFIG["targets"].items():
+            # Macs report no wattage (powermetrics needs sudo), so they aren't metered
+            if cfg.get("os") == "mac":
+                continue
+            for wname, wstart in windows.items():
+                ec = energy_cost_since(conn, name, wstart)
+                by_machine[name][wname] = ec
+                fleet[wname]["kwh"] += ec["kwh"]
+                fleet[wname]["cost"] += ec["cost"]
+    except Exception as e:
+        logger.warning(f"energy history unavailable: {e}")
+    finally:
+        if conn is not None:
+            conn.close()
 
     for w in fleet:
         fleet[w]["kwh"] = round(fleet[w]["kwh"], 3)
@@ -3037,10 +3083,11 @@ def get_history():
         # Group by day
         group_minutes = 1440
     else:
-        return jsonify({"error": "Invalid range. Use: hour, day, week, month"}), 400
-
-    conn = sqlite3.connect(CONFIG["db_path"])
-    conn.row_factory = sqlite3.Row
+        return jsonify({
+            "range": range_param,
+            "data": {},
+            "error": "Invalid range. Use: hour, day, week, month",
+        }), 400
 
     # Build query
     query = """
@@ -3058,16 +3105,29 @@ def get_history():
 
     query += " ORDER BY timestamp ASC"
 
-    cursor = conn.execute(query, params)
-    rows = cursor.fetchall()
-    conn.close()
+    rows = []
+    conn = None
+    try:
+        conn = sqlite3.connect(CONFIG["db_path"])
+        conn.row_factory = sqlite3.Row
+        cursor = conn.execute(query, params)
+        rows = cursor.fetchall()
+    except Exception as e:
+        logger.warning(f"metrics history unavailable: {e}")
+    finally:
+        if conn is not None:
+            conn.close()
 
     # Group and aggregate data
-    result = {}
+    result = {
+        name: []
+        for name in CONFIG["targets"]
+        if not target_filter or name == target_filter
+    }
     for row in rows:
         target = row["target"]
         if target not in result:
-            result[target] = []
+            continue
 
         result[target].append({
             "timestamp": row["timestamp"],
@@ -3093,7 +3153,10 @@ def get_history():
             bucket_start = None
 
             for point in result[target]:
-                ts = datetime.fromisoformat(point["timestamp"])
+                try:
+                    ts = datetime.fromisoformat(point["timestamp"])
+                except (TypeError, ValueError):
+                    continue
                 if bucket_start is None:
                     bucket_start = ts
                     bucket = [point]
@@ -3111,9 +3174,6 @@ def get_history():
                 aggregated.append(aggregate_bucket(bucket))
 
             result[target] = aggregated
-
-    # Only surface configured targets, in CONFIG order (gandalf, frodo, pippin)
-    result = {t: result[t] for t in CONFIG["targets"] if t in result}
 
     return jsonify({
         "range": range_param,
