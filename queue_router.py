@@ -889,9 +889,7 @@ ci_queue_cache_lock = threading.Lock()
 CI_QUEUE_CACHE_TTL = 45  # seconds - don't hammer the GitHub API
 
 def get_ci_queue_status():
-    """Queued + in-progress GitHub Actions run counts for armbrain-io/armbrain -
-    the same queue-depth signal the Shire autoscaler watches to decide whether
-    to wake reserve boxes."""
+    """Current GitHub Actions queue depth and job-level activity for armbrain."""
     now = time.time()
     with ci_queue_cache_lock:
         if ci_queue_cache["data"] is not None and (now - ci_queue_cache["ts"]) < CI_QUEUE_CACHE_TTL:
@@ -903,12 +901,75 @@ def get_ci_queue_status():
         try:
             headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
             base = f"https://api.github.com/repos/{GITHUB_CI_REPO}/actions/runs"
-            q = requests.get(base, params={"status": "queued", "per_page": 1}, headers=headers, timeout=8)
-            ip = requests.get(base, params={"status": "in_progress", "per_page": 1}, headers=headers, timeout=8)
+            # GitHub can strand queued runs when a branch disappears. Keep those
+            # visible as orphans, but exclude them from the live queue-depth signal.
+            from datetime import timezone
+            stale_cut = datetime.now(timezone.utc) - timedelta(hours=48)
+            cutoff = stale_cut.strftime("%Y-%m-%dT%H:%M:%SZ")
+            q = requests.get(
+                base,
+                params={"status": "queued", "per_page": 100, "created": f">={cutoff}"},
+                headers=headers,
+                timeout=8,
+            )
+            ip = requests.get(
+                base,
+                params={"status": "in_progress", "per_page": 100, "created": f">={cutoff}"},
+                headers=headers,
+                timeout=8,
+            )
             if q.ok and ip.ok:
                 result["available"] = True
                 result["queued"] = q.json().get("total_count", 0)
                 result["in_progress"] = ip.json().get("total_count", 0)
+
+                # A workflow run may contain many concurrent jobs. Count the jobs
+                # actually running so the dashboard reflects fleet workload.
+                try:
+                    active_jobs = 0
+                    active_runners = set()
+                    for run in (ip.json().get("workflow_runs") or [])[:12]:
+                        jobs = requests.get(
+                            f"{base}/{run['id']}/jobs",
+                            params={"per_page": 100},
+                            headers=headers,
+                            timeout=8,
+                        )
+                        if not jobs.ok:
+                            continue
+                        for job in jobs.json().get("jobs", []):
+                            if job.get("status") == "in_progress":
+                                active_jobs += 1
+                                if job.get("runner_name"):
+                                    active_runners.add(job["runner_name"])
+
+                    orphaned = 0
+                    all_queued = requests.get(
+                        base,
+                        params={"status": "queued", "per_page": 100},
+                        headers=headers,
+                        timeout=8,
+                    )
+                    if all_queued.ok:
+                        for run in all_queued.json().get("workflow_runs", []):
+                            try:
+                                created = datetime.strptime(
+                                    run.get("created_at") or "", "%Y-%m-%dT%H:%M:%SZ"
+                                ).replace(tzinfo=timezone.utc)
+                            except ValueError:
+                                continue
+                            if created < stale_cut:
+                                orphaned += 1
+
+                    result["active_jobs"] = active_jobs
+                    result["active_runners"] = sorted(active_runners)
+                    result["active_runner_count"] = len(active_runners)
+                    result["orphaned_queued"] = orphaned
+                except Exception as e:
+                    # An unreadable jobs API must not silently look like zero work.
+                    logger.warning(f"CI job-level count failed: {e}")
+                    result["active_jobs"] = None
+                    result["active_runner_count"] = None
             else:
                 logger.warning(f"CI queue check: GitHub returned {q.status_code}/{ip.status_code}")
         except Exception as e:
@@ -1934,11 +1995,20 @@ function refreshCiQueue() {
             el.innerHTML = '<p class="glance-unavailable">CI signal unavailable right now (token fetch or GitHub API failed) — not necessarily a real outage, just a stale read.</p>';
             return;
         }
+        const running = (d.active_jobs === null || d.active_jobs === undefined) ? d.in_progress : d.active_jobs;
+        const runningLabel = (d.active_jobs === null || d.active_jobs === undefined) ? 'Running Runs' : 'Running Jobs';
+        const runnerDetail = (d.active_runner_count === null || d.active_runner_count === undefined)
+            ? ''
+            : d.active_runner_count + ' active runner' + (d.active_runner_count === 1 ? '' : 's');
+        const orphanDetail = d.orphaned_queued
+            ? ' · ' + d.orphaned_queued + ' stale orphan' + (d.orphaned_queued === 1 ? '' : 's') + ' excluded'
+            : '';
         el.innerHTML =
             '<div class="glance-row">' +
             '<div class="glance-stat"><div class="glance-num ' + ciQueueNumClass(d.queued) + '">' + d.queued + '</div><div class="glance-label">Queued</div></div>' +
-            '<div class="glance-stat"><div class="glance-num">' + d.in_progress + '</div><div class="glance-label">Running</div></div>' +
-            '<div style="color:#667;font-size:0.85em">' + d.repo + ' — the same queue-depth signal the Shire autoscaler watches</div>' +
+            '<div class="glance-stat"><div class="glance-num">' + running + '</div><div class="glance-label">' + runningLabel + '</div></div>' +
+            '<div style="color:#667;font-size:0.85em">' + d.repo + ' — the same queue-depth signal the Shire autoscaler watches' +
+            (runnerDetail ? ' · ' + runnerDetail : '') + orphanDetail + '</div>' +
             '</div>';
     }).catch(() => {
         const el = document.getElementById('ci-queue-body');
