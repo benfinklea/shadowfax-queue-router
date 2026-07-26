@@ -2884,16 +2884,19 @@ function refreshEnergy() {
         rows += '</table>';
         document.getElementById('energy-by-machine').innerHTML = rows;
 
-        // Fleet aggregate
-        const f = data.fleet;
+        // Fleet aggregate — fail-soft: a partial/failed fetch (e.g. flaky phone
+        // link over Tailscale) must not throw on a missing fleet/window, it just
+        // shows 0 for that cell instead of nuking the whole panel.
+        const f = data.fleet || {};
         let fleet = '<table><tr><th>Period</th><th>GPU Energy</th><th>Cost</th></tr>';
         [['Today', 'day'], ['This Week', 'week'], ['This Month', 'month']].forEach(([lbl, k]) => {
+            const c = f[k] || {kwh: 0, cost: 0};
             fleet += '<tr><td><b>' + lbl + '</b></td><td><b style="color:var(--neon-cyan)">'
-                  + f[k].kwh.toFixed(2) + '</b> kWh</td><td><b class="cost">$' + f[k].cost.toFixed(2) + '</b></td></tr>';
+                  + (c.kwh || 0).toFixed(2) + '</b> kWh</td><td><b class="cost">$' + (c.cost || 0).toFixed(2) + '</b></td></tr>';
         });
         fleet += '</table>';
-        fleet += '<p style="margin-top:10px;color:#666;font-size:0.8em">Base ' + data.base_per_kwh.toFixed(6)
-              + ' $/kWh + PEC time-of-use. ' + data.note + '</p>';
+        fleet += '<p style="margin-top:10px;color:#666;font-size:0.8em">Base ' + (data.base_per_kwh || 0).toFixed(6)
+              + ' $/kWh + PEC time-of-use. ' + (data.note || '') + '</p>';
         document.getElementById('energy-fleet-body').innerHTML = fleet;
     }).catch(err => {
         document.getElementById('energy-by-machine').innerHTML = '<p style="color:#d94a4a">Error loading energy: ' + err + '</p>';
