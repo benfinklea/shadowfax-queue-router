@@ -1458,6 +1458,144 @@ def get_target_status(target_name, target_config, fast=False):
 
     return result
 
+
+# ── Shipping pipeline snapshot (ported forward from bak-20260725; Gemini fleet monitor consumes /api/pipeline) ──
+PIPELINE_CACHE_TTL = 300  # seconds
+pipeline_cache = {"data": None, "ts": 0.0}
+pipeline_cache_lock = threading.Lock()
+
+def get_pipeline_status():
+    """Shipping-pipeline snapshot for armbrain: issues -> PRs -> CI -> merged
+    today -> deployed today. Read-only GitHub queries, cached 5 min."""
+    now = time.time()
+    with pipeline_cache_lock:
+        if pipeline_cache["data"] is not None and (now - pipeline_cache["ts"]) < PIPELINE_CACHE_TTL:
+            return pipeline_cache["data"]
+
+    result = {"available": False, "repo": GITHUB_CI_REPO}
+    token = get_gh_ci_token()
+    if token:
+        try:
+            from datetime import datetime, timezone
+            headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
+            # "Today" is CENTRAL TIME (Ben's day), not UTC - counters were resetting at 7pm CT.
+            from zoneinfo import ZoneInfo
+            from datetime import timedelta
+            CT = ZoneInfo("America/Chicago")
+            now_ct = datetime.now(CT)
+            ct_midnight_utc = now_ct.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+            today = ct_midnight_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+            def search_count(q):
+                r = requests.get("https://api.github.com/search/issues",
+                                 params={"q": q, "per_page": 1}, headers=headers, timeout=8)
+                return r.json().get("total_count", 0) if r.ok else None
+            result["issues_open"] = search_count(f"repo:{GITHUB_CI_REPO} type:issue state:open")
+            result["prs_open"] = search_count(f"repo:{GITHUB_CI_REPO} type:pr state:open")
+            result["merged_today"] = search_count(f"repo:{GITHUB_CI_REPO} type:pr merged:>={today}")
+            spark = []
+            for i in range(6, 0, -1):
+                d0 = (now_ct - timedelta(days=i)).replace(hour=0, minute=0, second=0, microsecond=0)
+                d1 = d0 + timedelta(days=1)
+                q = (f"repo:{GITHUB_CI_REPO} type:pr merged:{d0.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}"
+                     f"..{d1.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}")
+                spark.append(search_count(q) or 0)
+            spark.append(result.get("merged_today") or 0)
+            result["merged_spark"] = spark
+            ci = get_ci_queue_status()
+            result["ci_queued"] = ci.get("queued", 0) if ci.get("available") else None
+            result["ci_running"] = ci.get("in_progress", 0) if ci.get("available") else None
+            # deploys today (Gateway Deploy workflow)
+            week_start = (now_ct - timedelta(days=6)).replace(hour=0, minute=0, second=0, microsecond=0)
+            r = requests.get(f"https://api.github.com/repos/{GITHUB_CI_REPO}/actions/runs",
+                             params={"created": f">={week_start.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}", "per_page": 100}, headers=headers, timeout=8)
+            dep_ok = dep_fail = dep_live = 0
+            live_started_min = None
+            dep_days = [0] * 7
+            if r.ok:
+                for run in r.json().get("workflow_runs", []):
+                    if run.get("name") != "Gateway Deploy":
+                        continue
+                    run_ct = None
+                    try:
+                        run_ct = datetime.strptime(run.get("created_at"), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).astimezone(CT)
+                    except Exception:
+                        pass
+                    is_today = run_ct is not None and run_ct.date() == now_ct.date()
+                    if run.get("status") == "completed" and run.get("conclusion") == "success" and run_ct is not None:
+                        idx = 6 - (now_ct.date() - run_ct.date()).days
+                        if 0 <= idx <= 6:
+                            dep_days[idx] += 1
+                    if run.get("status") != "completed":
+                        if not is_today:
+                            continue
+                        dep_live += 1
+                        try:
+                            t = datetime.strptime(run.get("run_started_at") or run.get("created_at"),
+                                                  "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                            m = int((datetime.now(timezone.utc) - t).total_seconds() // 60)
+                            live_started_min = m if live_started_min is None else min(live_started_min, m)
+                        except Exception:
+                            pass
+                    elif run.get("conclusion") == "success":
+                        if is_today:
+                            dep_ok += 1
+                    elif run.get("conclusion") not in ("cancelled", "skipped"):
+                        if is_today:
+                            dep_fail += 1
+            result["deploys_spark"] = dep_days
+            result.update({"deploys_ok_today": dep_ok, "deploys_failed_today": dep_fail,
+                           "deploys_in_flight": dep_live, "deploy_started_min": live_started_min})
+            # Last REAL deployment: newest completed run whose `deploy` JOB
+            # succeeded (a green run can be validation-only with deploy
+            # skipped, so run conclusion alone is not enough).
+            try:
+                found = False
+                for page in (1, 2):
+                    if found:
+                        break
+                    r = requests.get(f"https://api.github.com/repos/{GITHUB_CI_REPO}/actions/workflows/gateway-deploy.yml/runs",
+                                     params={"status": "completed", "branch": "main",
+                                             "per_page": 100, "page": page},
+                                     headers=headers, timeout=8)
+                    if not r.ok:
+                        break
+                    runs = r.json().get("workflow_runs", [])
+                    if not runs:
+                        break
+                    for run in runs:
+                        # scheduled guard ticks never run the deploy job — skip
+                        # them without burning a jobs API call (same event
+                        # filter the deploy-guard itself uses).
+                        if run.get("event") not in ("push", "workflow_dispatch"):
+                            continue
+                        jr = requests.get(run["jobs_url"], params={"per_page": 100},
+                                          headers=headers, timeout=8)
+                        if not jr.ok:
+                            continue
+                        dep_job = next((j for j in jr.json().get("jobs", [])
+                                        if j.get("name") == "deploy" and j.get("conclusion") == "success"), None)
+                        if dep_job:
+                            result["last_deploy_at"] = dep_job.get("completed_at") or run.get("updated_at")
+                            result["last_deploy_sha"] = (run.get("head_sha") or "")[:9]
+                            found = True
+                            break
+            except Exception as e:
+                logger.warning(f"last-deploy lookup failed: {e}")
+            result["available"] = True
+        except Exception as e:
+            logger.warning(f"pipeline status failed: {e}")
+
+    with pipeline_cache_lock:
+        pipeline_cache["data"] = result
+        pipeline_cache["ts"] = time.time()
+    return result
+
+
+@app.route("/api/pipeline", methods=["GET"])
+def api_pipeline():
+    return jsonify(get_pipeline_status())
+
+
 @app.route("/api/status", methods=["GET"])
 def get_status():
     """Get status of all targets and recent jobs."""
