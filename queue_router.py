@@ -5,6 +5,7 @@ Receives ComfyUI workflows and routes them to the best available GPU.
 """
 
 import json
+import os
 import re
 import sqlite3
 import uuid
@@ -117,10 +118,11 @@ CONFIG = {
 # "local": metrics come from this box itself (no SSH). "mac" is for Wake-on-LAN
 # (all farthings have WoL enabled at NIC + BIOS level; sam/shadowfax N/A).
 FLEET_NODES = {
-    "northfarthing": {"ssh_host": "192.168.1.147", "ssh_user": "ben", "wol_mac": "84:47:09:65:43:c3"},
-    "eastfarthing":  {"ssh_host": "192.168.1.137", "ssh_user": "ben", "wol_mac": "84:47:09:62:ef:60"},
-    "southfarthing": {"ssh_host": "192.168.1.136", "ssh_user": "ben", "wol_mac": "84:47:09:65:42:5b"},
-    "westfarthing":  {"ssh_host": "192.168.1.139", "ssh_user": "ben", "wol_mac": "84:47:09:65:42:85"},
+    # IPs renumbered by DHCP in the 2026-07-27 physical move (.147/.137/.136/.139 -> below)
+    "northfarthing": {"ssh_host": "192.168.1.60", "ssh_user": "ben", "wol_mac": "84:47:09:65:43:c3"},
+    "eastfarthing":  {"ssh_host": "192.168.1.73", "ssh_user": "ben", "wol_mac": "84:47:09:62:ef:60"},
+    "southfarthing": {"ssh_host": "192.168.1.74", "ssh_user": "ben", "wol_mac": "84:47:09:65:42:5b"},
+    "westfarthing":  {"ssh_host": "192.168.1.76", "ssh_user": "ben", "wol_mac": "84:47:09:65:42:85"},
     "shadowfax":     {"local": True},
     "sam":           {"ssh_host": "100.94.125.84", "ssh_user": "ben"},
 }
@@ -3224,9 +3226,30 @@ if __name__ == "__main__":
     sync_thread = threading.Thread(target=sync_comfyui_jobs, daemon=True)
     sync_thread.start()
 
-    # Start ComfyUI watchdog (auto-restart if down)
-    watchdog_thread = threading.Thread(target=comfyui_watchdog_loop, daemon=True)
-    watchdog_thread.start()
+    # ComfyUI watchdog (auto-restart if down) — OFF BY DEFAULT.
+    #
+    # Ben, 2026-07-25: "I'm not even running comfy" / "take it off the auto
+    # boot up". ComfyUI holds GPU memory he wants free. The systemd unit was
+    # disabled and comfyui was dropped from the service-watchdog lists, but
+    # THIS thread kept resurrecting it anyway — it SSHes to each target and
+    # runs `sudo systemctl restart comfyui` (see restart_comfyui), which
+    # starts a *disabled* unit just fine. Caught 2026-07-27: comfyui had been
+    # restarting on gandalf hourly, and the watchdog was also failing against
+    # frodo (unit renamed comfyui.service.disabled-2026-07-25) every cycle.
+    #
+    # A kill switch was documented as existing but was never actually in the
+    # code, so there was no way to turn this off short of editing the file.
+    # Set COMFYUI_WATCHDOG_ENABLED=1 to opt back in when ComfyUI is
+    # deliberately put into service again.
+    if os.environ.get("COMFYUI_WATCHDOG_ENABLED", "").strip() in ("1", "true", "yes", "on"):
+        watchdog_thread = threading.Thread(target=comfyui_watchdog_loop, daemon=True)
+        watchdog_thread.start()
+        logger.info("ComfyUI watchdog: ENABLED (COMFYUI_WATCHDOG_ENABLED set)")
+    else:
+        logger.info(
+            "ComfyUI watchdog: DISABLED (default). ComfyUI will NOT be auto-restarted. "
+            "Set COMFYUI_WATCHDOG_ENABLED=1 to re-enable."
+        )
 
     logger.info("")
     logger.info("=" * 60)
