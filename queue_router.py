@@ -132,7 +132,9 @@ FLEET_NODES = {
     "eastfarthing":  {"ssh_host": "eastfarthing.local", "ssh_user": "ben", "wol_mac": "84:47:09:62:ef:60"},
     "southfarthing": {"ssh_host": "southfarthing.local", "ssh_user": "ben", "wol_mac": "84:47:09:65:42:5b"},
     "westfarthing":  {"ssh_host": "westfarthing.local", "ssh_user": "ben", "wol_mac": "84:47:09:65:42:85"},
-    "shadowfax":     {"local": True},
+    # Was {"local": True} when this service ran ON shadowfax. It moved to gandalf
+    # 2026-07-21, so shadowfax is now just another remote box reached over SSH.
+    "shadowfax":     {"ssh_host": "shadowfax.local", "ssh_user": "ben"},
     "sam":           {"ssh_host": "100.94.125.84", "ssh_user": "ben"},
 }
 
@@ -1772,7 +1774,7 @@ def fleet_power():
         if cfg.get("local"):
             import subprocess
             logger.info("Self-reboot requested from dashboard")
-            send_notification("🔄 Shadowfax reboot", "Dashboard-triggered self reboot")
+            send_notification("🔄 Gandalf reboot", "Dashboard-triggered self reboot")
             subprocess.Popen(["bash", "-c", "sleep 2; sudo -n systemctl reboot"])
             return jsonify({"success": True, "node": node, "action": "reboot"})
         client = get_ssh_client(cfg["ssh_host"], cfg.get("ssh_user", "ben"))
@@ -1954,7 +1956,7 @@ def api_power():
 @app.route("/")
 def index():
     """Dashboard home page."""
-    return '''<!DOCTYPE html><html><head><title>SHADOWFAX // FLEET MONITOR</title>
+    return '''<!DOCTYPE html><html><head><title>GANDALF // FLEET MONITOR</title>
 <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Rajdhani:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
 :root{
@@ -2146,7 +2148,7 @@ border-radius:999px;border:1px solid #2a2a4e;background:var(--bg-panel);color:#8
 .route-pill.live{color:var(--neon-green);border-color:var(--neon-green);box-shadow:0 0 8px rgba(57,255,20,0.25)}
 .route-pill.missing{color:var(--neon-red);border-color:var(--neon-red);box-shadow:0 0 8px rgba(255,0,68,0.25);animation:pulse 1.5s infinite}
 </style></head>
-<body><h1>SHADOWFAX // FLEET MONITOR</h1>
+<body><h1>GANDALF // FLEET MONITOR</h1>
 
 <div id="fleet-summary" style="margin:4px 0 14px 0;font-size:0.95em;color:#889">Loading fleet summary...</div>
 
@@ -2807,9 +2809,8 @@ function refresh() {
                     html += '<div style="margin-top:10px;font-size:0.85em;color:#888">' + info.gpu.name + (info.gpu.cuda_version ? ' (CUDA ' + info.gpu.cuda_version + ')' : '') + '</div>';
                 }
 
-                if (info.url) {
-                    html += '<div style="margin-top:10px"><a href="' + info.url + '" target="comfyui-' + name + '" style="color:var(--neon-cyan);font-size:0.9em">Open ComfyUI →</a></div>';
-                }
+                // ComfyUI link removed 2026-07-28 (Ben): ComfyUI is disabled fleet-wide,
+                // so the link only ever led to a dead port.
                 html += '</div>';
             }
             html += '</div>';
@@ -3400,7 +3401,7 @@ if __name__ == "__main__":
 
     logger.info("")
     logger.info("=" * 60)
-    logger.info("  SHADOWFAX FLEET MONITOR")
+    logger.info("  GANDALF FLEET MONITOR")
     logger.info("=" * 60)
     logger.info(f"  Listening: http://0.0.0.0:5000")
     logger.info(f"  Dashboard: http://shadowfax.local")
