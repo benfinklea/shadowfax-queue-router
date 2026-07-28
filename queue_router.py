@@ -76,8 +76,8 @@ app.json.sort_keys = False
 CONFIG = {
     "targets": {
         "gandalf": {
-            "url": "http://192.168.1.122:8188",
-            "ssh_host": "192.168.1.122",
+            "url": "http://192.168.1.10:8188",
+            "ssh_host": "192.168.1.10",
             "ssh_user": "ben",
             "os": "linux",
             "model_status_urls": [
@@ -90,12 +90,12 @@ CONFIG = {
             "disk_path": "/workspace"
         },
         "frodo": {
-            "url": "http://192.168.1.105:8188",
-            "ssh_host": "192.168.1.105",
+            "url": "http://192.168.1.11:8188",
+            "ssh_host": "192.168.1.11",
             "ssh_user": "ben",
             "os": "linux",
             "model_status_urls": [
-                ("models", "http://192.168.1.105:8890/v1/models"),
+                ("models", "http://192.168.1.11:8890/v1/models"),
             ],
             "vram_gb": 32,
             "gpu_power_limit": 575,
@@ -118,11 +118,20 @@ CONFIG = {
 # "local": metrics come from this box itself (no SSH). "mac" is for Wake-on-LAN
 # (all farthings have WoL enabled at NIC + BIOS level; sam/shadowfax N/A).
 FLEET_NODES = {
-    # IPs renumbered by DHCP in the 2026-07-27 physical move (.147/.137/.136/.139 -> below)
-    "northfarthing": {"ssh_host": "192.168.1.60", "ssh_user": "ben", "wol_mac": "84:47:09:65:43:c3"},
-    "eastfarthing":  {"ssh_host": "192.168.1.73", "ssh_user": "ben", "wol_mac": "84:47:09:62:ef:60"},
-    "southfarthing": {"ssh_host": "192.168.1.74", "ssh_user": "ben", "wol_mac": "84:47:09:65:42:5b"},
-    "westfarthing":  {"ssh_host": "192.168.1.76", "ssh_user": "ben", "wol_mac": "84:47:09:65:42:85"},
+    # ADDRESS BY HOSTNAME, NOT IP (2026-07-28). These boxes have no DHCP
+    # reservations, so their IPs move: .147/.137/.136/.139 -> .73/.74/.76 ->
+    # .62/.61/.63 in two weeks. Every time they moved, the dashboard reported them
+    # OFFLINE and someone went looking for a sleep/power bug on a machine that was
+    # wide awake at a new address. That happened at least three times.
+    # mDNS (.local) follows the box wherever DHCP puts it, so this whole class of
+    # false "offline" report goes away without needing router access.
+    # NOTE: only the farthings are switched to names. gandalf.local resolves
+    # IPv6-only and northfarthing.local can return a secondary address, so the GPU
+    # targets above stay on explicit IPv4.
+    "northfarthing": {"ssh_host": "northfarthing.local", "ssh_user": "ben", "wol_mac": "84:47:09:65:43:c3"},
+    "eastfarthing":  {"ssh_host": "eastfarthing.local", "ssh_user": "ben", "wol_mac": "84:47:09:62:ef:60"},
+    "southfarthing": {"ssh_host": "southfarthing.local", "ssh_user": "ben", "wol_mac": "84:47:09:65:42:5b"},
+    "westfarthing":  {"ssh_host": "westfarthing.local", "ssh_user": "ben", "wol_mac": "84:47:09:65:42:85"},
     "shadowfax":     {"local": True},
     "sam":           {"ssh_host": "100.94.125.84", "ssh_user": "ben"},
 }
