@@ -102,6 +102,18 @@ CONFIG = {
             "gpu_power_max": 600,
             "disk_path": "/"
         },
+        # aragorn (promoted to a full card 2026-07-29 at Ben's request; order is
+        # gandalf, frodo, aragorn, pippin and dict order IS render order).
+        # Two NVIDIA GPUs (PCI 01:00.0 = 2f04, 03:00.0 = 2c02) but the nvidia
+        # driver is NOT installed yet, so nvidia-smi is absent and the card
+        # renders its CPU/RAM/disk vitals until the driver lands.
+        "aragorn": {
+            "ssh_host": "192.168.1.15",
+            "ssh_user": "mac",
+            "os": "linux",
+            "gpu_power_max": 675,
+            "disk_path": "/"
+        },
         "pippin": {
             "ssh_host": "pippen",
             "ssh_user": "ben",
@@ -132,7 +144,8 @@ FLEET_NODES = {
     # caveat above does NOT apply - explicit IPv4 is safe here. User is "mac"
     # (ben@gandalf's key is installed there for that user). NO wol_mac recorded
     # yet, so no Wake button until someone captures the NIC MAC.
-    "aragorn":       {"ssh_host": "192.168.1.15", "ssh_user": "mac"},
+    # aragorn moved OUT of this row 2026-07-29 - it is a full target card now
+    # (see CONFIG["targets"]). Listing it in both places would render it twice.
     "northfarthing": {"ssh_host": "northfarthing.local", "ssh_user": "ben", "wol_mac": "84:47:09:65:43:c3"},
     "eastfarthing":  {"ssh_host": "eastfarthing.local", "ssh_user": "ben", "wol_mac": "84:47:09:62:ef:60"},
     "southfarthing": {"ssh_host": "southfarthing.local", "ssh_user": "ben", "wol_mac": "84:47:09:65:42:5b"},
@@ -716,7 +729,9 @@ def get_ssh_metrics(host, user):
     """Get CPU, GPU, swap, disk I/O, and network I/O metrics via SSH."""
     result = {
         "cpu_percent": None,
+        "cpu_temp": None,
         "gpu_name": None,
+        "gpu_count": None,
         "gpu_watts": None,
         "gpu_power_limit": None,
         "gpu_temp": None,
@@ -749,15 +764,45 @@ def get_ssh_metrics(host, user):
         )
         gpu_output = stdout.read().decode().strip()
         if gpu_output:
-            parts = [part.strip() for part in gpu_output.split(",")]
-            if len(parts) >= 7:
-                result["gpu_name"] = parts[0]
-                result["gpu_watts"] = float(parts[1])
-                result["gpu_power_limit"] = float(parts[2])
-                result["gpu_temp"] = float(parts[3])
-                result["gpu_util"] = float(parts[4])
-                vram_total_mb = float(parts[5])
-                vram_used_mb = float(parts[6])
+            # MULTI-GPU (2026-07-29): aragorn has two cards (RTX 5070 + 5080), so
+            # nvidia-smi returns one line PER GPU. This used to split the whole
+            # blob on commas and crash on "2\nNVIDIA GeForce RTX 5080", which
+            # took the entire SSH metrics call down with it (no CPU, RAM, temp,
+            # or I/O for that box). Now every line is parsed and the box is
+            # reported as one logical accelerator: VRAM and watts SUM, temp is
+            # the HOTTEST card, utilization is the average.
+            gpus = []
+            for line in gpu_output.splitlines():
+                parts = [part.strip() for part in line.split(",")]
+                if len(parts) < 7:
+                    continue
+                try:
+                    gpus.append({
+                        "name": parts[0],
+                        "watts": float(parts[1]),
+                        "limit": float(parts[2]),
+                        "temp": float(parts[3]),
+                        "util": float(parts[4]),
+                        "vram_total_mb": float(parts[5]),
+                        "vram_used_mb": float(parts[6]),
+                    })
+                except ValueError:
+                    continue
+            if gpus:
+                names = [g["name"] for g in gpus]
+                if len(gpus) == 1:
+                    result["gpu_name"] = names[0]
+                elif len(set(names)) == 1:
+                    result["gpu_name"] = f"{len(gpus)} x {names[0]}"
+                else:
+                    result["gpu_name"] = " + ".join(names)
+                result["gpu_count"] = len(gpus)
+                result["gpu_watts"] = round(sum(g["watts"] for g in gpus), 1)
+                result["gpu_power_limit"] = round(sum(g["limit"] for g in gpus))
+                result["gpu_temp"] = max(g["temp"] for g in gpus)
+                result["gpu_util"] = round(sum(g["util"] for g in gpus) / len(gpus), 1)
+                vram_total_mb = sum(g["vram_total_mb"] for g in gpus)
+                vram_used_mb = sum(g["vram_used_mb"] for g in gpus)
                 result["vram_total_gb"] = round(vram_total_mb / 1024, 1)
                 result["vram_used_gb"] = round(vram_used_mb / 1024, 1)
                 result["vram_percent"] = (
@@ -773,6 +818,20 @@ def get_ssh_metrics(host, user):
         cpu_output = stdout.read().decode().strip()
         if cpu_output:
             result["cpu_percent"] = round(float(cpu_output), 1)
+
+        # CPU package temperature (2026-07-29): needed by boxes with no readable
+        # GPU (aragorn before its nvidia driver lands) so their card still has a
+        # TEMP dial. Same sensor preference order as FLEET_METRICS_CMD.
+        stdin, stdout, stderr = client.exec_command(
+            "tp=; for h in /sys/class/hwmon/hwmon*; do case \"$(cat $h/name 2>/dev/null)\" in "
+            "k10temp|coretemp) tp=$(cat $h/temp1_input 2>/dev/null); break;; esac; done; "
+            "[ -z \"$tp\" ] && tp=$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null); "
+            "echo ${tp:-0}",
+            timeout=SSH_COMMAND_TIMEOUT,
+        )
+        temp_output = stdout.read().decode().strip()
+        if temp_output and temp_output.isdigit() and int(temp_output) > 0:
+            result["cpu_temp"] = round(int(temp_output) / 1000)
 
         # System RAM (2026-07-29): this used to come from ComfyUI's
         # /system_stats endpoint; with ComfyUI disabled fleet-wide that source
@@ -1489,10 +1548,14 @@ def get_model_serving_stats():
             return (round(toks / secs, 1) if secs > 0 else 0.0), secs
         tps_now, _ = _agg([r for r in rows if r[0] >= recent_cut])
         tps_today, secs_today = _agg([r for r in rows if r[0] >= midnight])
+        # Peak generation speed seen today (single fastest request) - the bottom
+        # band of the card's tokens/sec strip.
+        _today_tps = [r[2] for r in rows if r[0] >= midnight and r[2]]
         result["gandalf"] = {
             "available": True,
             "tps_now": tps_now,
             "tps_avg_today": tps_today,
+            "tps_max_today": round(max(_today_tps), 1) if _today_tps else 0.0,
             "serving_minutes_today": round(secs_today / 60),
             "requests": {
                 "hour": sum(1 for r in rows if r[0] >= hour_ago),
@@ -1535,10 +1598,13 @@ def get_model_serving_stats():
                     n += 1
                 prev_busy = busy
             return n
+        # Peak 60s-window generation speed today (bottom band of the t/s strip).
+        _win_tps = [d[1] / d[2] for d in today if d[1] > 0 and d[2] > 0]
         result["frodo"] = {
             "available": len(samples) >= 2,
             "tps_now": tps_now,
             "tps_avg_today": round(tok_today / sec_today, 1) if sec_today > 0 else 0.0,
+            "tps_max_today": round(max(_win_tps), 1) if _win_tps else 0.0,
             "serving_minutes_today": round(sec_today / 60),
             "requests": {
                 "hour": _bursts([d for d in deltas if d[0] >= hour_ago]),
@@ -1667,6 +1733,7 @@ def offline_target_status(target_config):
         "gpu": None,
         "ram": None,
         "cpu_percent": None,
+        "cpu_temp": None,
         "gpu_watts": None,
         "gpu_temp": None,
         "gpu_util": None,
@@ -1775,6 +1842,8 @@ def get_target_status(target_name, target_config, fast=False):
                 target_config.get("ssh_user", "ben")
             )
             result["cpu_percent"] = ssh_metrics.get("cpu_percent")
+            result["cpu_temp"] = ssh_metrics.get("cpu_temp")
+            result["gpu_count"] = ssh_metrics.get("gpu_count")
             result["gpu_watts"] = ssh_metrics.get("gpu_watts")
             result["gpu_temp"] = ssh_metrics.get("gpu_temp")
             result["gpu_util"] = ssh_metrics.get("gpu_util")
@@ -2467,11 +2536,29 @@ background:rgba(0,255,242,0.04);font-size:0.85em;color:#889}
 .hdr-right{display:flex;align-items:center;gap:8px;font-size:0.8em}
 .peak-inline{font-family:'Orbitron',monospace;font-size:0.72em;color:var(--neon-green);
 text-shadow:0 0 6px var(--neon-green);white-space:nowrap;opacity:0.85}
-.dial-strip{display:flex;gap:4px;justify-content:space-around;align-items:flex-start;margin:8px 0 6px}
+.dial-strip{display:flex;gap:2px;justify-content:space-between;align-items:flex-start;margin:8px 0 6px}
 .io-line{display:flex;gap:12px;white-space:nowrap;align-items:center}
 .card-foot .io-stat{gap:5px}
-.dial-strip .gauge-label{font-size:0.55em;letter-spacing:1px;margin-top:3px}
-.dial-strip .gauge-value{font-size:0.82em;margin-top:0;white-space:nowrap}
+/* Each dial owns an equal column so neighbouring labels can never collide. */
+.dial-strip .gauge{flex:1 1 0;min-width:0;overflow:hidden}
+.dial-strip .gauge-dial{margin:0 auto}
+.dial-strip .gauge-label{font-size:0.55em;letter-spacing:1px;margin-top:3px;
+display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dial-strip .gauge-value{font-size:0.78em;margin-top:0;display:block;
+white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* --- Tokens/sec strip (2026-07-29, Ben): the card's top accent line became a
+   two-band live indicator. TOP band = tokens/sec right now, BOTTOM band =
+   today's peak tokens/sec. Both on the same scale so they compare. --- */
+.gpu-card.compact.has-tps::before{display:none}
+.tps-strip{position:absolute;top:0;left:0;right:0;height:4px;display:flex;
+flex-direction:column;z-index:2}
+.tps-band{height:2px;width:100%;background:#1d2640;position:relative;overflow:hidden}
+.tps-band .tps-fill{position:absolute;left:0;top:0;bottom:0;width:0;
+transition:width 1.2s cubic-bezier(0.4,0,0.2,1)}
+.tps-band.now .tps-fill{background:linear-gradient(90deg,#00fff2,#39ff14);
+box-shadow:0 0 8px #00fff2}
+.tps-band.peak .tps-fill{background:linear-gradient(90deg,#7a3fff,#ff00ff);
+box-shadow:0 0 8px #ff00ff;opacity:0.85}
 .mini-row{display:grid;grid-template-columns:44px 1fr auto;align-items:center;gap:8px;margin:4px 0}
 .mini-row .progress-bar{height:9px;margin:0;border-radius:3px}
 .mini-label{font-family:'Orbitron',monospace;font-size:0.6em;letter-spacing:1px;color:#778}
@@ -2485,7 +2572,7 @@ background:rgba(0,255,242,0.04);font-size:0.78em;color:#889;line-height:1.5}
 margin-top:8px;font-size:0.72em;color:#667}
 .card-foot .val{font-family:'Orbitron',monospace;color:var(--neon-cyan)}
 .card-actions{display:flex;gap:6px}
-.card-actions button{margin:0!important;padding:4px 9px;font-size:0.62em;letter-spacing:1px}
+.card-actions button{margin:0!important;padding:4px 9px;font-size:0.62em;letter-spacing:1px;white-space:nowrap}
 .queue-badge{background:var(--neon-yellow);color:#000;padding:3px 10px;border-radius:2px;font-size:0.8em;
 font-family:'Orbitron',monospace;font-weight:bold;box-shadow:0 0 10px var(--neon-yellow)}
 .queue-badge.empty{background:#2a2a4e;color:#666;box-shadow:none}
@@ -2833,9 +2920,19 @@ function refreshModelServing() {
                 if (!el.dataset.init) el.innerHTML = '<span class="dim">serving stats warming up…</span>';
                 continue;
             }
+            // Two-band strip at the top of the card: now (top) vs today's peak
+            // (bottom), on one shared scale so the bars are comparable.
+            const peak = s.tps_max_today || 0;
+            const scale = Math.max(TPS_GAUGE_MAX, peak);
+            const nowFill = document.getElementById('tps-fill-now-' + name);
+            const peakFill = document.getElementById('tps-fill-peak-' + name);
+            if (nowFill) nowFill.style.width = Math.min(100, (s.tps_now / scale) * 100) + '%';
+            if (peakFill) peakFill.style.width = Math.min(100, (peak / scale) * 100) + '%';
+
             // COMPACT (2026-07-29): the two t/s dials collapsed into one text line.
             const servingHtml = '<span class="tps">' + Math.round(s.tps_now) + '</span> t/s now · '
-                + '<span class="tps">' + Math.round(s.tps_avg_today) + '</span> avg today · '
+                + '<span class="tps">' + Math.round(peak) + '</span> peak today · '
+                + '<span class="tps">' + Math.round(s.tps_avg_today) + '</span> avg · '
                 + '<span class="dim">req ' + s.requests.hour + '/1h · ' + s.requests.day + '/24h · ' + s.requests.week + '/7d'
                 + (s.approx_requests ? '≈' : '')
                 + ' · ' + s.serving_minutes_today + ' min served</span>';
@@ -3204,7 +3301,15 @@ function refresh() {
 
                 const isMac = info.os === 'mac';
 
-                html += '<div class="gpu-card compact" id="card-' + name + '">';
+                const isModelBox = (name === 'gandalf' || name === 'frodo');
+                html += '<div class="gpu-card compact' + (isModelBox ? ' has-tps' : '') + '" id="card-' + name + '">';
+                // Two-band tokens/sec strip in place of the flat accent line.
+                if (isModelBox) {
+                    html += '<div class="tps-strip" id="tps-strip-' + name + '">'
+                         +  '<div class="tps-band now" title="Tokens/sec being served right now"><div class="tps-fill" id="tps-fill-now-' + name + '"></div></div>'
+                         +  '<div class="tps-band peak" title="Peak tokens/sec reached today"><div class="tps-fill" id="tps-fill-peak-' + name + '"></div></div>'
+                         +  '</div>';
+                }
                 html += '<div class="gpu-header"><span class="gpu-name">' + icon + ' ' + name + '</span>';
                 html += '<div class="hdr-right"><span id="status-' + name + '">' + status + '</span>';
                 if (!isMac) {
@@ -3216,7 +3321,9 @@ function refresh() {
                 html += '</div></div>';
 
                 const maxUtil = (info.max_util_today === null || info.max_util_today === undefined) ? '--' : info.max_util_today;
-                html += '<div class="peak-inline" id="maxutil-' + name + '">' + maxUtil + '% max utilization today</div>';
+                if (maxUtil !== '--') {
+                    html += '<div class="peak-inline" id="maxutil-' + name + '">' + maxUtil + '% max utilization today</div>';
+                }
 
                 if (info.online && isMac) {
                     // COMPACT: one dial strip, then inline micro-bars.
@@ -3244,7 +3351,7 @@ function refresh() {
                     // COMPACT: all five vitals in ONE dial row.
                     html += '<div class="dial-strip">';
                     html += renderGauge(info.gpu_util, 0, 100, "GPU", "%", false, 0.7, true, 'util-' + name);
-                    html += renderGauge(info.gpu_watts, 0, info.gpu_power_max, "POWER", "W", true, 0.7, false, 'power-' + name);
+                    html += renderGauge(info.gpu_watts, 0, info.gpu_power_max, "POWER", "W", false, 0.7, false, 'power-' + name);
                     html += renderGauge(info.gpu_temp, 24, 90, "TEMP", "°C", false, 0.7, false, 'temp-' + name);
                     html += renderGauge(info.cpu_percent, 0, 100, "CPU", "%", false, 0.7, false, 'cpu-' + name);
                     const swapPct = info.swap ? info.swap.percent : 0;
@@ -3287,7 +3394,40 @@ function refresh() {
                     html += '<button class="power-btn" data-target="' + name + '" data-current="' + info.gpu_power_limit + '" data-max="' + info.gpu_power_max + '" title="Set Power Limit">⚡ PWR</button>';
                     html += '<button class="swap-btn" data-target="' + name + '" title="Clear Swap">🧹 SWAP</button>';
                     html += '</span></div>';
-                    html += '<div style="margin-top:5px;font-size:0.7em;color:#556">' + info.gpu.name + (info.gpu.cuda_version ? ' (CUDA ' + info.gpu.cuda_version + ')' : '') + '</div>';
+                    html += '<div style="margin-top:5px;font-size:0.7em;color:#556">' + info.gpu.name + (info.gpu.cuda_version ? ' (CUDA ' + info.gpu.cuda_version + ')' : '') + ' · ' + info.gpu_power_max + 'W' + (info.gpu_count > 1 ? ' · ' + info.gpu_count + ' GPUs pooled' : '') + '</div>';
+                } else if (info.online) {
+                    // Online box with no readable GPU (e.g. aragorn before its
+                    // nvidia driver is installed). Same compact shape, CPU vitals.
+                    html += '<div class="dial-strip">';
+                    html += renderGauge(info.cpu_percent, 0, 100, "CPU", "%", false, 0.7, false, 'cpu-' + name);
+                    html += renderGauge(info.cpu_temp, 24, 90, "TEMP", "°C", false, 0.7, false, 'temp-' + name);
+                    const swapPct = info.swap ? info.swap.percent : 0;
+                    html += renderSwapGauge(swapPct, 100, 0.7, 'swap-' + name);
+                    html += '</div>';
+
+                    if (info.ram) {
+                        html += miniRow('RAM', info.ram.percent, 'progress-ram', 'ram-' + name,
+                                        'ram-label-' + name, info.ram.used_gb + ' / ' + info.ram.total_gb + ' GB');
+                    }
+                    if (info.disk) {
+                        const diskUsed = info.disk.total_gb >= 1000 ? (info.disk.used_gb / 1024).toFixed(1) + ' TB' : info.disk.used_gb + ' GB';
+                        const diskTotal = info.disk.total_gb >= 1000 ? (info.disk.total_gb / 1024).toFixed(1) + ' TB' : info.disk.total_gb + ' GB';
+                        html += miniRow('DISK', info.disk.percent, 'progress-disk', 'disk-' + name,
+                                        'disk-label-' + name, diskUsed + ' / ' + diskTotal);
+                    }
+                    html += '<div class="serving-line"><span class="dim">no GPU driver installed - GPU dials appear once nvidia-smi is available</span></div>';
+                    html += '<div class="card-foot">';
+                    let ioTxt2 = '';
+                    if (info.disk_io) {
+                        ioTxt2 += '<span class="io-stat" id="disk-io-' + name + '">📀 <span class="value val">' + info.disk_io.read_mbps + '/' + info.disk_io.write_mbps + '</span> MB/s</span>';
+                    }
+                    if (info.net_io) {
+                        ioTxt2 += '<span class="io-stat" id="net-io-' + name + '">🌐 <span class="value val">' + info.net_io.rx_mbps + '/' + info.net_io.tx_mbps + '</span> MB/s</span>';
+                    }
+                    html += '<span class="io-line">' + ioTxt2 + '</span>';
+                    html += '<span class="card-actions">';
+                    html += '<button class="swap-btn" data-target="' + name + '" title="Clear Swap">🧹 SWAP</button>';
+                    html += '</span></div>';
                 }
 
                 // ComfyUI link removed 2026-07-28 (Ben): ComfyUI is disabled fleet-wide,
@@ -3331,7 +3471,7 @@ function refresh() {
                 } else if (info.online && info.gpu) {
                     // Update gauges
                     updateGauge('util-' + name, info.gpu_util, 0, 100, '%', false, getUtilColor);
-                    updateGauge('power-' + name, info.gpu_watts, 0, info.gpu_power_max, 'W', true, getNormalColor);
+                    updateGauge('power-' + name, info.gpu_watts, 0, info.gpu_power_max, 'W', false, getNormalColor);
                     updateGauge('temp-' + name, info.gpu_temp, 24, 90, '°C', false, getNormalColor);
                     updateGauge('cpu-' + name, info.cpu_percent, 0, 100, '%', false, getNormalColor);
                     const swapPct = info.swap ? info.swap.percent : 0;
