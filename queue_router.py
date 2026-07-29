@@ -696,6 +696,9 @@ def get_ssh_metrics(host, user):
         "vram_total_gb": None,
         "vram_used_gb": None,
         "vram_percent": None,
+        "ram_total_gb": None,
+        "ram_used_gb": None,
+        "ram_percent": None,
         "swap_percent": None,
         "swap_used_gb": None,
         "swap_total_gb": None,
@@ -742,6 +745,25 @@ def get_ssh_metrics(host, user):
         cpu_output = stdout.read().decode().strip()
         if cpu_output:
             result["cpu_percent"] = round(float(cpu_output), 1)
+
+        # System RAM (2026-07-29): this used to come from ComfyUI's
+        # /system_stats endpoint; with ComfyUI disabled fleet-wide that source
+        # silently vanished and RAM dropped off the big-machine cards. Read it
+        # here over SSH like everything else ("used" from free already
+        # excludes buffers/cache, matching the fleet tiles).
+        stdin, stdout, stderr = client.exec_command(
+            "free -b | grep Mem | awk '{print $2, $3}'",
+            timeout=SSH_COMMAND_TIMEOUT,
+        )
+        ram_output = stdout.read().decode().strip()
+        if ram_output:
+            parts = ram_output.split()
+            if len(parts) >= 2:
+                total = int(parts[0])
+                used = int(parts[1])
+                result["ram_total_gb"] = round(total / (1024**3), 1)
+                result["ram_used_gb"] = round(used / (1024**3), 1)
+                result["ram_percent"] = round(used / total * 100, 1) if total > 0 else 0
 
         # Get swap usage
         stdin, stdout, stderr = client.exec_command(
@@ -1552,6 +1574,17 @@ def get_target_status(target_name, target_config, fast=False):
                     "vram_total_gb": ssh_metrics["vram_total_gb"],
                     "vram_used_gb": ssh_metrics["vram_used_gb"],
                     "vram_percent": ssh_metrics["vram_percent"],
+                }
+
+            # System RAM: fall back to the SSH reading when ComfyUI's
+            # /system_stats didn't provide it (ComfyUI is disabled fleet-wide
+            # since 2026-07-25, so in practice this IS the source now) - same
+            # fallback pattern as the GPU/VRAM block above.
+            if result["ram"] is None and ssh_metrics.get("ram_total_gb") is not None:
+                result["ram"] = {
+                    "total_gb": ssh_metrics["ram_total_gb"],
+                    "used_gb": ssh_metrics["ram_used_gb"],
+                    "percent": ssh_metrics["ram_percent"],
                 }
 
             # Swap usage
