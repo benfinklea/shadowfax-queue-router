@@ -437,6 +437,34 @@ def init_db():
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_metrics_timestamp ON metrics_history(timestamp)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_metrics_target ON metrics_history(target)")
+    # Model-serving stats (2026-07-29): per-request records from gandalf's
+    # llama-swap (its /api/metrics buffer is in-memory and lost on restart -
+    # persisting here is what makes hour/day/week windows survive) . . .
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS model_requests (
+            box TEXT NOT NULL,
+            req_id INTEGER NOT NULL,
+            ts TEXT NOT NULL,
+            model TEXT,
+            output_tokens INTEGER,
+            gen_tps REAL,
+            PRIMARY KEY (box, req_id, ts)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_model_requests_box_ts ON model_requests(box, ts)")
+    # . . . and Prometheus counter samples from frodo's bare llama-server
+    # (tokens_predicted_total / tokens_predicted_seconds_total), sampled every
+    # MODEL_SERVING_INTERVAL so rates and serving-time-only averages can be
+    # derived across restarts.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS model_counter_samples (
+            box TEXT NOT NULL,
+            ts TEXT NOT NULL,
+            tokens_total REAL,
+            gen_seconds_total REAL,
+            PRIMARY KEY (box, ts)
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -1335,6 +1363,200 @@ def get_fleet_stats():
         fleet_stats_cache["ts"] = time.time()
     return result
 
+# --- Model serving stats (2026-07-29): tokens/sec dials + requests served ---
+# Two very different sources, one shape out:
+#   gandalf: llama-swap (port 8889) keeps a per-request JSON buffer at
+#     /api/metrics (id, model, output_tokens, tokens_per_second, timestamp).
+#     Its own /metrics is system-level only, and the per-model llama-server
+#     /upstream/<model>/metrics MUST NOT be probed - hitting an upstream path
+#     triggers a model LOAD/swap (44-72s, evicts whatever is resident).
+#     The request buffer is in-memory, so we persist rows into sqlite.
+#   frodo: bare llama-server --metrics (port 8890) exposes Prometheus counters
+#     llamacpp:tokens_predicted_total + llamacpp:tokens_predicted_seconds_total.
+#     (Its *_tokens_seconds gauges are LIFETIME averages, not instantaneous -
+#     verified: 1.227e6 tok / 6436s = the exact 190.7 the gauge showed.)
+#     We sample the counters every 60s; deltas give rates, and the
+#     seconds_total counter only advances WHILE GENERATING, so
+#     sum(d_tokens)/sum(d_seconds) is exactly the serving-time-only average.
+# pippen: skipped - no llama-server there (route `code` moved; nothing serves).
+MODEL_SERVING_SOURCES = {
+    "gandalf": {"kind": "llamaswap", "url": "http://127.0.0.1:8889/api/metrics"},
+    "frodo":   {"kind": "llamacpp",  "url": "http://192.168.1.11:8890/metrics"},
+}
+MODEL_SERVING_INTERVAL = 60      # sampling cadence, matches METRICS_INTERVAL
+MODEL_SERVING_RETENTION_DAYS = 8  # a hair over the 7d display window
+MODEL_SERVING_HTTP_TIMEOUT = 6
+
+def _parse_llamaswap_ts(ts):
+    """llama-swap timestamps are UTC RFC3339 with nanoseconds - normalize to
+    the local naive ISO format the rest of this file stores."""
+    try:
+        ts = re.sub(r"\.(\d{6})\d*", r".\1", ts).replace("Z", "+00:00")
+        return datetime.fromisoformat(ts).astimezone().replace(tzinfo=None).isoformat()
+    except Exception:
+        return None
+
+def collect_model_serving():
+    """Background sampler: persist llama-swap request records + llama-server
+    counter samples into sqlite so windows survive restarts (both ours and
+    the model servers')."""
+    while True:
+        try:
+            conn = sqlite3.connect(CONFIG["db_path"])
+            # gandalf: upsert the whole request buffer (INSERT OR IGNORE makes
+            # re-reading the same records free; llama-swap restarts reset id to
+            # 0 but the (box, req_id, ts) key keeps old rows distinct)
+            try:
+                resp = requests.get(MODEL_SERVING_SOURCES["gandalf"]["url"],
+                                    timeout=MODEL_SERVING_HTTP_TIMEOUT)
+                if resp.ok:
+                    for rec in resp.json():
+                        ts = _parse_llamaswap_ts(rec.get("timestamp", ""))
+                        tok = rec.get("tokens") or {}
+                        if ts is None or not tok:
+                            continue
+                        conn.execute(
+                            "INSERT OR IGNORE INTO model_requests "
+                            "(box, req_id, ts, model, output_tokens, gen_tps) VALUES (?,?,?,?,?,?)",
+                            ("gandalf", rec.get("id", -1), ts, rec.get("model"),
+                             tok.get("output_tokens"), tok.get("tokens_per_second")))
+            except Exception as e:
+                logger.debug(f"model serving sample gandalf: {e}")
+            # frodo: one counter sample per cycle
+            try:
+                resp = requests.get(MODEL_SERVING_SOURCES["frodo"]["url"],
+                                    timeout=MODEL_SERVING_HTTP_TIMEOUT)
+                if resp.ok:
+                    vals = {}
+                    for line in resp.text.splitlines():
+                        for key in ("llamacpp:tokens_predicted_total ",
+                                    "llamacpp:tokens_predicted_seconds_total "):
+                            if line.startswith(key):
+                                vals[key.strip()] = float(line.split()[-1])
+                    if "llamacpp:tokens_predicted_total" in vals:
+                        conn.execute(
+                            "INSERT OR IGNORE INTO model_counter_samples "
+                            "(box, ts, tokens_total, gen_seconds_total) VALUES (?,?,?,?)",
+                            ("frodo", datetime.now().isoformat(),
+                             vals.get("llamacpp:tokens_predicted_total"),
+                             vals.get("llamacpp:tokens_predicted_seconds_total")))
+            except Exception as e:
+                logger.debug(f"model serving sample frodo: {e}")
+            cutoff = (datetime.now() - timedelta(days=MODEL_SERVING_RETENTION_DAYS)).isoformat()
+            conn.execute("DELETE FROM model_requests WHERE ts < ?", (cutoff,))
+            conn.execute("DELETE FROM model_counter_samples WHERE ts < ?", (cutoff,))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.warning(f"Model serving collection error: {e}")
+        time.sleep(MODEL_SERVING_INTERVAL)
+
+model_serving_cache = {"data": None, "ts": 0.0}
+model_serving_cache_lock = threading.Lock()
+MODEL_SERVING_CACHE_TTL = 30  # seconds
+
+def get_model_serving_stats():
+    """Per-box: tps_now, serving-time-only tps average today, requests served
+    in the last hour/day/week. Read from sqlite, cached 30s."""
+    now_t = time.time()
+    with model_serving_cache_lock:
+        if model_serving_cache["data"] is not None and (now_t - model_serving_cache["ts"]) < MODEL_SERVING_CACHE_TTL:
+            return model_serving_cache["data"]
+
+    now = datetime.now()
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    hour_ago = (now - timedelta(hours=1)).isoformat()
+    day_ago = (now - timedelta(days=1)).isoformat()
+    week_ago = (now - timedelta(days=7)).isoformat()
+    result = {}
+    try:
+        conn = sqlite3.connect(CONFIG["db_path"])
+
+        # gandalf - request-level records
+        rows = conn.execute(
+            "SELECT ts, output_tokens, gen_tps FROM model_requests "
+            "WHERE box='gandalf' AND ts >= ? ORDER BY ts", (week_ago,)).fetchall()
+        recent_cut = (now - timedelta(seconds=150)).isoformat()
+
+        def _agg(rs):
+            """Token-weighted generation speed over a set of requests: total
+            output tokens / total generation seconds (out/tps per request)."""
+            toks = secs = 0.0
+            for _, out, tps in rs:
+                if out and tps and tps > 0:
+                    toks += out
+                    secs += out / tps
+            return (round(toks / secs, 1) if secs > 0 else 0.0), secs
+        tps_now, _ = _agg([r for r in rows if r[0] >= recent_cut])
+        tps_today, secs_today = _agg([r for r in rows if r[0] >= midnight])
+        result["gandalf"] = {
+            "available": True,
+            "tps_now": tps_now,
+            "tps_avg_today": tps_today,
+            "serving_minutes_today": round(secs_today / 60),
+            "requests": {
+                "hour": sum(1 for r in rows if r[0] >= hour_ago),
+                "day": sum(1 for r in rows if r[0] >= day_ago),
+                "week": len(rows),
+            },
+            "approx_requests": False,
+        }
+
+        # frodo - counter samples -> reset-aware deltas
+        samples = conn.execute(
+            "SELECT ts, tokens_total, gen_seconds_total FROM model_counter_samples "
+            "WHERE box='frodo' AND ts >= ? ORDER BY ts", (week_ago,)).fetchall()
+        conn.close()
+        deltas = []  # (ts, d_tokens, d_secs)
+        for i in range(1, len(samples)):
+            ts, tok, sec = samples[i]
+            ptok, psec = samples[i - 1][1], samples[i - 1][2]
+            d_tok, d_sec = tok - ptok, (sec - psec) if sec is not None and psec is not None else 0.0
+            if d_tok < 0 or d_sec < 0:  # counter reset (llama-server restart)
+                d_tok, d_sec = tok, sec or 0.0
+            deltas.append((ts, d_tok, d_sec))
+        tps_now = 0.0
+        if deltas and deltas[-1][0] >= (now - timedelta(seconds=3 * MODEL_SERVING_INTERVAL)).isoformat():
+            _, d_tok, d_sec = deltas[-1]
+            tps_now = round(d_tok / d_sec, 1) if d_tok > 0 and d_sec > 0 else 0.0
+        today = [d for d in deltas if d[0] >= midnight]
+        tok_today = sum(d[1] for d in today if d[1] > 0)
+        sec_today = sum(d[2] for d in today if d[1] > 0)
+
+        def _bursts(ds):
+            """Requests can't be counted exactly from counters (llama-server
+            exposes no requests_total) - count busy-after-idle transitions in
+            the 60s samples as a lower-bound estimate."""
+            n = 0
+            prev_busy = False
+            for _, d_tok, _ in ds:
+                busy = d_tok > 0
+                if busy and not prev_busy:
+                    n += 1
+                prev_busy = busy
+            return n
+        result["frodo"] = {
+            "available": len(samples) >= 2,
+            "tps_now": tps_now,
+            "tps_avg_today": round(tok_today / sec_today, 1) if sec_today > 0 else 0.0,
+            "serving_minutes_today": round(sec_today / 60),
+            "requests": {
+                "hour": _bursts([d for d in deltas if d[0] >= hour_ago]),
+                "day": _bursts([d for d in deltas if d[0] >= day_ago]),
+                "week": _bursts(deltas),
+            },
+            "approx_requests": True,
+        }
+    except Exception as e:
+        logger.warning(f"model serving stats failed: {e}")
+        for box in MODEL_SERVING_SOURCES:
+            result.setdefault(box, {"available": False})
+
+    with model_serving_cache_lock:
+        model_serving_cache["data"] = result
+        model_serving_cache["ts"] = time.time()
+    return result
+
 def get_mac_metrics(host, user):
     """Get CPU%, GPU utilization, RAM, swap, and disk for a macOS target via SSH.
 
@@ -1894,6 +2116,12 @@ def api_ci_queue():
     """Queued/running GitHub Actions counts for armbrain-io/armbrain (cached)."""
     return jsonify(get_ci_queue_status())
 
+@app.route("/api/model_serving", methods=["GET"])
+def api_model_serving():
+    """Tokens/sec dials (now + today-while-serving) and requests served
+    (hour/day/week) for the model boxes."""
+    return jsonify(get_model_serving_stats())
+
 @app.route("/api/fleet_stats", methods=["GET"])
 def api_fleet_stats():
     """Compact stats bar: CLI agent sessions per box + CI runner busy/total."""
@@ -2369,6 +2597,7 @@ GET  /api/logs    - Job / usage history
 GET  /api/history - Historical metrics (range=hour|day|week|month)
 GET  /api/energy  - GPU energy + time-of-use cost (day/week/month)
 GET  /api/fleet_stats - CLI agent sessions per box + CI runner busy/total
+GET  /api/model_serving - tokens/sec dials + requests served (model boxes)
 GET  /api/health  - Health check</pre>
 </div>
 
@@ -2561,6 +2790,48 @@ function refreshRouteHealth() {
         const el = document.getElementById('route-health-body');
         if (el) el.innerHTML = '<p class="glance-unavailable">Model route check failed to load.</p>';
     });
+}
+
+// Model serving dials: t/s now + today's serving-time-only average, and
+// requests served 1h/24h/7d. Containers live inside the gandalf/frodo target
+// cards (built on the initial /api/status render), so this fills them lazily
+// and just updates the gauges afterwards.
+const TPS_GAUGE_MAX = 400;
+function tpsColor() { return '#00fff2'; }  // throughput isn't an alarm metric - keep it cyan
+function refreshModelServing() {
+    fetch('/api/model_serving').then(r => r.json()).then(data => {
+        for (const [name, s] of Object.entries(data)) {
+            const el = document.getElementById('serving-' + name);
+            if (!el) continue;
+            if (!s.available) {
+                if (!el.dataset.init) el.innerHTML = '<div style="margin-top:8px;color:#667;font-size:0.85em">Model serving stats warming up…</div>';
+                continue;
+            }
+            const reqText = 'req ' + s.requests.hour + ' / 1h · ' + s.requests.day + ' / 24h · ' + s.requests.week + ' / 7d'
+                + (s.approx_requests ? ' (≈ from 60s samples)' : '')
+                + ' · serving ' + s.serving_minutes_today + ' min today';
+            if (el.dataset.init !== '1') {
+                let html = '<div class="stat-row" style="margin-top:12px">';
+                html += '<div class="loaded-model-title">MODEL SERVING · TOKENS/SEC</div>';
+                html += '<div class="gauge-row" style="margin:8px 0">';
+                html += renderGauge(s.tps_now, 0, TPS_GAUGE_MAX, 'T/S NOW', '', false, 1, false, 'tpsnow-' + name);
+                html += renderGauge(s.tps_avg_today, 0, TPS_GAUGE_MAX, 'T/S TODAY', '', false, 1, false, 'tpsavg-' + name);
+                html += '</div>';
+                html += '<div id="reqline-' + name + '" style="color:#889;font-size:0.85em;text-align:center">' + reqText + '</div>';
+                html += '</div>';
+                el.innerHTML = html;
+                el.dataset.init = '1';
+                // the render used threshold colors; force the neutral cyan
+                updateGauge('tpsnow-' + name, s.tps_now, 0, TPS_GAUGE_MAX, '', false, tpsColor);
+                updateGauge('tpsavg-' + name, s.tps_avg_today, 0, TPS_GAUGE_MAX, '', false, tpsColor);
+                continue;
+            }
+            updateGauge('tpsnow-' + name, s.tps_now, 0, TPS_GAUGE_MAX, '', false, tpsColor);
+            updateGauge('tpsavg-' + name, s.tps_avg_today, 0, TPS_GAUGE_MAX, '', false, tpsColor);
+            const reqEl = document.getElementById('reqline-' + name);
+            if (reqEl && reqEl.textContent !== reqText) reqEl.textContent = reqText;
+        }
+    }).catch(() => {});
 }
 
 function refreshFleetStats() {
@@ -2977,6 +3248,11 @@ function refresh() {
                     }
                     html += '</div>';
 
+                    // Model serving stats (filled by refreshModelServing)
+                    if (name === 'gandalf' || name === 'frodo') {
+                        html += '<div id="serving-' + name + '"></div>';
+                    }
+
                     if (info.ram) {
                         html += '<div class="stat-row">';
                         html += '<div class="progress-label"><span>💾 RAM</span><span id="ram-label-' + name + '">' + info.ram.used_gb + ' / ' + info.ram.total_gb + ' GB</span></div>';
@@ -3252,7 +3528,7 @@ function refreshEnergy() {
 
 // --- Polling control: pause everything when the tab isn't visible, resume ---
 // --- with an immediate refresh when it becomes visible again.              ---
-let statusTimer = null, fleetTimer = null, historyTimer = null, energyTimer = null, ciQueueTimer = null, routeHealthTimer = null, fleetStatsTimer = null;
+let statusTimer = null, fleetTimer = null, historyTimer = null, energyTimer = null, ciQueueTimer = null, routeHealthTimer = null, fleetStatsTimer = null, modelServingTimer = null;
 
 function startPolling() {
     if (!statusTimer) statusTimer = setInterval(refresh, 12000);     // queue/GPU state: 12s
@@ -3262,6 +3538,7 @@ function startPolling() {
     if (!ciQueueTimer) ciQueueTimer = setInterval(refreshCiQueue, 45000);        // matches backend cache TTL
     if (!routeHealthTimer) routeHealthTimer = setInterval(refreshRouteHealth, 30000);
     if (!fleetStatsTimer) fleetStatsTimer = setInterval(refreshFleetStats, 60000); // matches backend cache TTL
+    if (!modelServingTimer) modelServingTimer = setInterval(refreshModelServing, 60000); // matches sampler cadence
 }
 
 function stopPolling() {
@@ -3272,6 +3549,7 @@ function stopPolling() {
     clearInterval(ciQueueTimer); ciQueueTimer = null;
     clearInterval(routeHealthTimer); routeHealthTimer = null;
     clearInterval(fleetStatsTimer); fleetStatsTimer = null;
+    clearInterval(modelServingTimer); modelServingTimer = null;
 }
 
 document.addEventListener('visibilitychange', () => {
@@ -3286,6 +3564,7 @@ document.addEventListener('visibilitychange', () => {
         refreshCiQueue();
         refreshRouteHealth();
         refreshFleetStats();
+        refreshModelServing();
         startPolling();
     }
 });
@@ -3297,6 +3576,8 @@ refreshFleet();
 refreshCiQueue();
 refreshRouteHealth();
 refreshFleetStats();
+// first serving refresh waits for the target cards (built by refresh()) to exist
+setTimeout(refreshModelServing, 5000);
 if (!document.hidden) startPolling();
 </script></body></html>'''
 
@@ -3574,6 +3855,10 @@ if __name__ == "__main__":
     # Start background job sync from ComfyUI
     sync_thread = threading.Thread(target=sync_comfyui_jobs, daemon=True)
     sync_thread.start()
+
+    # Model-serving sampler (tokens/sec + requests served, persisted to sqlite)
+    serving_thread = threading.Thread(target=collect_model_serving, daemon=True)
+    serving_thread.start()
 
     # ComfyUI watchdog (auto-restart if down) — OFF BY DEFAULT.
     #
