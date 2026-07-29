@@ -128,6 +128,11 @@ FLEET_NODES = {
     # NOTE: only the farthings are switched to names. gandalf.local resolves
     # IPv6-only and northfarthing.local can return a secondary address, so the GPU
     # targets above stay on explicit IPv4.
+    # aragorn (2026-07-29): static DHCP reservation, so the no-reservation IP
+    # caveat above does NOT apply - explicit IPv4 is safe here. User is "mac"
+    # (ben@gandalf's key is installed there for that user). NO wol_mac recorded
+    # yet, so no Wake button until someone captures the NIC MAC.
+    "aragorn":       {"ssh_host": "192.168.1.15", "ssh_user": "mac"},
     "northfarthing": {"ssh_host": "northfarthing.local", "ssh_user": "ben", "wol_mac": "84:47:09:65:43:c3"},
     "eastfarthing":  {"ssh_host": "eastfarthing.local", "ssh_user": "ben", "wol_mac": "84:47:09:62:ef:60"},
     "southfarthing": {"ssh_host": "southfarthing.local", "ssh_user": "ben", "wol_mac": "84:47:09:65:42:5b"},
@@ -1190,6 +1195,124 @@ def get_model_route_health():
         route_health_cache["ts"] = time.time()
     return result
 
+# --- Fleet stats bar (2026-07-29): CLI agent sessions + CI runner busy/total ---
+# (a) CLI agent sessions: count of claude/codex/agy MAIN processes per box.
+#     A pid whose parent also matches is collapsed into it (codex's node wrapper
+#     spawns the vendor binary - counting both would double every session).
+#     gandalf is measured locally (this service runs there); the others go over
+#     the same cached SSH channel + circuit breaker as the rest of the file.
+#     No session limits are configured anywhere, so these are plain counts.
+# (b) CI runners: busy/total per box from the GitHub org runner list, fetched
+#     server-side via the gh CLI (authed for ben on gandalf) and cached 60s so
+#     the dashboard can't hammer the GitHub API.
+AGENT_STAT_BOXES = {
+    "gandalf": {"local": True},
+    "aragorn": {"ssh_host": "192.168.1.15", "ssh_user": "mac"},
+    "frodo":   {"ssh_host": "192.168.1.11", "ssh_user": "ben"},
+    "pippen":  {"ssh_host": "pippen", "ssh_user": "ben"},
+}
+# Portable across linux + mac: pgrep the main CLIs by full cmdline, then drop
+# any pid whose parent is also in the match set. The regex text itself never
+# self-matches (in our own cmdline "claude" is preceded by "(", not "/" or ^).
+AGENT_COUNT_CMD = (
+    "pids=$(pgrep -f '(^|/)(claude|codex|agy)( |$)' | tr '\\n' ' '); n=0; "
+    "for p in $pids; do pp=$(ps -o ppid= -p $p 2>/dev/null | tr -d ' '); "
+    "case \" $pids \" in *\" $pp \"*) ;; *) n=$((n+1));; esac; done; "
+    "echo agents=$n"
+)
+GITHUB_RUNNER_ORG = "armbrain-io"
+
+fleet_stats_cache = {"data": None, "ts": 0.0}
+fleet_stats_cache_lock = threading.Lock()
+FLEET_STATS_CACHE_TTL = 60  # seconds - matches the dashboard poll cadence
+
+def _count_cli_agents(name, cfg):
+    """claude/codex/agy main-process count for one box. None = unreadable
+    right now (box down / SSH circuit open) - callers must NOT show it as 0."""
+    out = None
+    try:
+        if cfg.get("local"):
+            import subprocess
+            out = subprocess.run(["bash", "-c", AGENT_COUNT_CMD], capture_output=True,
+                                 text=True, timeout=15).stdout
+        else:
+            client = get_ssh_client(cfg["ssh_host"], cfg.get("ssh_user", "ben"))
+            if client is None:
+                return None
+            _, stdout, _ = client.exec_command(AGENT_COUNT_CMD, timeout=15)
+            out = stdout.read().decode()
+        for kv in (out or "").split():
+            if kv.startswith("agents="):
+                return int(kv.split("=", 1)[1])
+    except Exception as e:
+        logger.debug(f"agent count {name}: {e}")
+    return None
+
+def _get_runner_stats():
+    """CI runner busy/total per box from GitHub (gh api, run on gandalf)."""
+    result = {"available": False, "boxes": {}, "fleet": {"busy": 0, "total": 0, "online": 0}}
+    try:
+        import subprocess, pwd
+        env = dict(os.environ)
+        # systemd system services don't set HOME; gh refuses to find its auth without it
+        env.setdefault("HOME", pwd.getpwuid(os.getuid()).pw_dir)
+        out = subprocess.run(
+            ["gh", "api", f"orgs/{GITHUB_RUNNER_ORG}/actions/runners", "--paginate",
+             "--jq", '.runners[] | [.name, .status, (.busy|tostring)] | @tsv'],
+            capture_output=True, text=True, timeout=25, env=env,
+        )
+        if out.returncode != 0:
+            logger.warning(f"runner stats: gh api failed: {out.stderr.strip()[:200]}")
+            return result
+        boxes = {}
+        for line in out.stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) != 3:
+                continue
+            name, status, busy = parts
+            box = re.sub(r"-\d+$", "", name) or name  # aragorn-12 -> aragorn
+            b = boxes.setdefault(box, {"busy": 0, "total": 0, "online": 0})
+            b["total"] += 1
+            if status == "online":
+                b["online"] += 1
+                if busy == "true":
+                    b["busy"] += 1
+        result["available"] = True
+        result["boxes"] = {k: boxes[k] for k in sorted(boxes)}
+        result["fleet"] = {
+            "busy": sum(b["busy"] for b in boxes.values()),
+            "total": sum(b["total"] for b in boxes.values()),
+            "online": sum(b["online"] for b in boxes.values()),
+        }
+    except Exception as e:
+        logger.warning(f"runner stats failed: {e}")
+    return result
+
+def get_fleet_stats():
+    """Cached agents-per-box + runner busy/total. One cache for both halves so
+    a dashboard refresh costs at most one SSH sweep + one gh call per minute."""
+    now = time.time()
+    with fleet_stats_cache_lock:
+        if fleet_stats_cache["data"] is not None and (now - fleet_stats_cache["ts"]) < FLEET_STATS_CACHE_TTL:
+            return fleet_stats_cache["data"]
+    agents = {}
+    with ThreadPoolExecutor(max_workers=len(AGENT_STAT_BOXES)) as ex:
+        futs = {ex.submit(_count_cli_agents, n, c): n for n, c in AGENT_STAT_BOXES.items()}
+        for fut in as_completed(futs):
+            agents[futs[fut]] = fut.result()
+    counts = {n: agents.get(n) for n in AGENT_STAT_BOXES}  # keep display order
+    result = {
+        "agents": {
+            "boxes": counts,
+            "total": sum(v for v in counts.values() if v is not None),
+        },
+        "runners": _get_runner_stats(),
+    }
+    with fleet_stats_cache_lock:
+        fleet_stats_cache["data"] = result
+        fleet_stats_cache["ts"] = time.time()
+    return result
+
 def get_mac_metrics(host, user):
     """Get CPU%, GPU utilization, RAM, swap, and disk for a macOS target via SSH.
 
@@ -1738,6 +1861,11 @@ def api_ci_queue():
     """Queued/running GitHub Actions counts for armbrain-io/armbrain (cached)."""
     return jsonify(get_ci_queue_status())
 
+@app.route("/api/fleet_stats", methods=["GET"])
+def api_fleet_stats():
+    """Compact stats bar: CLI agent sessions per box + CI runner busy/total."""
+    return jsonify(get_fleet_stats())
+
 @app.route("/api/model_routes", methods=["GET"])
 def api_model_routes():
     """Live/missing status for each 🔒 local fleet-gateway route (cached)."""
@@ -2162,6 +2290,11 @@ border-radius:999px;border:1px solid #2a2a4e;background:var(--bg-panel);color:#8
 <div id="route-health-body"><p style="color:#667;margin:0">Loading route health...</p></div>
 </div>
 
+<div class=card id=fleet-stats-card style="padding:12px 15px;margin:12px 0">
+<h3>🤖 Agents &amp; Runners</h3>
+<div id="fleet-stats-body"><p style="color:#667;margin:0">Loading fleet stats...</p></div>
+</div>
+
 <div class=card id=monitors><p>Loading...</p></div>
 <div class=card id=fleet-hosts style="padding:12px 15px;margin:12px 0">
 <div id=fleet-row class=fleet-row><p style="grid-column:1/-1;color:#667;margin:0">Scanning fleet hosts...</p></div>
@@ -2202,6 +2335,7 @@ border-radius:999px;border:1px solid #2a2a4e;background:var(--bg-panel);color:#8
 GET  /api/logs    - Job / usage history
 GET  /api/history - Historical metrics (range=hour|day|week|month)
 GET  /api/energy  - GPU energy + time-of-use cost (day/week/month)
+GET  /api/fleet_stats - CLI agent sessions per box + CI runner busy/total
 GET  /api/health  - Health check</pre>
 </div>
 
@@ -2393,6 +2527,36 @@ function refreshRouteHealth() {
     }).catch(() => {
         const el = document.getElementById('route-health-body');
         if (el) el.innerHTML = '<p class="glance-unavailable">Model route check failed to load.</p>';
+    });
+}
+
+function refreshFleetStats() {
+    fetch('/api/fleet_stats').then(r => r.json()).then(d => {
+        const el = document.getElementById('fleet-stats-body');
+        if (!el) return;
+        const a = d.agents || {boxes: {}, total: 0};
+        // null = box unreadable right now (down / circuit open) - show ?, not 0
+        const agentDetail = Object.entries(a.boxes).map(([n, v]) =>
+            n + ' ' + (v === null || v === undefined ? '?' : v)).join(' · ');
+        const r = d.runners || {};
+        let html = '<div class="glance-row">';
+        html += '<div class="glance-stat"><div class="glance-num">' + a.total + '</div><div class="glance-label">CLI Agents</div></div>';
+        if (r.available) {
+            const f = r.fleet || {busy: 0, total: 0, online: 0};
+            const cls = (f.online > 0 && f.busy >= f.online) ? 'hot' : (f.busy > 0 ? '' : 'zero');
+            html += '<div class="glance-stat"><div class="glance-num ' + cls + '">' + f.busy + '/' + f.total + '</div><div class="glance-label">Runners Busy</div></div>';
+        }
+        html += '<div style="color:#667;font-size:0.85em;line-height:1.6">'
+             + '<b style="color:#889">agents:</b> ' + agentDetail
+             + '<br><b style="color:#889">runners:</b> '
+             + (r.available
+                ? Object.entries(r.boxes).map(([n, b]) => n + ' ' + b.busy + '/' + b.total).join(' · ')
+                : '<span class="glance-unavailable">unavailable right now (gh / GitHub API failed) — stale read, not necessarily an outage</span>')
+             + '</div></div>';
+        el.innerHTML = html;
+    }).catch(() => {
+        const el = document.getElementById('fleet-stats-body');
+        if (el) el.innerHTML = '<p class="glance-unavailable">Fleet stats failed to load.</p>';
     });
 }
 
@@ -3055,7 +3219,7 @@ function refreshEnergy() {
 
 // --- Polling control: pause everything when the tab isn't visible, resume ---
 // --- with an immediate refresh when it becomes visible again.              ---
-let statusTimer = null, fleetTimer = null, historyTimer = null, energyTimer = null, ciQueueTimer = null, routeHealthTimer = null;
+let statusTimer = null, fleetTimer = null, historyTimer = null, energyTimer = null, ciQueueTimer = null, routeHealthTimer = null, fleetStatsTimer = null;
 
 function startPolling() {
     if (!statusTimer) statusTimer = setInterval(refresh, 12000);     // queue/GPU state: 12s
@@ -3064,6 +3228,7 @@ function startPolling() {
     if (!energyTimer) energyTimer = setInterval(refreshEnergy, 60000);
     if (!ciQueueTimer) ciQueueTimer = setInterval(refreshCiQueue, 45000);        // matches backend cache TTL
     if (!routeHealthTimer) routeHealthTimer = setInterval(refreshRouteHealth, 30000);
+    if (!fleetStatsTimer) fleetStatsTimer = setInterval(refreshFleetStats, 60000); // matches backend cache TTL
 }
 
 function stopPolling() {
@@ -3073,6 +3238,7 @@ function stopPolling() {
     clearInterval(energyTimer); energyTimer = null;
     clearInterval(ciQueueTimer); ciQueueTimer = null;
     clearInterval(routeHealthTimer); routeHealthTimer = null;
+    clearInterval(fleetStatsTimer); fleetStatsTimer = null;
 }
 
 document.addEventListener('visibilitychange', () => {
@@ -3086,6 +3252,7 @@ document.addEventListener('visibilitychange', () => {
         refreshEnergy();
         refreshCiQueue();
         refreshRouteHealth();
+        refreshFleetStats();
         startPolling();
     }
 });
@@ -3096,6 +3263,7 @@ refreshEnergy();
 refreshFleet();
 refreshCiQueue();
 refreshRouteHealth();
+refreshFleetStats();
 if (!document.hidden) startPolling();
 </script></body></html>'''
 
