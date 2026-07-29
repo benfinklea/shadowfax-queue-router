@@ -2460,6 +2460,32 @@ background:rgba(0,255,242,0.04);font-size:0.85em;color:#889}
 .loaded-model-name{color:var(--neon-cyan);font-weight:bold}
 .loaded-model-vram{color:var(--neon-green);white-space:nowrap}
 .stat-row{margin:10px 0}
+/* --- COMPACT CARD LAYOUT (2026-07-29, Ben: same info, smaller space) --- */
+.gpu-card.compact{padding:12px 14px;margin:0}
+.gpu-card.compact .gpu-header{margin-bottom:6px}
+.gpu-card.compact .gpu-name{font-size:1.05em;letter-spacing:1px}
+.hdr-right{display:flex;align-items:center;gap:8px;font-size:0.8em}
+.peak-inline{font-family:'Orbitron',monospace;font-size:0.72em;color:var(--neon-green);
+text-shadow:0 0 6px var(--neon-green);white-space:nowrap;opacity:0.85}
+.dial-strip{display:flex;gap:4px;justify-content:space-around;align-items:flex-start;margin:8px 0 6px}
+.io-line{display:flex;gap:12px;white-space:nowrap;align-items:center}
+.card-foot .io-stat{gap:5px}
+.dial-strip .gauge-label{font-size:0.55em;letter-spacing:1px;margin-top:3px}
+.dial-strip .gauge-value{font-size:0.82em;margin-top:0;white-space:nowrap}
+.mini-row{display:grid;grid-template-columns:44px 1fr auto;align-items:center;gap:8px;margin:4px 0}
+.mini-row .progress-bar{height:9px;margin:0;border-radius:3px}
+.mini-label{font-family:'Orbitron',monospace;font-size:0.6em;letter-spacing:1px;color:#778}
+.mini-val{font-family:'Orbitron',monospace;font-size:0.72em;color:#aab;white-space:nowrap}
+.serving-line{margin-top:7px;padding:5px 8px;border-left:2px solid var(--neon-cyan);
+background:rgba(0,255,242,0.04);font-size:0.78em;color:#889;line-height:1.5}
+.serving-line b{color:var(--neon-cyan)}
+.serving-line .tps{font-family:'Orbitron',monospace;color:var(--neon-cyan)}
+.serving-line .dim{color:#667}
+.card-foot{display:flex;justify-content:space-between;align-items:center;gap:8px;
+margin-top:8px;font-size:0.72em;color:#667}
+.card-foot .val{font-family:'Orbitron',monospace;color:var(--neon-cyan)}
+.card-actions{display:flex;gap:6px}
+.card-actions button{margin:0!important;padding:4px 9px;font-size:0.62em;letter-spacing:1px}
 .queue-badge{background:var(--neon-yellow);color:#000;padding:3px 10px;border-radius:2px;font-size:0.8em;
 font-family:'Orbitron',monospace;font-weight:bold;box-shadow:0 0 10px var(--neon-yellow)}
 .queue-badge.empty{background:#2a2a4e;color:#666;box-shadow:none}
@@ -2804,32 +2830,20 @@ function refreshModelServing() {
             const el = document.getElementById('serving-' + name);
             if (!el) continue;
             if (!s.available) {
-                if (!el.dataset.init) el.innerHTML = '<div style="margin-top:8px;color:#667;font-size:0.85em">Model serving stats warming up…</div>';
+                if (!el.dataset.init) el.innerHTML = '<span class="dim">serving stats warming up…</span>';
                 continue;
             }
-            const reqText = 'req ' + s.requests.hour + ' / 1h · ' + s.requests.day + ' / 24h · ' + s.requests.week + ' / 7d'
-                + (s.approx_requests ? ' (≈ from 60s samples)' : '')
-                + ' · serving ' + s.serving_minutes_today + ' min today';
-            if (el.dataset.init !== '1') {
-                let html = '<div class="stat-row" style="margin-top:12px">';
-                html += '<div class="loaded-model-title">MODEL SERVING · TOKENS/SEC</div>';
-                html += '<div class="gauge-row" style="margin:8px 0">';
-                html += renderGauge(s.tps_now, 0, TPS_GAUGE_MAX, 'T/S NOW', '', false, 1, false, 'tpsnow-' + name);
-                html += renderGauge(s.tps_avg_today, 0, TPS_GAUGE_MAX, 'T/S TODAY', '', false, 1, false, 'tpsavg-' + name);
-                html += '</div>';
-                html += '<div id="reqline-' + name + '" style="color:#889;font-size:0.85em;text-align:center">' + reqText + '</div>';
-                html += '</div>';
-                el.innerHTML = html;
-                el.dataset.init = '1';
-                // the render used threshold colors; force the neutral cyan
-                updateGauge('tpsnow-' + name, s.tps_now, 0, TPS_GAUGE_MAX, '', false, tpsColor);
-                updateGauge('tpsavg-' + name, s.tps_avg_today, 0, TPS_GAUGE_MAX, '', false, tpsColor);
-                continue;
+            // COMPACT (2026-07-29): the two t/s dials collapsed into one text line.
+            const servingHtml = '<span class="tps">' + Math.round(s.tps_now) + '</span> t/s now · '
+                + '<span class="tps">' + Math.round(s.tps_avg_today) + '</span> avg today · '
+                + '<span class="dim">req ' + s.requests.hour + '/1h · ' + s.requests.day + '/24h · ' + s.requests.week + '/7d'
+                + (s.approx_requests ? '≈' : '')
+                + ' · ' + s.serving_minutes_today + ' min served</span>';
+            if (el.dataset.lastVal !== servingHtml) {
+                el.dataset.lastVal = servingHtml;
+                el.innerHTML = servingHtml;
             }
-            updateGauge('tpsnow-' + name, s.tps_now, 0, TPS_GAUGE_MAX, '', false, tpsColor);
-            updateGauge('tpsavg-' + name, s.tps_avg_today, 0, TPS_GAUGE_MAX, '', false, tpsColor);
-            const reqEl = document.getElementById('reqline-' + name);
-            if (reqEl && reqEl.textContent !== reqText) reqEl.textContent = reqText;
+            el.dataset.init = '1';
         }
     }).catch(() => {});
 }
@@ -2871,19 +2885,26 @@ function progressBar(percent, cls, id) {
     return '<div class="progress-bar"><div id="' + id + '" class="progress-fill ' + barClass + '" data-percent="' + percent + '" style="width:' + percent + '%"></div></div>';
 }
 
+// COMPACT (2026-07-29): one line, not a titled block.
 function loadedModelsHtml(lm) {
     if (!lm || !lm.available) {
-        return '<div class="loaded-model-title">LOADED IN VRAM</div><div style="margin-top:3px">Live model status unavailable</div>';
+        return '<span class="dim">model status unavailable</span>';
     }
     if (!lm.models || !lm.models.length) {
-        return '<div class="loaded-model-title">LOADED IN VRAM</div><div style="margin-top:3px">No served model loaded</div>';
+        return '<span class="dim">no model loaded</span>';
     }
-    return '<div class="loaded-model-title">LOADED IN VRAM · LIVE</div>' + lm.models.map(model =>
-        '<div class="loaded-model"><span class="loaded-model-name">● ' + model.name + '</span>' +
-        '<span class="loaded-model-vram">' +
-        (model.vram_gb === null || model.vram_gb === undefined ? 'VRAM measuring…' : model.vram_gb.toFixed(1) + ' GB VRAM') +
-        '</span></div>'
-    ).join('');
+    return lm.models.map(model =>
+        '<b>● ' + model.name + '</b> <span class="tps">' +
+        (model.vram_gb === null || model.vram_gb === undefined ? 'measuring…' : model.vram_gb.toFixed(1) + ' GB') +
+        '</span>'
+    ).join(' · ');
+}
+
+// Label + thin bar + value, all on ONE line (compact card layout).
+function miniRow(label, percent, cls, barId, labelId, valueText) {
+    return '<div class="mini-row"><span class="mini-label">' + label + '</span>' +
+        progressBar(percent, cls, barId) +
+        '<span class="mini-val" id="' + labelId + '">' + valueText + '</span></div>';
 }
 
 // Update existing progress bars smoothly
@@ -3183,9 +3204,9 @@ function refresh() {
 
                 const isMac = info.os === 'mac';
 
-                html += '<div class="gpu-card" id="card-' + name + '">';
+                html += '<div class="gpu-card compact" id="card-' + name + '">';
                 html += '<div class="gpu-header"><span class="gpu-name">' + icon + ' ' + name + '</span>';
-                html += '<div style="display:flex;align-items:center;gap:10px"><span id="status-' + name + '">' + status + '</span>';
+                html += '<div class="hdr-right"><span id="status-' + name + '">' + status + '</span>';
                 if (!isMac) {
                     html += '<div class="machine-power">';
                     html += '<button class="reboot-btn" data-target="' + name + '" title="Reboot">&#x21bb;</button>';
@@ -3195,91 +3216,78 @@ function refresh() {
                 html += '</div></div>';
 
                 const maxUtil = (info.max_util_today === null || info.max_util_today === undefined) ? '--' : info.max_util_today;
-                html += '<div class="queue-info">';
-                html += '<div class="max-util" id="maxutil-' + name + '">' + maxUtil + '% max utilization today</div>';
-                html += '</div>';
+                html += '<div class="peak-inline" id="maxutil-' + name + '">' + maxUtil + '% max utilization today</div>';
 
                 if (info.online && isMac) {
-                    html += '<div class="gauge-row">';
-                    html += renderGauge(info.gpu_util, 0, 100, "GPU UTIL", "%", false, 1.5, true, 'util-' + name);
-                    html += renderGauge(info.cpu_percent, 0, 100, "CPU", "%", false, 1.5, false, 'cpu-' + name);
-                    html += '</div>';
-                    html += '<div class="gauge-row">';
+                    // COMPACT: one dial strip, then inline micro-bars.
+                    html += '<div class="dial-strip">';
+                    html += renderGauge(info.gpu_util, 0, 100, "GPU", "%", false, 0.7, true, 'util-' + name);
+                    html += renderGauge(info.cpu_percent, 0, 100, "CPU", "%", false, 0.7, false, 'cpu-' + name);
                     const swapPct = info.swap ? info.swap.percent : 0;
-                    html += renderSwapGauge(swapPct, 100, 1, 'swap-' + name);
+                    html += renderSwapGauge(swapPct, 100, 0.7, 'swap-' + name);
                     html += '</div>';
 
                     if (info.ram) {
-                        html += '<div class="stat-row">';
-                        html += '<div class="progress-label"><span>🧠 Memory</span><span id="ram-label-' + name + '">' + info.ram.used_gb + ' / ' + info.ram.total_gb + ' GB</span></div>';
-                        html += progressBar(info.ram.percent, "progress-ram", 'ram-' + name);
-                        html += '</div>';
+                        html += miniRow('MEM', info.ram.percent, 'progress-ram', 'ram-' + name,
+                                        'ram-label-' + name, info.ram.used_gb + ' / ' + info.ram.total_gb + ' GB');
                     }
 
                     if (info.disk) {
                         const diskUsed = info.disk.total_gb >= 1000 ? (info.disk.used_gb / 1024).toFixed(1) + ' TB' : info.disk.used_gb + ' GB';
                         const diskTotal = info.disk.total_gb >= 1000 ? (info.disk.total_gb / 1024).toFixed(1) + ' TB' : info.disk.total_gb + ' GB';
-                        html += '<div class="stat-row">';
-                        html += '<div class="progress-label"><span>💿 Disk</span><span id="disk-label-' + name + '">' + diskUsed + ' / ' + diskTotal + '</span></div>';
-                        html += progressBar(info.disk.percent, "progress-disk", 'disk-' + name);
-                        html += '</div>';
+                        html += miniRow('DISK', info.disk.percent, 'progress-disk', 'disk-' + name,
+                                        'disk-label-' + name, diskUsed + ' / ' + diskTotal);
                     }
 
-                    html += '<div style="margin-top:10px;font-size:0.85em;color:#888">Apple M1 Max · 64GB Unified · 32-core GPU</div>';
+                    html += '<div class="card-foot"><span>Apple M1 Max · 64GB Unified · 32-core GPU</span></div>';
                 } else if (info.online && info.gpu) {
-                    html += '<div class="gauge-row">';
-                    html += renderGauge(info.gpu_util, 0, 100, "GPU UTIL", "%", false, 1.5, true, 'util-' + name);
-                    html += renderGauge(info.gpu_watts, 0, info.gpu_power_max, "POWER", "W", true, 1.5, false, 'power-' + name);
-                    html += '</div>';
-                    html += '<div class="gauge-row">';
-                    html += renderGauge(info.gpu_temp, 24, 90, "TEMP", "°C", false, 1, false, 'temp-' + name);
-                    html += renderGauge(info.cpu_percent, 0, 100, "CPU", "%", false, 1, false, 'cpu-' + name);
+                    // COMPACT: all five vitals in ONE dial row.
+                    html += '<div class="dial-strip">';
+                    html += renderGauge(info.gpu_util, 0, 100, "GPU", "%", false, 0.7, true, 'util-' + name);
+                    html += renderGauge(info.gpu_watts, 0, info.gpu_power_max, "POWER", "W", true, 0.7, false, 'power-' + name);
+                    html += renderGauge(info.gpu_temp, 24, 90, "TEMP", "°C", false, 0.7, false, 'temp-' + name);
+                    html += renderGauge(info.cpu_percent, 0, 100, "CPU", "%", false, 0.7, false, 'cpu-' + name);
                     const swapPct = info.swap ? info.swap.percent : 0;
-                    html += renderSwapGauge(swapPct, 100, 1, 'swap-' + name);
-                    html += '</div>';
-                    html += '<button class="power-btn" data-target="' + name + '" data-current="' + info.gpu_power_limit + '" data-max="' + info.gpu_power_max + '">⚡ Set Power Limit</button>';
-                    html += '<button class="swap-btn" data-target="' + name + '">🧹 Clear Swap</button>';
-
-                    html += '<div class="stat-row">';
-                    html += '<div class="progress-label"><span>🎮 VRAM</span><span id="vram-label-' + name + '">' + info.gpu.vram_used_gb + ' / ' + info.gpu.vram_total_gb + ' GB</span></div>';
-                    html += progressBar(info.gpu.vram_percent, "progress-vram", 'vram-' + name);
-                    if (name === 'gandalf' || name === 'frodo') {
-                        html += '<div class="loaded-models" id="loaded-models-' + name + '">' + loadedModelsHtml(info.loaded_models) + '</div>';
-                    }
+                    html += renderSwapGauge(swapPct, 100, 0.7, 'swap-' + name);
                     html += '</div>';
 
-                    // Model serving stats (filled by refreshModelServing)
-                    if (name === 'gandalf' || name === 'frodo') {
-                        html += '<div id="serving-' + name + '"></div>';
-                    }
+                    html += miniRow('VRAM', info.gpu.vram_percent, 'progress-vram', 'vram-' + name,
+                                    'vram-label-' + name, info.gpu.vram_used_gb + ' / ' + info.gpu.vram_total_gb + ' GB');
 
                     if (info.ram) {
-                        html += '<div class="stat-row">';
-                        html += '<div class="progress-label"><span>💾 RAM</span><span id="ram-label-' + name + '">' + info.ram.used_gb + ' / ' + info.ram.total_gb + ' GB</span></div>';
-                        html += progressBar(info.ram.percent, "progress-ram", 'ram-' + name);
-                        html += '</div>';
+                        html += miniRow('RAM', info.ram.percent, 'progress-ram', 'ram-' + name,
+                                        'ram-label-' + name, info.ram.used_gb + ' / ' + info.ram.total_gb + ' GB');
                     }
 
                     if (info.disk) {
                         const diskUsed = info.disk.total_gb >= 1000 ? (info.disk.used_gb / 1024).toFixed(1) + ' TB' : info.disk.used_gb + ' GB';
                         const diskTotal = info.disk.total_gb >= 1000 ? (info.disk.total_gb / 1024).toFixed(1) + ' TB' : info.disk.total_gb + ' GB';
-                        html += '<div class="stat-row">';
-                        html += '<div class="progress-label"><span>💿 Disk</span><span id="disk-label-' + name + '">' + diskUsed + ' / ' + diskTotal + '</span></div>';
-                        html += progressBar(info.disk.percent, "progress-disk", 'disk-' + name);
+                        html += miniRow('DISK', info.disk.percent, 'progress-disk', 'disk-' + name,
+                                        'disk-label-' + name, diskUsed + ' / ' + diskTotal);
+                    }
+
+                    // Loaded model + tokens/sec, one line each (was 2 gauges + a block)
+                    if (name === 'gandalf' || name === 'frodo') {
+                        html += '<div class="serving-line">';
+                        html += '<div id="loaded-models-' + name + '">' + loadedModelsHtml(info.loaded_models) + '</div>';
+                        html += '<div id="serving-' + name + '"></div>';
                         html += '</div>';
                     }
 
-                // I/O Stats
-                    html += '<div class="io-stats">';
+                    html += '<div class="card-foot">';
+                    let ioTxt = '';
                     if (info.disk_io) {
-                        html += '<div class="io-stat" id="disk-io-' + name + '">📀 <span class="value">' + info.disk_io.read_mbps + '/' + info.disk_io.write_mbps + '</span> MB/s</div>';
+                        ioTxt += '<span class="io-stat" id="disk-io-' + name + '">📀 <span class="value val">' + info.disk_io.read_mbps + '/' + info.disk_io.write_mbps + '</span> MB/s</span>';
                     }
                     if (info.net_io) {
-                        html += '<div class="io-stat" id="net-io-' + name + '">🌐 <span class="value">' + info.net_io.rx_mbps + '/' + info.net_io.tx_mbps + '</span> MB/s</div>';
+                        ioTxt += '<span class="io-stat" id="net-io-' + name + '">🌐 <span class="value val">' + info.net_io.rx_mbps + '/' + info.net_io.tx_mbps + '</span> MB/s</span>';
                     }
-                    html += '</div>';
-
-                    html += '<div style="margin-top:10px;font-size:0.85em;color:#888">' + info.gpu.name + (info.gpu.cuda_version ? ' (CUDA ' + info.gpu.cuda_version + ')' : '') + '</div>';
+                    html += '<span class="io-line">' + ioTxt + '</span>';
+                    html += '<span class="card-actions">';
+                    html += '<button class="power-btn" data-target="' + name + '" data-current="' + info.gpu_power_limit + '" data-max="' + info.gpu_power_max + '" title="Set Power Limit">⚡ PWR</button>';
+                    html += '<button class="swap-btn" data-target="' + name + '" title="Clear Swap">🧹 SWAP</button>';
+                    html += '</span></div>';
+                    html += '<div style="margin-top:5px;font-size:0.7em;color:#556">' + info.gpu.name + (info.gpu.cuda_version ? ' (CUDA ' + info.gpu.cuda_version + ')' : '') + '</div>';
                 }
 
                 // ComfyUI link removed 2026-07-28 (Ben): ComfyUI is disabled fleet-wide,
