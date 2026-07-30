@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import uuid
 import requests
 import logging
@@ -112,12 +113,26 @@ CONFIG = {
             "ssh_user": "mac",
             "os": "linux",
             "gpu_power_max": 675,
-            "disk_path": "/"
+            "disk_path": "/",
+            # Three ollama instances, each pinned to specific card(s) by
+            # CUDA_VISIBLE_DEVICES in its systemd unit. CUDA_DEVICE_ORDER is
+            # PCI_BUS_ID, so device 0 = RTX 5070 (01:00.0), 1 = RTX 5080 (03:00.0).
+            # ollama.service :11434 -> devices "1"   (5080)  = route reason-oss
+            # ollama-5070    :11435 -> devices "0"   (5070)  = route fast-mini
+            # ollama-27b     :11436 -> devices "0,1" (both, OLLAMA_SCHED_SPREAD=1)
+            "ollama_instances": [
+                {"port": 11434, "where": "5080"},
+                {"port": 11435, "where": "5070"},
+                {"port": 11436, "where": "both GPUs"},
+            ],
         },
         "pippin": {
             "ssh_host": "pippen",
             "ssh_user": "ben",
             "os": "mac",
+            "model_status_urls": [
+                ("models", "http://pippen.local:8891/v1/models"),
+            ],
             "vram_gb": 64,
             "disk_path": "/"
         }
@@ -169,7 +184,10 @@ GATEWAY_MODELS_URL = "http://gandalf.local:4000/v1/models"
 # The 🔒 local-only routes from the fleet gateway table - the ones that should
 # always be up. (opus/sonnet/codex/gemini/etc. are external and expected to
 # come and go with vendor availability, so they're left off this glance tile.)
-LOCAL_GATEWAY_ROUTES = ["fast", "code", "code-glm", "reason", "coder", "big", "cheap"]
+LOCAL_GATEWAY_ROUTES = ["fast", "code", "code-glm", "reason", "coder", "big", "cheap",
+                        # aragorn, 2026-07-29: one ollama seat per GPU
+                        # (reason-oss on the 5080, fast-mini on the 5070).
+                        "reason-oss", "fast-mini"]
 
 # One-shot metrics: cpu% (0.6s /proc/stat delta), ram MB, hottest sensor (milli-C)
 FLEET_METRICS_CMD = (
@@ -1005,6 +1023,36 @@ def _model_processes(target_name, target_config):
     return rows
 
 
+def get_ollama_loaded_models(target_config):
+    """What each ollama instance on a box has RESIDENT, and on which card.
+
+    ollama /v1/models lists everything PULLED, which would show green for
+    models that aren't loaded - /api/ps is the honest signal, and it reports
+    size_vram directly so no process matching is needed.
+    """
+    host = target_config.get("ssh_host")
+    models = []
+    reachable = False
+    for inst in target_config.get("ollama_instances", []):
+        try:
+            r = requests.get(f"http://{host}:{inst['port']}/api/ps", timeout=4)
+            if not r.ok:
+                continue
+            reachable = True
+            for m in r.json().get("models", []):
+                name = (m.get("model") or m.get("name") or "").replace(":latest", "")
+                if not name:
+                    continue
+                models.append({
+                    "name": name,
+                    "vram_gb": round(m["size_vram"] / (1024 ** 3), 1) if m.get("size_vram") else None,
+                    "where": inst.get("where"),
+                })
+        except Exception as e:
+            logger.debug(f"ollama :{inst['port']} /api/ps unavailable: {e}")
+    return {"available": reachable, "models": models}
+
+
 def get_loaded_models(target_name, target_config):
     """Live served-model names paired with their real per-process VRAM use."""
     now = time.time()
@@ -1271,6 +1319,115 @@ route_health_cache = {"data": None, "ts": 0.0}
 route_health_cache_lock = threading.Lock()
 ROUTE_HEALTH_CACHE_TTL = 30  # seconds
 
+# --- Route topology (2026-07-29, Ben: "move the coding pathways down to the
+# machine they are running on"). Each route badge renders on ITS box's card, so
+# the dashboard has to know which box serves which route. Parsed from the LIVE
+# gateway config rather than hardcoded, so a route moving boxes can't silently
+# leave the dashboard lying. Falls back to the known map if the file is gone.
+GATEWAY_CONFIG_PATH = "/workspace/gandalf-gateway/fleet-litellm-config.yaml"
+ROUTE_TOPOLOGY_TTL = 300  # seconds - config changes are rare
+# host in api_base -> the box name this dashboard uses ("pippen" is the
+# hostname, "pippin" is the card name).
+_ROUTE_HOST_TO_BOX = {
+    "gandalf": "gandalf", "frodo": "frodo", "pippen": "pippin",
+    "pippin": "pippin", "shadowfax": "shadowfax", "sam": "sam",
+    "aragorn": "aragorn", "127.0.0.1": "gandalf", "localhost": "gandalf",
+    "192.168.1.15": "aragorn", "192.168.1.10": "gandalf", "192.168.1.11": "frodo",
+}
+_ROUTE_TOPOLOGY_FALLBACK = {
+    "fast": {"box": "frodo", "model": "qwen3.6-35b-a3b", "port": 8890},
+    "code": {"box": "pippin", "model": "qwen3-coder-next", "port": 8891},
+    "code-glm": {"box": "gandalf", "model": "glm-4.5-air", "port": 8889},
+    "reason": {"box": "gandalf", "model": "gemma4-26b", "port": 8889},
+    "coder": {"box": "gandalf", "model": "devstral-small-2-24b", "port": 8889},
+    "big": {"box": "gandalf", "model": "qwen3-235b-a22b", "port": 8889},
+    "cheap": {"box": "shadowfax", "model": "glm-edge", "port": 8081},
+    "reason-oss": {"box": "aragorn", "model": "gpt-oss:20b", "port": 11434},
+    "fast-mini": {"box": "aragorn", "model": "qwen3:8b", "port": 11435},
+}
+route_topology_cache = {"data": None, "ts": 0.0}
+route_topology_lock = threading.Lock()
+
+
+def get_route_topology():
+    """route name -> {box, model, port}, read from the live gateway config."""
+    now = time.time()
+    with route_topology_lock:
+        if route_topology_cache["data"] is not None and (now - route_topology_cache["ts"]) < ROUTE_TOPOLOGY_TTL:
+            return route_topology_cache["data"]
+
+    topo = {}
+    try:
+        text = open(GATEWAY_CONFIG_PATH).read()
+        for block in re.split(r"\n\s*-\s+model_name:\s*", text)[1:]:
+            name = block.split("\n")[0].split("#")[0].strip().strip("\"'")
+            if name not in LOCAL_GATEWAY_ROUTES:
+                continue
+            base = re.search(r"api_base:\s*[\"']?(\S+?)[\"']?\s*(?:$|,|\})", block, re.M)
+            model = re.search(r"model:\s*[\"']?([^\"'\s,}]+)", block)
+            if not (base and model):
+                continue
+            host_port = re.sub(r"^https?://", "", base.group(1)).split("/")[0]
+            host, _, port = host_port.partition(":")
+            topo[name] = {
+                "box": _ROUTE_HOST_TO_BOX.get(host.replace(".local", ""), host),
+                "model": model.group(1).split("/")[-1],
+                "port": int(port) if port.isdigit() else None,
+            }
+    except Exception as e:
+        logger.warning(f"gateway config unreadable ({e}); using fallback route map")
+
+    for name, info in _ROUTE_TOPOLOGY_FALLBACK.items():
+        topo.setdefault(name, dict(info))
+
+    with route_topology_lock:
+        route_topology_cache["data"] = topo
+        route_topology_cache["ts"] = time.time()
+    return topo
+
+
+def get_loaded_route_models():
+    """Model ids currently RESIDENT in memory, per box.
+
+    gandalf runs llama-swap, so only one of its four models is loaded at a
+    time - /running is the authority. frodo/pippin/shadowfax run a single
+    llama-server each, so anything their /v1/models lists IS loaded.
+    """
+    loaded = {}
+    try:
+        r = requests.get("http://127.0.0.1:8889/running", timeout=4)
+        if r.ok:
+            running = r.json().get("running", [])
+            ids = set()
+            for entry in running:
+                if isinstance(entry, str):
+                    ids.add(entry)
+                elif isinstance(entry, dict):
+                    ids.add(entry.get("model") or entry.get("id") or entry.get("name"))
+            loaded["gandalf"] = {i for i in ids if i}
+    except Exception as e:
+        logger.debug(f"gandalf /running unavailable: {e}")
+
+    for port in (11434, 11435):
+        try:
+            r = requests.get(f"http://192.168.1.15:{port}/api/ps", timeout=4)
+            if r.ok:
+                ids = {m.get("model") or m.get("name") for m in r.json().get("models", [])}
+                loaded.setdefault("aragorn", set()).update(i for i in ids if i)
+        except Exception as e:
+            logger.debug(f"aragorn ollama :{port} /api/ps unavailable: {e}")
+
+    for box, url in (("frodo", "http://192.168.1.11:8890/v1/models"),
+                     ("pippin", "http://pippen.local:8891/v1/models"),
+                     ("shadowfax", "http://shadowfax.local:8081/v1/models")):
+        try:
+            r = requests.get(url, timeout=4)
+            if r.ok:
+                loaded[box] = {m.get("id") for m in r.json().get("data", []) if m.get("id")}
+        except Exception as e:
+            logger.debug(f"{box} model list unavailable: {e}")
+    return loaded
+
 def get_model_route_health():
     """Which 🔒 local fleet-gateway routes are live right now vs missing -
     the "is a model route silently gone" signal."""
@@ -1295,10 +1452,25 @@ def get_model_route_health():
         except Exception as e:
             logger.warning(f"Model route check failed: {e}")
 
-    result = {
-        "available": available,
-        "routes": [{"name": name, "live": routes_live[name]} for name in LOCAL_GATEWAY_ROUTES],
-    }
+    topo = get_route_topology()
+    loaded_by_box = get_loaded_route_models()
+    routes = []
+    for name in LOCAL_GATEWAY_ROUTES:
+        info = topo.get(name, {})
+        box = info.get("box")
+        model = info.get("model")
+        # Three states, not two: live+resident = green, live but nothing loaded
+        # in memory = grey (llama-swap unloads after idle - that is normal, not
+        # an alarm), absent from the gateway = red.
+        resident = bool(model and box and model in loaded_by_box.get(box, set()))
+        routes.append({
+            "name": name,
+            "live": routes_live[name],
+            "loaded": resident,
+            "box": box,
+            "model": model,
+        })
+    result = {"available": available, "routes": routes}
     with route_health_cache_lock:
         route_health_cache["data"] = result
         route_health_cache["ts"] = time.time()
@@ -1441,6 +1613,7 @@ def get_fleet_stats():
 MODEL_SERVING_SOURCES = {
     "gandalf": {"kind": "llamaswap", "url": "http://127.0.0.1:8889/api/metrics"},
     "frodo":   {"kind": "llamacpp",  "url": "http://192.168.1.11:8890/metrics"},
+    "pippin":  {"kind": "llamacpp",  "url": "http://pippen.local:8891/metrics"},
 }
 MODEL_SERVING_INTERVAL = 60      # sampling cadence, matches METRICS_INTERVAL
 MODEL_SERVING_RETENTION_DAYS = 8  # a hair over the 7d display window
@@ -1454,6 +1627,73 @@ def _parse_llamaswap_ts(ts):
         return datetime.fromisoformat(ts).astimezone().replace(tzinfo=None).isoformat()
     except Exception:
         return None
+
+# --- Gateway-derived token stats (2026-07-29). aragorn serves via ollama, which
+# has NO token-counter endpoint, so its tokens/sec cannot come from the box.
+# LiteLLM already logs completion_tokens + start/end time for every request it
+# routes, which yields real measured tokens/sec for ANY route. Read over
+# `docker exec` (peer auth inside the container - no password in this file).
+GATEWAY_TOKENS_TTL = 45  # seconds
+gateway_tokens_cache = {"data": None, "ts": 0.0}
+gateway_tokens_lock = threading.Lock()
+
+_GATEWAY_TOKENS_SQL = """
+WITH d AS (
+  SELECT model,
+         completion_tokens AS tok,
+         GREATEST(EXTRACT(epoch FROM ("endTime"-"startTime")), 0.001) AS secs,
+         "startTime" AS ts
+  FROM "LiteLLM_SpendLogs"
+  WHERE completion_tokens > 0
+    AND "startTime" >= now() - interval '7 days'
+)
+SELECT model,
+       COALESCE(SUM(tok)  FILTER (WHERE ts >= date_trunc('day', now() AT TIME ZONE 'America/Chicago') AT TIME ZONE 'America/Chicago'), 0),
+       COALESCE(SUM(secs) FILTER (WHERE ts >= date_trunc('day', now() AT TIME ZONE 'America/Chicago') AT TIME ZONE 'America/Chicago'), 0),
+       COALESCE(MAX(tok/secs) FILTER (WHERE ts >= date_trunc('day', now() AT TIME ZONE 'America/Chicago') AT TIME ZONE 'America/Chicago'), 0),
+       COALESCE(MAX(tok/secs) FILTER (WHERE ts >= now() - interval '150 seconds'), 0),
+       COUNT(*) FILTER (WHERE ts >= now() - interval '1 hour'),
+       COUNT(*) FILTER (WHERE ts >= now() - interval '1 day'),
+       COUNT(*)
+FROM d GROUP BY model;
+"""
+
+
+def get_gateway_token_stats():
+    """model id -> measured token throughput, straight from the gateway's log."""
+    now_t = time.time()
+    with gateway_tokens_lock:
+        if gateway_tokens_cache["data"] is not None and (now_t - gateway_tokens_cache["ts"]) < GATEWAY_TOKENS_TTL:
+            return gateway_tokens_cache["data"]
+
+    stats = {}
+    try:
+        out = subprocess.run(
+            ["docker", "exec", "litellm-db", "psql", "-U", "litellm", "-d", "litellm",
+             "-t", "-A", "-F", "|", "-c", _GATEWAY_TOKENS_SQL],
+            capture_output=True, text=True, timeout=15,
+        )
+        for line in out.stdout.strip().splitlines():
+            parts = line.split("|")
+            if len(parts) < 8:
+                continue
+            model = parts[0].split("/")[-1].strip()
+            tok, secs, peak, nowtps, h, d, w = (float(x) for x in parts[1:8])
+            stats[model] = {
+                "tokens_today": tok,
+                "seconds_today": secs,
+                "tps_max_today": round(peak, 1),
+                "tps_now": round(nowtps, 1),
+                "requests": {"hour": int(h), "day": int(d), "week": int(w)},
+            }
+    except Exception as e:
+        logger.debug(f"gateway token stats unavailable: {e}")
+
+    with gateway_tokens_lock:
+        gateway_tokens_cache["data"] = stats
+        gateway_tokens_cache["ts"] = time.time()
+    return stats
+
 
 def collect_model_serving():
     """Background sampler: persist llama-swap request records + llama-server
@@ -1481,26 +1721,28 @@ def collect_model_serving():
                              tok.get("output_tokens"), tok.get("tokens_per_second")))
             except Exception as e:
                 logger.debug(f"model serving sample gandalf: {e}")
-            # frodo: one counter sample per cycle
-            try:
-                resp = requests.get(MODEL_SERVING_SOURCES["frodo"]["url"],
-                                    timeout=MODEL_SERVING_HTTP_TIMEOUT)
-                if resp.ok:
-                    vals = {}
-                    for line in resp.text.splitlines():
-                        for key in ("llamacpp:tokens_predicted_total ",
-                                    "llamacpp:tokens_predicted_seconds_total "):
-                            if line.startswith(key):
-                                vals[key.strip()] = float(line.split()[-1])
-                    if "llamacpp:tokens_predicted_total" in vals:
-                        conn.execute(
-                            "INSERT OR IGNORE INTO model_counter_samples "
-                            "(box, ts, tokens_total, gen_seconds_total) VALUES (?,?,?,?)",
-                            ("frodo", datetime.now().isoformat(),
-                             vals.get("llamacpp:tokens_predicted_total"),
-                             vals.get("llamacpp:tokens_predicted_seconds_total")))
-            except Exception as e:
-                logger.debug(f"model serving sample frodo: {e}")
+            # every plain llama-server box: one counter sample per cycle
+            for _box, _src in MODEL_SERVING_SOURCES.items():
+                if _src.get("kind") != "llamacpp":
+                    continue
+                try:
+                    resp = requests.get(_src["url"], timeout=MODEL_SERVING_HTTP_TIMEOUT)
+                    if resp.ok:
+                        vals = {}
+                        for line in resp.text.splitlines():
+                            for key in ("llamacpp:tokens_predicted_total ",
+                                        "llamacpp:tokens_predicted_seconds_total "):
+                                if line.startswith(key):
+                                    vals[key.strip()] = float(line.split()[-1])
+                        if "llamacpp:tokens_predicted_total" in vals:
+                            conn.execute(
+                                "INSERT OR IGNORE INTO model_counter_samples "
+                                "(box, ts, tokens_total, gen_seconds_total) VALUES (?,?,?,?)",
+                                (_box, datetime.now().isoformat(),
+                                 vals.get("llamacpp:tokens_predicted_total"),
+                                 vals.get("llamacpp:tokens_predicted_seconds_total")))
+                except Exception as e:
+                    logger.debug(f"model serving sample {_box}: {e}")
             cutoff = (datetime.now() - timedelta(days=MODEL_SERVING_RETENTION_DAYS)).isoformat()
             conn.execute("DELETE FROM model_requests WHERE ts < ?", (cutoff,))
             conn.execute("DELETE FROM model_counter_samples WHERE ts < ?", (cutoff,))
@@ -1565,27 +1807,9 @@ def get_model_serving_stats():
             "approx_requests": False,
         }
 
-        # frodo - counter samples -> reset-aware deltas
-        samples = conn.execute(
-            "SELECT ts, tokens_total, gen_seconds_total FROM model_counter_samples "
-            "WHERE box='frodo' AND ts >= ? ORDER BY ts", (week_ago,)).fetchall()
-        conn.close()
-        deltas = []  # (ts, d_tokens, d_secs)
-        for i in range(1, len(samples)):
-            ts, tok, sec = samples[i]
-            ptok, psec = samples[i - 1][1], samples[i - 1][2]
-            d_tok, d_sec = tok - ptok, (sec - psec) if sec is not None and psec is not None else 0.0
-            if d_tok < 0 or d_sec < 0:  # counter reset (llama-server restart)
-                d_tok, d_sec = tok, sec or 0.0
-            deltas.append((ts, d_tok, d_sec))
-        tps_now = 0.0
-        if deltas and deltas[-1][0] >= (now - timedelta(seconds=3 * MODEL_SERVING_INTERVAL)).isoformat():
-            _, d_tok, d_sec = deltas[-1]
-            tps_now = round(d_tok / d_sec, 1) if d_tok > 0 and d_sec > 0 else 0.0
-        today = [d for d in deltas if d[0] >= midnight]
-        tok_today = sum(d[1] for d in today if d[1] > 0)
-        sec_today = sum(d[2] for d in today if d[1] > 0)
-
+        # every counter-sampled box (frodo, pippin) -> reset-aware deltas.
+        # Generalised 2026-07-29: pippin serves the `code` route, so Ben wants
+        # its tokens/sec on the card like the other model boxes.
         def _bursts(ds):
             """Requests can't be counted exactly from counters (llama-server
             exposes no requests_total) - count busy-after-idle transitions in
@@ -1598,25 +1822,82 @@ def get_model_serving_stats():
                     n += 1
                 prev_busy = busy
             return n
-        # Peak 60s-window generation speed today (bottom band of the t/s strip).
-        _win_tps = [d[1] / d[2] for d in today if d[1] > 0 and d[2] > 0]
-        result["frodo"] = {
-            "available": len(samples) >= 2,
-            "tps_now": tps_now,
-            "tps_avg_today": round(tok_today / sec_today, 1) if sec_today > 0 else 0.0,
-            "tps_max_today": round(max(_win_tps), 1) if _win_tps else 0.0,
-            "serving_minutes_today": round(sec_today / 60),
-            "requests": {
-                "hour": _bursts([d for d in deltas if d[0] >= hour_ago]),
-                "day": _bursts([d for d in deltas if d[0] >= day_ago]),
-                "week": _bursts(deltas),
-            },
-            "approx_requests": True,
-        }
+
+        for box, src in MODEL_SERVING_SOURCES.items():
+            if src.get("kind") != "llamacpp":
+                continue
+            samples = conn.execute(
+                "SELECT ts, tokens_total, gen_seconds_total FROM model_counter_samples "
+                "WHERE box=? AND ts >= ? ORDER BY ts", (box, week_ago)).fetchall()
+            deltas = []  # (ts, d_tokens, d_secs)
+            for i in range(1, len(samples)):
+                ts, tok, sec = samples[i]
+                ptok, psec = samples[i - 1][1], samples[i - 1][2]
+                d_tok, d_sec = tok - ptok, (sec - psec) if sec is not None and psec is not None else 0.0
+                if d_tok < 0 or d_sec < 0:  # counter reset (llama-server restart)
+                    d_tok, d_sec = tok, sec or 0.0
+                deltas.append((ts, d_tok, d_sec))
+            tps_now = 0.0
+            if deltas and deltas[-1][0] >= (now - timedelta(seconds=3 * MODEL_SERVING_INTERVAL)).isoformat():
+                _, d_tok, d_sec = deltas[-1]
+                tps_now = round(d_tok / d_sec, 1) if d_tok > 0 and d_sec > 0 else 0.0
+            today = [d for d in deltas if d[0] >= midnight]
+            tok_today = sum(d[1] for d in today if d[1] > 0)
+            sec_today = sum(d[2] for d in today if d[1] > 0)
+            # Peak 60s-window generation speed today (bottom band of the t/s strip).
+            _win_tps = [d[1] / d[2] for d in today if d[1] > 0 and d[2] > 0]
+            result[box] = {
+                "available": len(samples) >= 2,
+                "tps_now": tps_now,
+                "tps_avg_today": round(tok_today / sec_today, 1) if sec_today > 0 else 0.0,
+                "tps_max_today": round(max(_win_tps), 1) if _win_tps else 0.0,
+                "serving_minutes_today": round(sec_today / 60),
+                "requests": {
+                    "hour": _bursts([d for d in deltas if d[0] >= hour_ago]),
+                    "day": _bursts([d for d in deltas if d[0] >= day_ago]),
+                    "week": _bursts(deltas),
+                },
+                "approx_requests": True,
+            }
+        conn.close()
     except Exception as e:
         logger.warning(f"model serving stats failed: {e}")
         for box in MODEL_SERVING_SOURCES:
             result.setdefault(box, {"available": False})
+
+    # Boxes with no native token counters (ollama) get their numbers from the
+    # gateway's request log instead - measured, not estimated.
+    try:
+        gw = get_gateway_token_stats()
+        topo = get_route_topology()
+        by_box = {}
+        for route, info in topo.items():
+            if info.get("box") in MODEL_SERVING_SOURCES:
+                continue  # native counters win
+            by_box.setdefault(info["box"], set()).add(info.get("model"))
+        for box, models in by_box.items():
+            rows = [gw[m] for m in models if m in gw]
+            if not rows:
+                result.setdefault(box, {"available": False, "source": "gateway"})
+                continue
+            tok = sum(r["tokens_today"] for r in rows)
+            secs = sum(r["seconds_today"] for r in rows)
+            result[box] = {
+                "available": True,
+                "source": "gateway",
+                "tps_now": max(r["tps_now"] for r in rows),
+                "tps_avg_today": round(tok / secs, 1) if secs > 0 else 0.0,
+                "tps_max_today": max(r["tps_max_today"] for r in rows),
+                "serving_minutes_today": round(secs / 60),
+                "requests": {
+                    "hour": sum(r["requests"]["hour"] for r in rows),
+                    "day": sum(r["requests"]["day"] for r in rows),
+                    "week": sum(r["requests"]["week"] for r in rows),
+                },
+                "approx_requests": False,
+            }
+    except Exception as e:
+        logger.debug(f"gateway-derived serving stats failed: {e}")
 
     with model_serving_cache_lock:
         model_serving_cache["data"] = result
@@ -1778,6 +2059,14 @@ def get_target_status(target_name, target_config, fast=False):
                     }
             except Exception as e:
                 logger.warning(f"{target_name} Mac metrics unreachable: {e}")
+        # Macs return early, so their loaded-model read happens here (pippin
+        # serves the `code` route - Ben, 2026-07-29: "if it can run a local AI,
+        # I want it on that screen").
+        if target_config.get("model_status_urls"):
+            try:
+                result["loaded_models"] = get_loaded_models(target_name, target_config)
+            except Exception as e:
+                logger.debug(f"{target_name} loaded-model read failed: {e}")
         return result
 
     # Try ComfyUI HTTP endpoints
@@ -1909,8 +2198,10 @@ def get_target_status(target_name, target_config, fast=False):
             if disk_usage.get("total_gb"):
                 result["disk"] = disk_usage
 
-            if target_name in ("gandalf", "frodo"):
+            if target_config.get("model_status_urls"):
                 result["loaded_models"] = get_loaded_models(target_name, target_config)
+            elif target_config.get("ollama_instances"):
+                result["loaded_models"] = get_ollama_loaded_models(target_config)
         except Exception as e:
             logger.warning(f"{target_name} SSH unreachable: {e}")
 
@@ -2582,6 +2873,8 @@ font-family:'Orbitron',monospace;font-weight:bold;box-shadow:0 0 10px var(--neon
 .gauge-bg{position:absolute;width:100%;height:200%;border-radius:50%}
 .gauge-mask{position:absolute;bottom:0;left:10%;width:80%;height:80%;background:var(--bg-card);border-radius:999px 999px 0 0}
 .gauge-needle{position:absolute;bottom:0;left:50%;background:linear-gradient(to top,#fff 0%,#fff 60%,var(--neon-cyan) 100%);transform-origin:bottom center;transition:transform 1.5s cubic-bezier(0.4,0,0.2,1);border-radius:2px}
+.gauge-peak{position:absolute;bottom:0;left:50%;transform-origin:bottom center;
+border-radius:1px;transition:transform 1.5s cubic-bezier(0.4,0,0.2,1);pointer-events:none;z-index:3}
 .gauge-center{position:absolute;bottom:-5px;left:50%;background:#0a0a0f;border:2px solid var(--neon-cyan);border-radius:50%;transition:border-color 0.8s}
 .gauge-label{font-family:'Orbitron',monospace;font-size:0.85em;color:#888;margin-top:8px;
 letter-spacing:2px;text-transform:uppercase}
@@ -2645,6 +2938,62 @@ letter-spacing:1px;text-transform:uppercase;transition:all 0.3s}
 .glance-label{font-size:0.75em;color:#889;letter-spacing:1px;text-transform:uppercase;margin-top:2px}
 .glance-unavailable{color:#667;font-size:0.9em;font-style:italic}
 .route-pills{display:flex;gap:8px;flex-wrap:wrap}
+/* Route badges on the machine card that actually serves them (2026-07-29, Ben).
+   GREEN = model resident in memory, GREY = route up but nothing loaded (normal
+   for llama-swap after idle), RED = route missing from the gateway. */
+.card-routes{display:flex;gap:4px;flex-wrap:wrap;margin:6px 0 2px}
+.card-route{font-family:'Orbitron',monospace;font-size:0.6em;letter-spacing:1px;
+padding:2px 7px;border-radius:999px;border:1px solid #2a3450;color:#778;white-space:nowrap}
+.card-route.loaded{color:var(--neon-green);border-color:var(--neon-green);
+box-shadow:0 0 7px rgba(57,255,20,0.3);background:rgba(57,255,20,0.07)}
+.card-route.idle{color:#7d8798;border-color:#333f5c}
+.card-route.missing{color:var(--neon-red);border-color:var(--neon-red);
+box-shadow:0 0 7px rgba(255,0,68,0.3)}
+.ft-routes{display:flex;gap:3px;flex-wrap:wrap;margin-top:5px}
+/* One-row glance strip: CI queue + route health + agents, ~1/3 the height of
+   the three cards it replaced (Ben, 2026-07-29). Numbers big, words small. */
+.ship-flow{display:flex;align-items:stretch;gap:0;flex-wrap:wrap;margin:0 0 9px 0}
+.ship-label{display:flex;align-items:center;gap:7px;font-family:'Orbitron',monospace;
+font-size:0.72em;letter-spacing:2px;color:var(--neon-cyan);text-shadow:0 0 8px var(--neon-cyan);
+padding-right:12px;white-space:nowrap}
+.ship-stage{background:rgba(255,255,255,0.025);border:1px solid #1e2942;border-radius:7px;
+padding:7px 14px;min-width:92px;text-align:center;display:flex;flex-direction:column;
+align-items:center;justify-content:center;gap:2px}
+.ship-num{font-family:'Orbitron',monospace;font-size:1.5em;font-weight:700;line-height:1;
+color:var(--neon-cyan);text-shadow:0 0 10px var(--neon-cyan)}
+.ship-num.ok{color:var(--neon-green);text-shadow:0 0 10px var(--neon-green)}
+.ship-num.warn{color:var(--neon-yellow);text-shadow:0 0 10px var(--neon-yellow)}
+.ship-num.hot{color:var(--neon-red);text-shadow:0 0 10px var(--neon-red)}
+.ship-num.stamp{font-size:1.05em;white-space:nowrap}
+.ship-cap{font-family:'Orbitron',monospace;font-size:0.56em;letter-spacing:1.5px;
+text-transform:uppercase;color:#7a839c;white-space:nowrap}
+.ship-sub{font-size:0.62em;color:#5d6478;white-space:nowrap}
+.ship-arrow{display:flex;align-items:center;padding:0 9px;color:var(--neon-magenta);
+font-size:0.9em;text-shadow:0 0 8px var(--neon-magenta)}
+.ship-spark{display:flex;align-items:flex-end;gap:2px;height:11px;margin-top:3px}
+.ship-spark i{width:5px;background:var(--neon-cyan);box-shadow:0 0 4px var(--neon-cyan);
+border-radius:1px 1px 0 0;min-height:1px}
+.gstrip{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px;align-items:center}
+.gcell{display:flex;align-items:center;gap:9px;padding:2px 4px;border-left:2px solid #24304d;min-width:0}
+.gcell .gicon{font-size:1.15em;line-height:1;flex:0 0 auto}
+.gnum{font-family:'Orbitron',monospace;font-size:1.35em;font-weight:700;line-height:1;
+color:var(--neon-cyan);text-shadow:0 0 9px var(--neon-cyan)}
+.gnum.ok{color:var(--neon-green);text-shadow:0 0 9px var(--neon-green)}
+.gnum.warn{color:var(--neon-yellow);text-shadow:0 0 9px var(--neon-yellow)}
+.gnum.hot{color:var(--neon-red);text-shadow:0 0 9px var(--neon-red)}
+.gcap{font-size:0.62em;letter-spacing:1px;text-transform:uppercase;color:#778;
+font-family:'Orbitron',monospace;margin-top:2px;white-space:nowrap}
+.gpair{display:flex;flex-direction:column;align-items:center;flex:0 0 auto}
+.gdim{color:#667;font-size:0.8em}
+.gbar{flex:1 1 auto;min-width:36px;height:7px;border-radius:3px;background:#182137;
+border:1px solid #24304d;overflow:hidden;position:relative}
+.gbar i{display:block;height:100%;background:linear-gradient(90deg,#00fff2,#39ff14);
+box-shadow:0 0 7px #00fff2;transition:width 1.2s cubic-bezier(0.4,0,0.2,1)}
+.gbar i.hot{background:linear-gradient(90deg,#ff9500,#ff0044);box-shadow:0 0 7px #ff0044}
+.gdots{display:flex;gap:3px;flex-wrap:wrap;flex:1 1 auto}
+.gdot{width:8px;height:8px;border-radius:50%;background:#2a3450;border:1px solid #37436a}
+.gdot.loaded{background:var(--neon-green);border-color:var(--neon-green);box-shadow:0 0 6px var(--neon-green)}
+.gdot.missing{background:var(--neon-red);border-color:var(--neon-red);box-shadow:0 0 6px var(--neon-red)}
 .route-pill{font-family:'Orbitron',monospace;font-size:0.8em;letter-spacing:1px;padding:5px 12px;
 border-radius:999px;border:1px solid #2a2a4e;background:var(--bg-panel);color:#889}
 .route-pill.live{color:var(--neon-green);border-color:var(--neon-green);box-shadow:0 0 8px rgba(57,255,20,0.25)}
@@ -2654,19 +3003,12 @@ border-radius:999px;border:1px solid #2a2a4e;background:var(--bg-panel);color:#8
 
 <div id="fleet-summary" style="margin:4px 0 14px 0;font-size:0.95em;color:#889">Loading fleet summary...</div>
 
-<div class=card id=ci-queue-card style="padding:12px 15px;margin:12px 0">
-<h3>🚦 CI Queue — armbrain</h3>
-<div id="ci-queue-body"><p style="color:#667;margin:0">Loading CI queue...</p></div>
+<div class=card id=glance-strip style="padding:9px 12px;margin:10px 0">
+<div id="ship-flow" class="ship-flow"><span class="gdim">shipping pipeline…</span></div>
+<div class="gstrip">
+<div class="gcell" id="route-health-body"><span class="gdim">routes…</span></div>
+<div class="gcell" id="fleet-stats-body"><span class="gdim">agents…</span></div>
 </div>
-
-<div class=card id=route-health-card style="padding:12px 15px;margin:12px 0">
-<h3>🛰️ Model Route Health</h3>
-<div id="route-health-body"><p style="color:#667;margin:0">Loading route health...</p></div>
-</div>
-
-<div class=card id=fleet-stats-card style="padding:12px 15px;margin:12px 0">
-<h3>🤖 Agents &amp; Runners</h3>
-<div id="fleet-stats-body"><p style="color:#667;margin:0">Loading fleet stats...</p></div>
 </div>
 
 <div class=card id=monitors><p>Loading...</p></div>
@@ -2715,7 +3057,7 @@ GET  /api/health  - Health check</pre>
 </div>
 
 <script>
-const icons = {gandalf: "🧙", frodo: "🧝", pippin: "🍎", shadowfax: "🐴"};
+const icons = {gandalf: "🧙", frodo: "🧝", pippin: "🍎", shadowfax: "🐴", aragorn: "👑"};
 const fleetIcons = {northfarthing: "🌾", eastfarthing: "🌾", southfarthing: "🌾", westfarthing: "🌾", shadowfax: "🐴", sam: "🌱"};
 
 // Core vs Reserve summary (2026-07-18): 5-of-6 reserve boxes down at any given
@@ -2763,6 +3105,7 @@ function fleetTileHtml(name, n) {
         html += '<div class="ft-stat"><span>&nbsp;</span><b></b></div>';
         html += '<div class="ft-stat"><span>&nbsp;</span><b></b></div>';
     }
+    html += '<div class="ft-routes" id="ft-routes-' + name + '"></div>';
     if (n.can_wake) {
         // Shire boxes: full power control — shutdown / restart / wake
         html += '<div class="ft-btns">';
@@ -2850,6 +3193,58 @@ function fleetPower(node, action) {
 
 function ciQueueNumClass(n) { return n === 0 ? 'zero' : (n <= 3 ? 'warn' : 'hot'); }
 
+function sparkHtml(vals) {
+    if (!vals || !vals.length) return '';
+    const peak = Math.max(1, ...vals);
+    return '<div class="ship-spark">' + vals.map(v =>
+        '<i style="height:' + Math.max(1, Math.round((v / peak) * 11)) + 'px"></i>').join('') + '</div>';
+}
+
+function shipStage(num, cap, cls, sub, spark) {
+    return '<div class="ship-stage"><div class="ship-num ' + (cls || '') + '">' + num + '</div>'
+         + '<div class="ship-cap">' + cap + '</div>'
+         + (sub ? '<div class="ship-sub">' + sub + '</div>' : '')
+         + (spark ? sparkHtml(spark) : '') + '</div>';
+}
+
+// The development pipeline as a left-to-right flow: what is queued, what is in
+// flight, what actually shipped. Ben asked for this shape specifically.
+function refreshShipFlow() {
+    fetch('/api/pipeline').then(r => r.json()).then(d => {
+        const el = document.getElementById('ship-flow');
+        if (!el) return;
+        if (!d.available) {
+            el.innerHTML = '<span class="gdim">shipping pipeline unavailable (GitHub read failed) — stale, not an outage</span>';
+            return;
+        }
+        const ARROW = '<div class="ship-arrow">&#10148;</div>';
+        const ciNum = d.ci_queued + '/' + d.ci_running;
+        const ciCls = d.ci_queued > 5 ? 'hot' : (d.ci_queued > 0 ? 'warn' : 'ok');
+        let deploySub = '';
+        if (d.deploys_in_flight) deploySub = d.deploys_in_flight + ' in flight' + (d.deploy_started_min !== null && d.deploy_started_min !== undefined ? ' · ' + d.deploy_started_min + 'm' : '');
+        else if (d.deploys_failed_today) deploySub = d.deploys_failed_today + ' failed';
+        else if (d.deploys_ok_today) deploySub = 'all landed';
+        let stamp = '--';
+        if (d.last_deploy_at) {
+            const t = new Date(d.last_deploy_at);
+            stamp = t.toLocaleString('en-US', {month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZone: 'America/Chicago'});
+        }
+        el.innerHTML =
+            '<div class="ship-label">🏭 SHIPPING</div>' +
+            shipStage(d.issues_open, 'issues open') + ARROW +
+            shipStage(d.prs_open, 'prs open') + ARROW +
+            shipStage(ciNum, 'ci q/run', ciCls) + ARROW +
+            shipStage(d.merged_today, 'merged today', 'ok', '', d.merged_spark) + ARROW +
+            shipStage(d.deploys_ok_today, 'deployed today', d.deploys_failed_today ? 'hot' : '', deploySub, d.deploys_spark) + ARROW +
+            '<div class="ship-stage"><div class="ship-num stamp">' + stamp + '</div>'
+              + '<div class="ship-cap">last deploy (CT)</div>'
+              + (d.last_deploy_sha ? '<div class="ship-sub">⎇ ' + d.last_deploy_sha + '</div>' : '') + '</div>';
+    }).catch(() => {
+        const el = document.getElementById('ship-flow');
+        if (el) el.innerHTML = '<span class="gdim">shipping pipeline failed to load.</span>';
+    });
+}
+
 function refreshCiQueue() {
     fetch('/api/ci_queue').then(r => r.json()).then(d => {
         const el = document.getElementById('ci-queue-body');
@@ -2866,13 +3261,14 @@ function refreshCiQueue() {
         const orphanDetail = d.orphaned_queued
             ? ' · ' + d.orphaned_queued + ' stale orphan' + (d.orphaned_queued === 1 ? '' : 's') + ' excluded'
             : '';
+        const tip = d.repo + ' — the same queue-depth signal the Shire autoscaler watches'
+                  + (runnerDetail ? ' · ' + runnerDetail : '') + orphanDetail;
         el.innerHTML =
-            '<div class="glance-row">' +
-            '<div class="glance-stat"><div class="glance-num ' + ciQueueNumClass(d.queued) + '">' + d.queued + '</div><div class="glance-label">Queued</div></div>' +
-            '<div class="glance-stat"><div class="glance-num">' + running + '</div><div class="glance-label">' + runningLabel + '</div></div>' +
-            '<div style="color:#667;font-size:0.85em">' + d.repo + ' — the same queue-depth signal the Shire autoscaler watches' +
-            (runnerDetail ? ' · ' + runnerDetail : '') + orphanDetail + '</div>' +
-            '</div>';
+            '<span class="gicon" title="CI queue">🚦</span>' +
+            '<div class="gpair"><div class="gnum ' + ciQueueNumClass(d.queued) + '">' + d.queued + '</div><div class="gcap">queued</div></div>' +
+            '<div class="gpair"><div class="gnum ok">' + running + '</div><div class="gcap">' + (runningLabel === 'Running Jobs' ? 'running' : 'runs') + '</div></div>' +
+            '<div class="gbar" title="' + tip + '"><i class="' + (d.queued > 5 ? 'hot' : '') + '" style="width:' +
+                Math.min(100, (d.queued + running) === 0 ? 0 : (running / Math.max(1, running + d.queued)) * 100) + '%"></i></div>';
     }).catch(() => {
         const el = document.getElementById('ci-queue-body');
         if (el) el.innerHTML = '<p class="glance-unavailable">CI queue check failed to load.</p>';
@@ -2888,17 +3284,38 @@ function refreshRouteHealth() {
             return;
         }
         const missing = d.routes.filter(r => !r.live);
-        let html = '<div class="route-pills">';
-        d.routes.forEach(r => {
-            html += '<span class="route-pill ' + (r.live ? 'live' : 'missing') + '">' + (r.live ? '● ' : '✕ ') + r.name + '</span>';
+        const loaded = d.routes.filter(r => r.loaded);
+
+        // The pills themselves live on each machine's own card now (Ben,
+        // 2026-07-29: "move the coding pathways down to the machine they are
+        // running on"). This panel keeps only the fleet-wide summary so a
+        // route vanishing on a DARK box is still visible somewhere.
+        const byBox = {};
+        d.routes.forEach(r => { (byBox[r.box] = byBox[r.box] || []).push(r); });
+        Object.keys(byBox).forEach(box => {
+            const slot = document.getElementById('routes-' + box) || document.getElementById('ft-routes-' + box);
+            if (!slot) return;
+            const pills = byBox[box].map(r => {
+                const cls = !r.live ? 'missing' : (r.loaded ? 'loaded' : 'idle');
+                const mark = !r.live ? '✕ ' : (r.loaded ? '● ' : '○ ');
+                const tip = !r.live ? 'route MISSING from the gateway'
+                          : (r.loaded ? r.model + ' loaded in memory'
+                                      : r.model + ' configured, not loaded right now');
+                return '<span class="card-route ' + cls + '" title="' + tip + '">' + mark + r.name + '</span>';
+            }).join('');
+            if (slot.dataset.lastVal !== pills) { slot.dataset.lastVal = pills; slot.innerHTML = pills; }
         });
-        html += '</div>';
-        if (missing.length) {
-            html += '<p style="margin:8px 0 0 0;color:var(--neon-red)">' + missing.length + ' local route(s) MISSING: ' + missing.map(r => r.name).join(', ') + '</p>';
-        } else {
-            html += '<p style="margin:8px 0 0 0;color:#667;font-size:0.85em">' + d.routes.length + '/' + d.routes.length + ' local routes live</p>';
-        }
-        el.innerHTML = html;
+
+        const dots = d.routes.map(r => {
+            const cls = !r.live ? 'missing' : (r.loaded ? 'loaded' : '');
+            const state = !r.live ? 'MISSING from gateway' : (r.loaded ? 'loaded in memory' : 'configured, not loaded');
+            return '<span class="gdot ' + cls + '" title="' + r.name + ' (' + r.box + ') — ' + state + '"></span>';
+        }).join('');
+        el.innerHTML =
+            '<span class="gicon" title="Local model routes">🛰️</span>' +
+            '<div class="gpair"><div class="gnum ' + (missing.length ? 'hot' : 'ok') + '">' + loaded.length + '/' + d.routes.length + '</div>' +
+            '<div class="gcap">' + (missing.length ? missing.length + ' missing' : 'loaded') + '</div></div>' +
+            '<div class="gdots" title="one dot per local route — green = model in memory">' + dots + '</div>';
     }).catch(() => {
         const el = document.getElementById('route-health-body');
         if (el) el.innerHTML = '<p class="glance-unavailable">Model route check failed to load.</p>';
@@ -2954,20 +3371,21 @@ function refreshFleetStats() {
         const agentDetail = Object.entries(a.boxes).map(([n, v]) =>
             n + ' ' + (v === null || v === undefined ? '?' : v)).join(' · ');
         const r = d.runners || {};
-        let html = '<div class="glance-row">';
-        html += '<div class="glance-stat"><div class="glance-num">' + a.total + '</div><div class="glance-label">CLI Agents</div></div>';
-        if (r.available) {
-            const f = r.fleet || {busy: 0, total: 0, online: 0};
-            const cls = (f.online > 0 && f.busy >= f.online) ? 'hot' : (f.busy > 0 ? '' : 'zero');
-            html += '<div class="glance-stat"><div class="glance-num ' + cls + '">' + f.busy + '/' + f.total + '</div><div class="glance-label">Runners Busy</div></div>';
+        const f = (r.available ? (r.fleet || {busy: 0, total: 0, online: 0}) : null);
+        const runnerDetail = r.available
+            ? Object.entries(r.boxes).map(([n, b]) => n + ' ' + b.busy + '/' + b.total).join(' · ')
+            : 'runner counts unavailable (gh / GitHub API failed) — stale read, not an outage';
+        let html = '<span class="gicon" title="agents: ' + agentDetail + '">🤖</span>'
+                 + '<div class="gpair"><div class="gnum">' + a.total + '</div><div class="gcap">agents</div></div>';
+        if (f) {
+            const pct = f.total > 0 ? (f.busy / f.total) * 100 : 0;
+            const hot = (f.online > 0 && f.busy >= f.online);
+            html += '<div class="gpair"><div class="gnum ' + (hot ? 'hot' : (f.busy ? 'warn' : 'ok')) + '">'
+                 + f.busy + '/' + f.total + '</div><div class="gcap">runners</div></div>'
+                 + '<div class="gbar" title="' + runnerDetail + '"><i class="' + (hot ? 'hot' : '') + '" style="width:' + pct + '%"></i></div>';
+        } else {
+            html += '<span class="gdim" title="' + runnerDetail + '">runners ?</span>';
         }
-        html += '<div style="color:#667;font-size:0.85em;line-height:1.6">'
-             + '<b style="color:#889">agents:</b> ' + agentDetail
-             + '<br><b style="color:#889">runners:</b> '
-             + (r.available
-                ? Object.entries(r.boxes).map(([n, b]) => n + ' ' + b.busy + '/' + b.total).join(' · ')
-                : '<span class="glance-unavailable">unavailable right now (gh / GitHub API failed) — stale read, not necessarily an outage</span>')
-             + '</div></div>';
         el.innerHTML = html;
     }).catch(() => {
         const el = document.getElementById('fleet-stats-body');
@@ -2993,8 +3411,8 @@ function loadedModelsHtml(lm) {
     return lm.models.map(model =>
         '<b>● ' + model.name + '</b> <span class="tps">' +
         (model.vram_gb === null || model.vram_gb === undefined ? 'measuring…' : model.vram_gb.toFixed(1) + ' GB') +
-        '</span>'
-    ).join(' · ');
+        '</span>' + (model.where ? ' <span class="dim">on ' + model.where + '</span>' : '')
+    ).join('<br>');
 }
 
 // Label + thin bar + value, all on ONE line (compact card layout).
@@ -3069,7 +3487,35 @@ function getSwapColor(percent) {
     return '#ff0044';
 }
 
-function renderGauge(value, min, max, label, unit, showLimit, size, reverseColors, id) {
+function peakMarkerHtml(peakValue, min, max, size, id) {
+    // A thin tick parked at today's high-water mark. Only the outer ~28% of the
+    // bar is painted, so it reads as a mark ON the arc, not a second needle.
+    const s = size || 1;
+    const h = Math.round(44 * s);
+    const w = Math.max(2, Math.round(2.5 * s));
+    const has = peakValue !== null && peakValue !== undefined;
+    const pct = has ? Math.max(0, Math.min(100, ((peakValue - min) / (max - min)) * 100)) : 0;
+    const angle = -90 + (pct * 1.8);
+    return '<div class="gauge-peak" id="' + id + '" title="Peak today"' +
+        ' style="width:' + w + 'px;height:' + h + 'px;margin-left:' + (-w / 2) + 'px;' +
+        'transform:rotate(' + angle + 'deg);opacity:' + (has ? 0.95 : 0) + ';' +
+        'background:linear-gradient(to top,transparent 0%,transparent 72%,#fff 72%,#fff 100%)"></div>';
+}
+
+function updatePeakMarker(id, peakValue, min, max) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const has = peakValue !== null && peakValue !== undefined;
+    const pct = has ? Math.max(0, Math.min(100, ((peakValue - min) / (max - min)) * 100)) : 0;
+    const angle = -90 + (pct * 1.8);
+    const key = has ? String(angle) : 'none';
+    if (el.dataset.lastVal === key) return;
+    el.dataset.lastVal = key;
+    el.style.opacity = has ? 0.95 : 0;
+    el.style.transform = 'rotate(' + angle + 'deg)';
+}
+
+function renderGauge(value, min, max, label, unit, showLimit, size, reverseColors, id, peakValue) {
     const s = size || 1;
     const w = Math.round(100 * s);
     const h = Math.round(50 * s);
@@ -3106,6 +3552,7 @@ function renderGauge(value, min, max, label, unit, showLimit, size, reverseColor
         '<div class="gauge-bg" style="background:' + gradient + '"></div>' +
         '<div class="gauge-mask"></div>' +
         '<div class="gauge-needle" style="width:' + needleW + 'px;height:' + needleH + 'px;margin-left:' + (-needleW/2) + 'px;transform:rotate(' + angle + 'deg);background:linear-gradient(to top,#fff 0%,#fff 60%,' + color + ' 100%)"></div>' +
+        (peakValue !== undefined ? peakMarkerHtml(peakValue, min, max, s, gaugeId + '-peak') : '') +
         '<div class="gauge-center" style="width:' + centerSize + 'px;height:' + centerSize + 'px;margin-left:' + (-centerSize/2) + 'px;border-color:' + color + '"></div>' +
         '</div>' +
         '<div class="gauge-label">' + label + '</div>' +
@@ -3301,7 +3748,7 @@ function refresh() {
 
                 const isMac = info.os === 'mac';
 
-                const isModelBox = (name === 'gandalf' || name === 'frodo');
+                const isModelBox = ['gandalf', 'frodo', 'pippin', 'aragorn'].includes(name);
                 html += '<div class="gpu-card compact' + (isModelBox ? ' has-tps' : '') + '" id="card-' + name + '">';
                 // Two-band tokens/sec strip in place of the flat accent line.
                 if (isModelBox) {
@@ -3321,14 +3768,15 @@ function refresh() {
                 html += '</div></div>';
 
                 const maxUtil = (info.max_util_today === null || info.max_util_today === undefined) ? '--' : info.max_util_today;
-                if (maxUtil !== '--') {
-                    html += '<div class="peak-inline" id="maxutil-' + name + '">' + maxUtil + '% max utilization today</div>';
-                }
+                // The old "99% max utilization today" text line is gone - that
+                // number is now the peak-hold tick on the GPU dial itself.
+
+                html += '<div class="card-routes" id="routes-' + name + '"></div>';
 
                 if (info.online && isMac) {
                     // COMPACT: one dial strip, then inline micro-bars.
                     html += '<div class="dial-strip">';
-                    html += renderGauge(info.gpu_util, 0, 100, "GPU", "%", false, 0.7, true, 'util-' + name);
+                    html += renderGauge(info.gpu_util, 0, 100, "GPU", "%", false, 0.7, true, 'util-' + name, info.max_util_today);
                     html += renderGauge(info.cpu_percent, 0, 100, "CPU", "%", false, 0.7, false, 'cpu-' + name);
                     const swapPct = info.swap ? info.swap.percent : 0;
                     html += renderSwapGauge(swapPct, 100, 0.7, 'swap-' + name);
@@ -3346,11 +3794,17 @@ function refresh() {
                                         'disk-label-' + name, diskUsed + ' / ' + diskTotal);
                     }
 
+                    if (isModelBox) {
+                        html += '<div class="serving-line">';
+                        html += '<div id="loaded-models-' + name + '">' + loadedModelsHtml(info.loaded_models) + '</div>';
+                        html += '<div id="serving-' + name + '"></div>';
+                        html += '</div>';
+                    }
                     html += '<div class="card-foot"><span>Apple M1 Max · 64GB Unified · 32-core GPU</span></div>';
                 } else if (info.online && info.gpu) {
                     // COMPACT: all five vitals in ONE dial row.
                     html += '<div class="dial-strip">';
-                    html += renderGauge(info.gpu_util, 0, 100, "GPU", "%", false, 0.7, true, 'util-' + name);
+                    html += renderGauge(info.gpu_util, 0, 100, "GPU", "%", false, 0.7, true, 'util-' + name, info.max_util_today);
                     html += renderGauge(info.gpu_watts, 0, info.gpu_power_max, "POWER", "W", false, 0.7, false, 'power-' + name);
                     html += renderGauge(info.gpu_temp, 24, 90, "TEMP", "°C", false, 0.7, false, 'temp-' + name);
                     html += renderGauge(info.cpu_percent, 0, 100, "CPU", "%", false, 0.7, false, 'cpu-' + name);
@@ -3374,10 +3828,10 @@ function refresh() {
                     }
 
                     // Loaded model + tokens/sec, one line each (was 2 gauges + a block)
-                    if (name === 'gandalf' || name === 'frodo') {
+                    if (isModelBox || info.loaded_models) {
                         html += '<div class="serving-line">';
                         html += '<div id="loaded-models-' + name + '">' + loadedModelsHtml(info.loaded_models) + '</div>';
-                        html += '<div id="serving-' + name + '"></div>';
+                        if (isModelBox) html += '<div id="serving-' + name + '"></div>';
                         html += '</div>';
                     }
 
@@ -3442,13 +3896,14 @@ function refresh() {
             // UPDATE PATH: Just update values in place
             for (const [name, info] of Object.entries(targets)) {
                 // Update max utilization today
-                const maxUtilEl = document.getElementById('maxutil-' + name);
-                if (maxUtilEl) {
-                    const maxUtil = (info.max_util_today === null || info.max_util_today === undefined) ? '--' : info.max_util_today;
-                    maxUtilEl.textContent = maxUtil + '% max utilization today';
-                }
+                updatePeakMarker('util-' + name + '-peak', info.max_util_today, 0, 100);
 
                 if (info.online && info.os === 'mac') {
+                    const lmEl = document.getElementById('loaded-models-' + name);
+                    if (lmEl) {
+                        const lmHtml = loadedModelsHtml(info.loaded_models);
+                        if (lmEl.dataset.lastVal !== lmHtml) { lmEl.dataset.lastVal = lmHtml; lmEl.innerHTML = lmHtml; }
+                    }
                     updateGauge('util-' + name, info.gpu_util, 0, 100, '%', false, getUtilColor);
                     updateGauge('cpu-' + name, info.cpu_percent, 0, 100, '%', false, getNormalColor);
                     const swapPct = info.swap ? info.swap.percent : 0;
@@ -3676,7 +4131,7 @@ function refreshEnergy() {
 
 // --- Polling control: pause everything when the tab isn't visible, resume ---
 // --- with an immediate refresh when it becomes visible again.              ---
-let statusTimer = null, fleetTimer = null, historyTimer = null, energyTimer = null, ciQueueTimer = null, routeHealthTimer = null, fleetStatsTimer = null, modelServingTimer = null;
+let statusTimer = null, fleetTimer = null, historyTimer = null, energyTimer = null, ciQueueTimer = null, routeHealthTimer = null, fleetStatsTimer = null, modelServingTimer = null, shipFlowTimer = null;
 
 function startPolling() {
     if (!statusTimer) statusTimer = setInterval(refresh, 12000);     // queue/GPU state: 12s
@@ -3684,6 +4139,7 @@ function startPolling() {
     if (!historyTimer) historyTimer = setInterval(refreshHistory, 60000);
     if (!energyTimer) energyTimer = setInterval(refreshEnergy, 60000);
     if (!ciQueueTimer) ciQueueTimer = setInterval(refreshCiQueue, 45000);        // matches backend cache TTL
+    if (!shipFlowTimer) shipFlowTimer = setInterval(refreshShipFlow, 120000);    // /api/pipeline is cached 5 min
     if (!routeHealthTimer) routeHealthTimer = setInterval(refreshRouteHealth, 30000);
     if (!fleetStatsTimer) fleetStatsTimer = setInterval(refreshFleetStats, 60000); // matches backend cache TTL
     if (!modelServingTimer) modelServingTimer = setInterval(refreshModelServing, 60000); // matches sampler cadence
@@ -3695,6 +4151,7 @@ function stopPolling() {
     clearInterval(historyTimer); historyTimer = null;
     clearInterval(energyTimer); energyTimer = null;
     clearInterval(ciQueueTimer); ciQueueTimer = null;
+    clearInterval(shipFlowTimer); shipFlowTimer = null;
     clearInterval(routeHealthTimer); routeHealthTimer = null;
     clearInterval(fleetStatsTimer); fleetStatsTimer = null;
     clearInterval(modelServingTimer); modelServingTimer = null;
@@ -3710,6 +4167,7 @@ document.addEventListener('visibilitychange', () => {
         refreshHistory();
         refreshEnergy();
         refreshCiQueue();
+        refreshShipFlow();
         refreshRouteHealth();
         refreshFleetStats();
         refreshModelServing();
@@ -3722,6 +4180,7 @@ refreshHistory();
 refreshEnergy();
 refreshFleet();
 refreshCiQueue();
+refreshShipFlow();
 refreshRouteHealth();
 refreshFleetStats();
 // first serving refresh waits for the target cards (built by refresh()) to exist
