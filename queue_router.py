@@ -2403,6 +2403,7 @@ def get_status():
     today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
     jobs_today = {}
     max_util_today = {}
+    peaks_today = {}
     recent_jobs = []
     conn = None
     try:
@@ -2419,6 +2420,21 @@ def get_status():
             (today_start,)
         )
         max_util_today = {row[0]: row[1] for row in cursor.fetchall()}
+
+        # Daily high-water mark for EVERY metric, not just GPU use (Ben,
+        # 2026-07-30: he wants the amplifier-style peak-hold marker on all the
+        # dials and bars). Every column is already recorded per poll.
+        cursor = conn.execute(
+            "SELECT target, MAX(gpu_temp), MAX(gpu_watts), MAX(cpu_percent), "
+            "MAX(vram_percent), MAX(ram_percent), MAX(swap_percent) "
+            "FROM metrics_history WHERE timestamp >= ? GROUP BY target",
+            (today_start,)
+        )
+        for row in cursor.fetchall():
+            peaks_today[row[0]] = {
+                "gpu_temp": row[1], "gpu_watts": row[2], "cpu_percent": row[3],
+                "vram_percent": row[4], "ram_percent": row[5], "swap_percent": row[6],
+            }
 
         cursor = conn.execute(
             "SELECT id, target, status, submitted_at FROM jobs ORDER BY submitted_at DESC LIMIT 10"
@@ -2437,6 +2453,7 @@ def get_status():
         targets_status[name]["jobs_today"] = jobs_today.get(name, 0)
         v = max_util_today.get(name)
         targets_status[name]["max_util_today"] = round(v) if v is not None else None
+        targets_status[name]["peaks_today"] = peaks_today.get(name, {})
 
     return jsonify({
         "targets": targets_status,
@@ -2874,7 +2891,13 @@ font-family:'Orbitron',monospace;font-weight:bold;box-shadow:0 0 10px var(--neon
 .gauge-mask{position:absolute;bottom:0;left:10%;width:80%;height:80%;background:var(--bg-card);border-radius:999px 999px 0 0}
 .gauge-needle{position:absolute;bottom:0;left:50%;background:linear-gradient(to top,#fff 0%,#fff 60%,var(--neon-cyan) 100%);transform-origin:bottom center;transition:transform 1.5s cubic-bezier(0.4,0,0.2,1);border-radius:2px}
 .gauge-peak{position:absolute;bottom:0;left:50%;transform-origin:bottom center;
-border-radius:1px;transition:transform 1.5s cubic-bezier(0.4,0,0.2,1);pointer-events:none;z-index:3}
+border-radius:1px;transition:transform 1.5s cubic-bezier(0.4,0,0.2,1);pointer-events:none;z-index:4;
+filter:drop-shadow(0 0 3px #ff00ff)}
+/* Peak-hold on the bars too: a bright vertical tick parked at today's max. */
+.progress-bar{position:relative}
+.bar-peak{position:absolute;top:-1px;bottom:-1px;width:2px;background:#ff2bd6;
+box-shadow:0 0 6px #ff00ff,0 0 2px #fff;z-index:3;pointer-events:none;
+transition:left 1.5s cubic-bezier(0.4,0,0.2,1)}
 .gauge-center{position:absolute;bottom:-5px;left:50%;background:#0a0a0f;border:2px solid var(--neon-cyan);border-radius:50%;transition:border-color 0.8s}
 .gauge-label{font-family:'Orbitron',monospace;font-size:0.85em;color:#888;margin-top:8px;
 letter-spacing:2px;text-transform:uppercase}
@@ -3393,11 +3416,26 @@ function refreshFleetStats() {
     });
 }
 
-function progressBar(percent, cls, id) {
+function progressBar(percent, cls, id, peakPct) {
     let barClass = cls;
     if (percent > 90) barClass = 'progress-red';
     else if (percent > 70) barClass = 'progress-yellow';
-    return '<div class="progress-bar"><div id="' + id + '" class="progress-fill ' + barClass + '" data-percent="' + percent + '" style="width:' + percent + '%"></div></div>';
+    const peak = (peakPct === null || peakPct === undefined)
+        ? ''
+        : '<div class="bar-peak" id="' + id + '-peak" title="Peak today: ' + Math.round(peakPct) + '%" style="left:' + Math.max(0, Math.min(100, peakPct)) + '%"></div>';
+    return '<div class="progress-bar"><div id="' + id + '" class="progress-fill ' + barClass + '" data-percent="' + percent + '" style="width:' + percent + '%"></div>' + peak + '</div>';
+}
+
+function updateBarPeak(id, peakPct) {
+    const el = document.getElementById(id + '-peak');
+    if (!el) return;
+    if (peakPct === null || peakPct === undefined) { el.style.display = 'none'; return; }
+    const v = Math.max(0, Math.min(100, peakPct));
+    if (el.dataset.lastVal === String(v)) return;
+    el.dataset.lastVal = String(v);
+    el.style.display = '';
+    el.style.left = v + '%';
+    el.title = 'Peak today: ' + Math.round(peakPct) + '%';
 }
 
 // COMPACT (2026-07-29): one line, not a titled block.
@@ -3416,9 +3454,9 @@ function loadedModelsHtml(lm) {
 }
 
 // Label + thin bar + value, all on ONE line (compact card layout).
-function miniRow(label, percent, cls, barId, labelId, valueText) {
+function miniRow(label, percent, cls, barId, labelId, valueText, peakPct) {
     return '<div class="mini-row"><span class="mini-label">' + label + '</span>' +
-        progressBar(percent, cls, barId) +
+        progressBar(percent, cls, barId, peakPct) +
         '<span class="mini-val" id="' + labelId + '">' + valueText + '</span></div>';
 }
 
@@ -3491,15 +3529,15 @@ function peakMarkerHtml(peakValue, min, max, size, id) {
     // A thin tick parked at today's high-water mark. Only the outer ~28% of the
     // bar is painted, so it reads as a mark ON the arc, not a second needle.
     const s = size || 1;
-    const h = Math.round(44 * s);
-    const w = Math.max(2, Math.round(2.5 * s));
+    const h = Math.round(52 * s);   // past the arc's outer rim, per Ben
+    const w = Math.max(3, Math.round(3.5 * s));
     const has = peakValue !== null && peakValue !== undefined;
     const pct = has ? Math.max(0, Math.min(100, ((peakValue - min) / (max - min)) * 100)) : 0;
     const angle = -90 + (pct * 1.8);
     return '<div class="gauge-peak" id="' + id + '" title="Peak today"' +
         ' style="width:' + w + 'px;height:' + h + 'px;margin-left:' + (-w / 2) + 'px;' +
         'transform:rotate(' + angle + 'deg);opacity:' + (has ? 0.95 : 0) + ';' +
-        'background:linear-gradient(to top,transparent 0%,transparent 72%,#fff 72%,#fff 100%)"></div>';
+        'background:linear-gradient(to top,transparent 0%,transparent 55%,#ff2bd6 55%,#ff2bd6 100%)"></div>';
 }
 
 function updatePeakMarker(id, peakValue, min, max) {
@@ -3559,7 +3597,7 @@ function renderGauge(value, min, max, label, unit, showLimit, size, reverseColor
         '<div class="gauge-value" style="color:' + color + ';text-shadow:0 0 10px ' + color + '">' + displayValue + '</div></div>';
 }
 
-function renderSwapGauge(value, max, size, id) {
+function renderSwapGauge(value, max, size, id, peakValue) {
     // Swap uses different color logic
     let color;
     if (value === 0) { color = '#39ff14'; }
@@ -3586,6 +3624,7 @@ function renderSwapGauge(value, max, size, id) {
         '<div class="gauge-bg" style="background:' + gradient + '"></div>' +
         '<div class="gauge-mask"></div>' +
         '<div class="gauge-needle" style="width:' + needleW + 'px;height:' + needleH + 'px;margin-left:' + (-needleW/2) + 'px;transform:rotate(' + angle + 'deg);background:linear-gradient(to top,#fff 0%,#fff 60%,' + color + ' 100%)"></div>' +
+        (peakValue !== undefined ? peakMarkerHtml(peakValue, 0, max, s, gaugeId + '-peak') : '') +
         '<div class="gauge-center" style="width:' + centerSize + 'px;height:' + centerSize + 'px;margin-left:' + (-centerSize/2) + 'px;border-color:' + color + '"></div>' +
         '</div>' +
         '<div class="gauge-label">SWAP</div>' +
@@ -3775,16 +3814,17 @@ function refresh() {
 
                 if (info.online && isMac) {
                     // COMPACT: one dial strip, then inline micro-bars.
+                    const pk = info.peaks_today || {};
                     html += '<div class="dial-strip">';
                     html += renderGauge(info.gpu_util, 0, 100, "GPU", "%", false, 0.7, true, 'util-' + name, info.max_util_today);
-                    html += renderGauge(info.cpu_percent, 0, 100, "CPU", "%", false, 0.7, false, 'cpu-' + name);
+                    html += renderGauge(info.cpu_percent, 0, 100, "CPU", "%", false, 0.7, false, 'cpu-' + name, pk.cpu_percent);
                     const swapPct = info.swap ? info.swap.percent : 0;
-                    html += renderSwapGauge(swapPct, 100, 0.7, 'swap-' + name);
+                    html += renderSwapGauge(swapPct, 100, 0.7, 'swap-' + name, pk.swap_percent);
                     html += '</div>';
 
                     if (info.ram) {
                         html += miniRow('MEM', info.ram.percent, 'progress-ram', 'ram-' + name,
-                                        'ram-label-' + name, info.ram.used_gb + ' / ' + info.ram.total_gb + ' GB');
+                                        'ram-label-' + name, info.ram.used_gb + ' / ' + info.ram.total_gb + ' GB', pk.ram_percent);
                     }
 
                     if (info.disk) {
@@ -3803,21 +3843,22 @@ function refresh() {
                     html += '<div class="card-foot"><span>Apple M1 Max · 64GB Unified · 32-core GPU</span></div>';
                 } else if (info.online && info.gpu) {
                     // COMPACT: all five vitals in ONE dial row.
+                    const pk = info.peaks_today || {};
                     html += '<div class="dial-strip">';
                     html += renderGauge(info.gpu_util, 0, 100, "GPU", "%", false, 0.7, true, 'util-' + name, info.max_util_today);
-                    html += renderGauge(info.gpu_watts, 0, info.gpu_power_max, "POWER", "W", false, 0.7, false, 'power-' + name);
-                    html += renderGauge(info.gpu_temp, 24, 90, "TEMP", "°C", false, 0.7, false, 'temp-' + name);
-                    html += renderGauge(info.cpu_percent, 0, 100, "CPU", "%", false, 0.7, false, 'cpu-' + name);
+                    html += renderGauge(info.gpu_watts, 0, info.gpu_power_max, "POWER", "W", false, 0.7, false, 'power-' + name, pk.gpu_watts);
+                    html += renderGauge(info.gpu_temp, 24, 90, "TEMP", "°C", false, 0.7, false, 'temp-' + name, pk.gpu_temp);
+                    html += renderGauge(info.cpu_percent, 0, 100, "CPU", "%", false, 0.7, false, 'cpu-' + name, pk.cpu_percent);
                     const swapPct = info.swap ? info.swap.percent : 0;
-                    html += renderSwapGauge(swapPct, 100, 0.7, 'swap-' + name);
+                    html += renderSwapGauge(swapPct, 100, 0.7, 'swap-' + name, pk.swap_percent);
                     html += '</div>';
 
                     html += miniRow('VRAM', info.gpu.vram_percent, 'progress-vram', 'vram-' + name,
-                                    'vram-label-' + name, info.gpu.vram_used_gb + ' / ' + info.gpu.vram_total_gb + ' GB');
+                                    'vram-label-' + name, info.gpu.vram_used_gb + ' / ' + info.gpu.vram_total_gb + ' GB', pk.vram_percent);
 
                     if (info.ram) {
                         html += miniRow('RAM', info.ram.percent, 'progress-ram', 'ram-' + name,
-                                        'ram-label-' + name, info.ram.used_gb + ' / ' + info.ram.total_gb + ' GB');
+                                        'ram-label-' + name, info.ram.used_gb + ' / ' + info.ram.total_gb + ' GB', pk.ram_percent);
                     }
 
                     if (info.disk) {
@@ -3852,16 +3893,17 @@ function refresh() {
                 } else if (info.online) {
                     // Online box with no readable GPU (e.g. aragorn before its
                     // nvidia driver is installed). Same compact shape, CPU vitals.
+                    const pk = info.peaks_today || {};
                     html += '<div class="dial-strip">';
-                    html += renderGauge(info.cpu_percent, 0, 100, "CPU", "%", false, 0.7, false, 'cpu-' + name);
-                    html += renderGauge(info.cpu_temp, 24, 90, "TEMP", "°C", false, 0.7, false, 'temp-' + name);
+                    html += renderGauge(info.cpu_percent, 0, 100, "CPU", "%", false, 0.7, false, 'cpu-' + name, pk.cpu_percent);
+                    html += renderGauge(info.cpu_temp, 24, 90, "TEMP", "°C", false, 0.7, false, 'temp-' + name, pk.gpu_temp);
                     const swapPct = info.swap ? info.swap.percent : 0;
-                    html += renderSwapGauge(swapPct, 100, 0.7, 'swap-' + name);
+                    html += renderSwapGauge(swapPct, 100, 0.7, 'swap-' + name, pk.swap_percent);
                     html += '</div>';
 
                     if (info.ram) {
                         html += miniRow('RAM', info.ram.percent, 'progress-ram', 'ram-' + name,
-                                        'ram-label-' + name, info.ram.used_gb + ' / ' + info.ram.total_gb + ' GB');
+                                        'ram-label-' + name, info.ram.used_gb + ' / ' + info.ram.total_gb + ' GB', pk.ram_percent);
                     }
                     if (info.disk) {
                         const diskUsed = info.disk.total_gb >= 1000 ? (info.disk.used_gb / 1024).toFixed(1) + ' TB' : info.disk.used_gb + ' GB';
@@ -3908,6 +3950,11 @@ function refresh() {
                     updateGauge('cpu-' + name, info.cpu_percent, 0, 100, '%', false, getNormalColor);
                     const swapPct = info.swap ? info.swap.percent : 0;
                     updateGauge('swap-' + name, swapPct, 0, 100, '%', false, getSwapColor);
+                    const pk = info.peaks_today || {};
+                    updatePeakMarker('cpu-' + name + '-peak', pk.cpu_percent, 0, 100);
+                    updatePeakMarker('swap-' + name + '-peak', pk.swap_percent, 0, 100);
+                    updateBarPeak('ram-' + name, pk.ram_percent);
+                    updateBarPeak('disk-' + name, null);
 
                     if (info.ram) {
                         updateProgressBar('ram-' + name, info.ram.percent, 'progress-ram');
@@ -3931,6 +3978,14 @@ function refresh() {
                     updateGauge('cpu-' + name, info.cpu_percent, 0, 100, '%', false, getNormalColor);
                     const swapPct = info.swap ? info.swap.percent : 0;
                     updateGauge('swap-' + name, swapPct, 0, 100, '%', false, getSwapColor);
+                    // Peak-hold marks: today's high-water mark on every dial and bar.
+                    const pk = info.peaks_today || {};
+                    updatePeakMarker('power-' + name + '-peak', pk.gpu_watts, 0, info.gpu_power_max);
+                    updatePeakMarker('temp-' + name + '-peak', pk.gpu_temp, 24, 90);
+                    updatePeakMarker('cpu-' + name + '-peak', pk.cpu_percent, 0, 100);
+                    updatePeakMarker('swap-' + name + '-peak', pk.swap_percent, 0, 100);
+                    updateBarPeak('vram-' + name, pk.vram_percent);
+                    updateBarPeak('ram-' + name, pk.ram_percent);
 
                     // Update progress bars
                     updateProgressBar('vram-' + name, info.gpu.vram_percent, 'progress-vram');
