@@ -18,7 +18,7 @@ import paramiko
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 from datetime import datetime, timedelta
 from pathlib import Path
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 
 # Pushover notification settings
@@ -2493,6 +2493,20 @@ def api_ci_queue():
     """Queued/running GitHub Actions counts for armbrain-io/armbrain (cached)."""
     return jsonify(get_ci_queue_status())
 
+@app.route("/armbrain-logo.svg", methods=["GET"])
+def armbrain_logo():
+    """The real Armbrain mark, recoloured in the brand's own indigo/coral.
+    Lives next to this file on purpose - the original is in an armbrain
+    worktree that can be deleted at any time."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "armbrain-logo.svg")
+    try:
+        with open(path) as fh:
+            return Response(fh.read(), mimetype="image/svg+xml",
+                            headers={"Cache-Control": "public, max-age=86400"})
+    except OSError:
+        return Response("", status=404)
+
+
 @app.route("/api/model_serving", methods=["GET"])
 def api_model_serving():
     """Tokens/sec dials (now + today-while-serving) and requests served
@@ -2892,11 +2906,11 @@ font-family:'Orbitron',monospace;font-weight:bold;box-shadow:0 0 10px var(--neon
 .gauge-needle{position:absolute;bottom:0;left:50%;background:linear-gradient(to top,#fff 0%,#fff 60%,var(--neon-cyan) 100%);transform-origin:bottom center;transition:transform 1.5s cubic-bezier(0.4,0,0.2,1);border-radius:2px}
 .gauge-peak{position:absolute;bottom:0;left:50%;transform-origin:bottom center;
 border-radius:1px;transition:transform 1.5s cubic-bezier(0.4,0,0.2,1);pointer-events:none;z-index:4;
-filter:drop-shadow(0 0 3px #ff00ff)}
+filter:drop-shadow(0 0 3px #ffb000)}
 /* Peak-hold on the bars too: a bright vertical tick parked at today's max. */
 .progress-bar{position:relative}
-.bar-peak{position:absolute;top:-1px;bottom:-1px;width:2px;background:#ff2bd6;
-box-shadow:0 0 6px #ff00ff,0 0 2px #fff;z-index:3;pointer-events:none;
+.bar-peak{position:absolute;top:-1px;bottom:-1px;width:2px;background:#fff8e1;
+box-shadow:0 0 6px #ffb000,0 0 2px #fff;z-index:3;pointer-events:none;
 transition:left 1.5s cubic-bezier(0.4,0,0.2,1)}
 .gauge-center{position:absolute;bottom:-5px;left:50%;background:#0a0a0f;border:2px solid var(--neon-cyan);border-radius:50%;transition:border-color 0.8s}
 .gauge-label{font-family:'Orbitron',monospace;font-size:0.85em;color:#888;margin-top:8px;
@@ -2976,7 +2990,9 @@ box-shadow:0 0 7px rgba(255,0,68,0.3)}
 /* One-row glance strip: CI queue + route health + agents, ~1/3 the height of
    the three cards it replaced (Ben, 2026-07-29). Numbers big, words small. */
 .ship-flow{display:flex;align-items:stretch;gap:0;flex-wrap:wrap;margin:0 0 9px 0}
-.ship-label{display:flex;align-items:center;gap:7px;font-family:'Orbitron',monospace;
+.ship-logo{width:30px;height:30px;display:block;margin:0 auto 3px auto;
+filter:drop-shadow(0 0 6px rgba(99,102,241,0.75))}
+.ship-label{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:0;font-family:'Orbitron',monospace;
 font-size:0.72em;letter-spacing:2px;color:var(--neon-cyan);text-shadow:0 0 8px var(--neon-cyan);
 padding-right:12px;white-space:nowrap}
 .ship-stage{background:rgba(255,255,255,0.025);border:1px solid #1e2942;border-radius:7px;
@@ -3223,8 +3239,8 @@ function sparkHtml(vals) {
         '<i style="height:' + Math.max(1, Math.round((v / peak) * 11)) + 'px"></i>').join('') + '</div>';
 }
 
-function shipStage(num, cap, cls, sub, spark) {
-    return '<div class="ship-stage"><div class="ship-num ' + (cls || '') + '">' + num + '</div>'
+function shipStage(num, cap, cls, sub, spark, help) {
+    return '<div class="ship-stage"' + (help ? ' title="' + help.replace(/"/g, '') + '"' : '') + '><div class="ship-num ' + (cls || '') + '">' + num + '</div>'
          + '<div class="ship-cap">' + cap + '</div>'
          + (sub ? '<div class="ship-sub">' + sub + '</div>' : '')
          + (spark ? sparkHtml(spark) : '') + '</div>';
@@ -3253,13 +3269,13 @@ function refreshShipFlow() {
             stamp = t.toLocaleString('en-US', {month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZone: 'America/Chicago'});
         }
         el.innerHTML =
-            '<div class="ship-label">🏭 SHIPPING</div>' +
-            shipStage(d.issues_open, 'issues open') + ARROW +
-            shipStage(d.prs_open, 'prs open') + ARROW +
-            shipStage(ciNum, 'ci q/run', ciCls) + ARROW +
-            shipStage(d.merged_today, 'merged today', 'ok', '', d.merged_spark) + ARROW +
-            shipStage(d.deploys_ok_today, 'deployed today', d.deploys_failed_today ? 'hot' : '', deploySub, d.deploys_spark) + ARROW +
-            '<div class="ship-stage"><div class="ship-num stamp">' + stamp + '</div>'
+            '<div class="ship-label"><img src="/armbrain-logo.svg" alt="Armbrain" class="ship-logo" title="Armbrain - the product this pipeline ships">SHIPPING</div>' +
+            shipStage(d.issues_open, 'issues open', '', '', null, HELP.issues) + ARROW +
+            shipStage(d.prs_open, 'prs open', '', '', null, HELP.prs) + ARROW +
+            shipStage(ciNum, 'ci q/run', ciCls, '', null, HELP.ciqr) + ARROW +
+            shipStage(d.merged_today, 'merged today', 'ok', '', d.merged_spark, HELP.merged) + ARROW +
+            shipStage(d.deploys_ok_today, 'deployed today', d.deploys_failed_today ? 'hot' : '', deploySub, d.deploys_spark, HELP.deployed) + ARROW +
+            '<div class="ship-stage" title="' + HELP.lastdep.replace(/"/g, '') + '"><div class="ship-num stamp">' + stamp + '</div>'
               + '<div class="ship-cap">last deploy (CT)</div>'
               + (d.last_deploy_sha ? '<div class="ship-sub">⎇ ' + d.last_deploy_sha + '</div>' : '') + '</div>';
     }).catch(() => {
@@ -3321,10 +3337,10 @@ function refreshRouteHealth() {
             const pills = byBox[box].map(r => {
                 const cls = !r.live ? 'missing' : (r.loaded ? 'loaded' : 'idle');
                 const mark = !r.live ? '✕ ' : (r.loaded ? '● ' : '○ ');
-                const tip = !r.live ? 'route MISSING from the gateway'
+                const state = !r.live ? 'route MISSING from the gateway'
                           : (r.loaded ? r.model + ' loaded in memory'
                                       : r.model + ' configured, not loaded right now');
-                return '<span class="card-route ' + cls + '" title="' + tip + '">' + mark + r.name + '</span>';
+                return '<span class="card-route ' + cls + '" title="' + r.name + ' on ' + r.box + ' — ' + state + ' (' + r.model + '). ' + HELP.routepill.replace(/"/g, '') + '">' + mark + r.name + '</span>';
             }).join('');
             if (slot.dataset.lastVal !== pills) { slot.dataset.lastVal = pills; slot.innerHTML = pills; }
         });
@@ -3335,13 +3351,21 @@ function refreshRouteHealth() {
             return '<span class="gdot ' + cls + '" title="' + r.name + ' (' + r.box + ') — ' + state + '"></span>';
         }).join('');
         el.innerHTML =
-            '<span class="gicon" title="Local model routes">🛰️</span>' +
-            '<div class="gpair"><div class="gnum ' + (missing.length ? 'hot' : 'ok') + '">' + loaded.length + '/' + d.routes.length + '</div>' +
+            '<span class="gicon" title="' + HELP.routesum.replace(/"/g, '') + '">🛰️</span>' +
+            '<div class="gpair" title="' + HELP.routesum.replace(/"/g, '') + '"><div class="gnum ' + (missing.length ? 'hot' : 'ok') + '">' + loaded.length + '/' + d.routes.length + '</div>' +
             '<div class="gcap">' + (missing.length ? missing.length + ' missing' : 'loaded') + '</div></div>' +
-            '<div class="gdots" title="one dot per local route — green = model in memory">' + dots + '</div>';
-    }).catch(() => {
+            '<div class="gdots" title="' + HELP.routesum.replace(/"/g, '') + '">' + dots + '</div>';
+    }).catch(err => {
+        console.error('route health render failed:', err);   // do not hide real bugs
         const el = document.getElementById('route-health-body');
-        if (el) el.innerHTML = '<p class="glance-unavailable">Model route check failed to load.</p>';
+        if (!el) return;
+        if (!el.dataset.retried) {
+            el.dataset.retried = '1';
+            el.innerHTML = '<span class="gdim">routes…</span>';
+            setTimeout(refreshRouteHealth, 3000);
+            return;
+        }
+        el.innerHTML = '<span class="gdim" title="The dashboard could not reach its own route-health endpoint. Usually means the service restarted; it retries automatically.">route check unavailable — retrying</span>';
     });
 }
 
@@ -3399,11 +3423,11 @@ function refreshFleetStats() {
             ? Object.entries(r.boxes).map(([n, b]) => n + ' ' + b.busy + '/' + b.total).join(' · ')
             : 'runner counts unavailable (gh / GitHub API failed) — stale read, not an outage';
         let html = '<span class="gicon" title="agents: ' + agentDetail + '">🤖</span>'
-                 + '<div class="gpair"><div class="gnum">' + a.total + '</div><div class="gcap">agents</div></div>';
+                 + '<div class="gpair" title="' + HELP.agents.replace(/"/g, '') + ' Per box: ' + agentDetail + '"><div class="gnum">' + a.total + '</div><div class="gcap">agents</div></div>';
         if (f) {
             const pct = f.total > 0 ? (f.busy / f.total) * 100 : 0;
             const hot = (f.online > 0 && f.busy >= f.online);
-            html += '<div class="gpair"><div class="gnum ' + (hot ? 'hot' : (f.busy ? 'warn' : 'ok')) + '">'
+            html += '<div class="gpair" title="' + HELP.runners.replace(/"/g, '') + ' Per box: ' + runnerDetail + '"><div class="gnum ' + (hot ? 'hot' : (f.busy ? 'warn' : 'ok')) + '">'
                  + f.busy + '/' + f.total + '</div><div class="gcap">runners</div></div>'
                  + '<div class="gbar" title="' + runnerDetail + '"><i class="' + (hot ? 'hot' : '') + '" style="width:' + pct + '%"></i></div>';
         } else {
@@ -3422,7 +3446,7 @@ function progressBar(percent, cls, id, peakPct) {
     else if (percent > 70) barClass = 'progress-yellow';
     const peak = (peakPct === null || peakPct === undefined)
         ? ''
-        : '<div class="bar-peak" id="' + id + '-peak" title="Peak today: ' + Math.round(peakPct) + '%" style="left:' + Math.max(0, Math.min(100, peakPct)) + '%"></div>';
+        : '<div class="bar-peak" id="' + id + '-peak" title="Peak today: ' + Math.round(peakPct) + '% — ' + HELP.peak.replace(/"/g, '') + '" style="left:' + Math.max(0, Math.min(100, peakPct)) + '%"></div>';
     return '<div class="progress-bar"><div id="' + id + '" class="progress-fill ' + barClass + '" data-percent="' + percent + '" style="width:' + percent + '%"></div>' + peak + '</div>';
 }
 
@@ -3455,7 +3479,8 @@ function loadedModelsHtml(lm) {
 
 // Label + thin bar + value, all on ONE line (compact card layout).
 function miniRow(label, percent, cls, barId, labelId, valueText, peakPct) {
-    return '<div class="mini-row"><span class="mini-label">' + label + '</span>' +
+    const help = HELP[label.toLowerCase()] || '';
+    return '<div class="mini-row" title="' + help.replace(/"/g, '') + '"><span class="mini-label">' + label + '</span>' +
         progressBar(percent, cls, barId, peakPct) +
         '<span class="mini-val" id="' + labelId + '">' + valueText + '</span></div>';
 }
@@ -3525,6 +3550,38 @@ function getSwapColor(percent) {
     return '#ff0044';
 }
 
+// Plain-English explanations for every reading on the page (Ben, 2026-07-30).
+// Static text, no live values - the tooltip explains WHAT the number is, the
+// number itself says how much.
+const HELP = {
+    gpu:   'GPU USE - how hard the graphics card is working right now, 0 to 100%. A model answering a question pushes this up. The bright mark on the arc is the highest it reached today.',
+    power: 'POWER DRAW - watts the graphics card is pulling right now. The small grey number at the bottom of the card is its ceiling. The mark on the arc is today high point.',
+    temp:  'TEMPERATURE - how hot the chip is, in Celsius. Green is fine, yellow is warm, red means it is throttling itself to avoid damage. Around 85C is where to start worrying.',
+    cpu:   'PROCESSOR USE - how busy the regular processor is, separate from the graphics card. High here with low GPU usually means the box is compiling or running tests, not serving a model.',
+    swap:  'SWAP - memory that has spilled from RAM onto the disk. Zero is ideal. Anything high means the box ran out of real memory and is now much slower.',
+    vram:  'GRAPHICS MEMORY - the graphics card own memory, which is what a model has to fit inside. A model bigger than this either will not run or spills onto the processor and crawls.',
+    ram:   'SYSTEM MEMORY - ordinary RAM. Separate from graphics memory. Running out shows up as swap.',
+    mem:   'MEMORY - on a Mac the processor and graphics share one pool, so this single number covers both.',
+    disk:  'DISK - how full the drive is. No high-water mark here on purpose: disk usage only climbs, so today maximum is just the current number.',
+    io:    'DISK and NETWORK traffic in megabytes per second, read/write and in/out. Useful for spotting a box that is busy moving data rather than thinking.',
+    tps:   'TOKENS PER SECOND - the speed the model is writing. A token is roughly three quarters of a word. NOW is this second, PEAK TODAY is the fastest it managed today, AVG is the average across everything it served today.',
+    reqs:  'REQUESTS - how many times something asked this box for an answer, in the last hour, last 24 hours and last 7 days.',
+    served:'SERVING TIME - total minutes this box spent actually generating today. A big request count with few minutes means lots of short answers.',
+    model: 'LOADED MODEL - which AI model is sitting in memory right now, and how much memory it is using. Empty means nothing is loaded and the next request will wait for it to load.',
+    peak:  'The high-water mark for today. Like the peak needle on a stereo amplifier: it stays where the loudest moment was, even after the level drops back down. Resets at midnight.',
+    routepill: 'A ROUTE is a nickname you ask for instead of naming a model, so the gateway can pick the machine. This badge sits on the machine that serves it. GREEN means the model is loaded in memory and will answer immediately. GREY means the route works but nothing is loaded, so the first request waits while it loads. RED means the route is missing from the gateway entirely - that one is a problem.',
+    routesum:  'LOADED ROUTES - how many of your local model routes have their model actually sitting in memory right now, out of the total number of local routes. Grey dots are idle, not broken: models unload after sitting unused, and the next request loads them again. Only red is a real fault.',
+    agents:    'CLI AGENTS - how many AI coding agents are running across the fleet right now.',
+    runners:   'RUNNERS - GitHub Actions workers available to run your tests and builds, shown as busy out of total. When busy equals total, new work waits in line.',
+    issues:    'ISSUES OPEN - open tickets on the armbrain repository.',
+    prs:       'PULL REQUESTS OPEN - finished work waiting to be reviewed and merged.',
+    ciqr:      'CI QUEUED / RUNNING - automated test runs waiting to start, and runs happening now. A growing queued number means you are short on runners.',
+    merged:    'MERGED TODAY - pull requests that landed in the main branch today. The little bars are the last seven days, so you can see whether today is normal.',
+    deployed:  'DEPLOYED TODAY - releases that went live today. The little bars are the last seven days.',
+    lastdep:   'LAST DEPLOY - when the most recent release went out, in Central Time, and the short code identifying exactly which version it was.',
+    maxutil:   'The busiest this graphics card got today, as a percentage.',
+};
+
 function peakMarkerHtml(peakValue, min, max, size, id) {
     // A thin tick parked at today's high-water mark. Only the outer ~28% of the
     // bar is painted, so it reads as a mark ON the arc, not a second needle.
@@ -3534,10 +3591,10 @@ function peakMarkerHtml(peakValue, min, max, size, id) {
     const has = peakValue !== null && peakValue !== undefined;
     const pct = has ? Math.max(0, Math.min(100, ((peakValue - min) / (max - min)) * 100)) : 0;
     const angle = -90 + (pct * 1.8);
-    return '<div class="gauge-peak" id="' + id + '" title="Peak today"' +
+    return '<div class="gauge-peak" id="' + id + '" title="' + HELP.peak.replace(/"/g, '') + '"' +
         ' style="width:' + w + 'px;height:' + h + 'px;margin-left:' + (-w / 2) + 'px;' +
         'transform:rotate(' + angle + 'deg);opacity:' + (has ? 0.95 : 0) + ';' +
-        'background:linear-gradient(to top,transparent 0%,transparent 55%,#ff2bd6 55%,#ff2bd6 100%)"></div>';
+        'background:linear-gradient(to top,transparent 0%,transparent 55%,#ffd166 55%,#fff8e1 100%)"></div>';
 }
 
 function updatePeakMarker(id, peakValue, min, max) {
@@ -3585,7 +3642,8 @@ function renderGauge(value, min, max, label, unit, showLimit, size, reverseColor
         gradient = 'conic-gradient(from 0.75turn, #39ff14 0deg, #39ff14 126deg, #d9a54a 126deg, #d9a54a 162deg, #d94a4a 162deg, #d94a4a 180deg, transparent 180deg)';
     }
 
-    return '<div class="gauge" id="' + gaugeId + '" style="width:' + w + 'px" data-min="' + min + '" data-max="' + max + '">' +
+    const help = HELP[label.toLowerCase().replace(/[^a-z]/g, '')] || '';
+    return '<div class="gauge" id="' + gaugeId + '" style="width:' + w + 'px" data-min="' + min + '" data-max="' + max + '" title="' + help.replace(/"/g, '') + '">' +
         '<div class="gauge-dial" style="width:' + w + 'px;height:' + h + 'px">' +
         '<div class="gauge-bg" style="background:' + gradient + '"></div>' +
         '<div class="gauge-mask"></div>' +
@@ -3619,7 +3677,7 @@ function renderSwapGauge(value, max, size, id, peakValue) {
     // Swap gradient: green at 0, yellow 0-70%, red >70%
     const gradient = 'conic-gradient(from 0.75turn, #39ff14 0deg, #39ff14 5deg, #d9a54a 5deg, #d9a54a 126deg, #d94a4a 126deg, #d94a4a 180deg, transparent 180deg)';
 
-    return '<div class="gauge" id="' + gaugeId + '" style="width:' + w + 'px" data-min="0" data-max="' + max + '">' +
+    return '<div class="gauge" id="' + gaugeId + '" style="width:' + w + 'px" data-min="0" data-max="' + max + '" title="' + HELP.swap + '">' +
         '<div class="gauge-dial" style="width:' + w + 'px;height:' + h + 'px">' +
         '<div class="gauge-bg" style="background:' + gradient + '"></div>' +
         '<div class="gauge-mask"></div>' +
@@ -3836,8 +3894,8 @@ function refresh() {
 
                     if (isModelBox) {
                         html += '<div class="serving-line">';
-                        html += '<div id="loaded-models-' + name + '">' + loadedModelsHtml(info.loaded_models) + '</div>';
-                        html += '<div id="serving-' + name + '"></div>';
+                        html += '<div id="loaded-models-' + name + '" title="' + HELP.model.replace(/"/g, '') + '">' + loadedModelsHtml(info.loaded_models) + '</div>';
+                        html += '<div id="serving-' + name + '" title="' + HELP.tps.replace(/"/g, '') + ' ' + HELP.reqs.replace(/"/g, '') + '"></div>';
                         html += '</div>';
                     }
                     html += '<div class="card-foot"><span>Apple M1 Max · 64GB Unified · 32-core GPU</span></div>';
@@ -3871,8 +3929,8 @@ function refresh() {
                     // Loaded model + tokens/sec, one line each (was 2 gauges + a block)
                     if (isModelBox || info.loaded_models) {
                         html += '<div class="serving-line">';
-                        html += '<div id="loaded-models-' + name + '">' + loadedModelsHtml(info.loaded_models) + '</div>';
-                        if (isModelBox) html += '<div id="serving-' + name + '"></div>';
+                        html += '<div id="loaded-models-' + name + '" title="' + HELP.model.replace(/"/g, '') + '">' + loadedModelsHtml(info.loaded_models) + '</div>';
+                        if (isModelBox) html += '<div id="serving-' + name + '" title="' + HELP.tps.replace(/"/g, '') + ' ' + HELP.reqs.replace(/"/g, '') + '"></div>';
                         html += '</div>';
                     }
 
@@ -3884,7 +3942,7 @@ function refresh() {
                     if (info.net_io) {
                         ioTxt += '<span class="io-stat" id="net-io-' + name + '">🌐 <span class="value val">' + info.net_io.rx_mbps + '/' + info.net_io.tx_mbps + '</span> MB/s</span>';
                     }
-                    html += '<span class="io-line">' + ioTxt + '</span>';
+                    html += '<span class="io-line" title="' + HELP.io.replace(/"/g, '') + '">' + ioTxt + '</span>';
                     html += '<span class="card-actions">';
                     html += '<button class="power-btn" data-target="' + name + '" data-current="' + info.gpu_power_limit + '" data-max="' + info.gpu_power_max + '" title="Set Power Limit">⚡ PWR</button>';
                     html += '<button class="swap-btn" data-target="' + name + '" title="Clear Swap">🧹 SWAP</button>';
@@ -3920,7 +3978,7 @@ function refresh() {
                     if (info.net_io) {
                         ioTxt2 += '<span class="io-stat" id="net-io-' + name + '">🌐 <span class="value val">' + info.net_io.rx_mbps + '/' + info.net_io.tx_mbps + '</span> MB/s</span>';
                     }
-                    html += '<span class="io-line">' + ioTxt2 + '</span>';
+                    html += '<span class="io-line" title="' + HELP.io.replace(/"/g, '') + '">' + ioTxt2 + '</span>';
                     html += '<span class="card-actions">';
                     html += '<button class="swap-btn" data-target="' + name + '" title="Clear Swap">🧹 SWAP</button>';
                     html += '</span></div>';
