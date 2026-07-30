@@ -184,10 +184,21 @@ GATEWAY_MODELS_URL = "http://gandalf.local:4000/v1/models"
 # The 🔒 local-only routes from the fleet gateway table - the ones that should
 # always be up. (opus/sonnet/codex/gemini/etc. are external and expected to
 # come and go with vendor availability, so they're left off this glance tile.)
-LOCAL_GATEWAY_ROUTES = ["fast", "code", "code-glm", "reason", "coder", "big", "cheap",
-                        # aragorn, 2026-07-29: one ollama seat per GPU
-                        # (reason-oss on the 5080, fast-mini on the 5070).
-                        "reason-oss", "fast-mini"]
+# The chips on the dashboard. Rebuilt 2026-07-30 to match reality after the night's
+# reconfiguration. Deliberately EXCLUDES alias-only routes (code-glm and big now
+# both point at models listed here) so one model does not show up as two chips.
+# Dropped: `coder` (devstral) - retired by council vote, 3.5 tok/s.
+LOCAL_GATEWAY_ROUTES = [
+    "flagship",    # gandalf 35B-A3B + n-gram, RESIDENT, never unloads
+    "dense",       # gandalf 27B + MTP and n-gram, RESIDENT, never unloads
+    "fast",        # frodo 35B-A3B - best prefill on the fleet, 4 slots
+    "reason",      # gandalf gemma4-26b - on demand, loads alongside the pair
+    "code",        # pippen
+    "reason-oss",  # aragorn 5080
+    "fast-mini",   # aragorn 5070
+    "reason-27b",  # aragorn, 27B split across BOTH cards
+    "cheap",       # shadowfax
+]
 
 # One-shot metrics: cpu% (0.6s /proc/stat delta), ram MB, hottest sensor (milli-C)
 FLEET_METRICS_CMD = (
@@ -1364,6 +1375,9 @@ _ROUTE_HOST_TO_BOX = {
     "192.168.1.15": "aragorn", "192.168.1.10": "gandalf", "192.168.1.11": "frodo",
 }
 _ROUTE_TOPOLOGY_FALLBACK = {
+    "flagship": {"box": "gandalf", "model": "qwen3.6-35b-a3b-q8-256k", "port": 8889},
+    "dense": {"box": "gandalf", "model": "qwen3.6-27b", "port": 8889},
+    "reason-27b": {"box": "aragorn", "model": "qwen3.6-27b-q5km", "port": 11436},
     "fast": {"box": "frodo", "model": "qwen3.6-35b-a3b", "port": 8890},
     "code": {"box": "pippin", "model": "qwen3-coder-next", "port": 8891},
     "code-glm": {"box": "gandalf", "model": "glm-4.5-air", "port": 8889},
@@ -1785,6 +1799,29 @@ model_serving_cache = {"data": None, "ts": 0.0}
 model_serving_cache_lock = threading.Lock()
 MODEL_SERVING_CACHE_TTL = 30  # seconds
 
+# --- Stats reset marker (2026-07-30, Ben: "reset all the averages on the fleet
+# monitor"). After a config change - new models, speculation switched on - the
+# day's peaks and averages describe a machine that no longer exists, so they
+# mislead rather than inform. This does NOT delete history (the historical charts
+# still want it); it just moves the start of the "today" window forward.
+# Reset:  POST /api/reset_stats     Clear:  DELETE /api/reset_stats
+STATS_RESET_FILE = "/var/lib/queue-router/stats_reset_at"
+
+
+def stats_window_start():
+    """Start of the 'today' window: midnight, or a later reset if one is set."""
+    midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    try:
+        with open(STATS_RESET_FILE) as fh:
+            marker = fh.read().strip()
+        # A marker from a previous day must not pin the window in the past.
+        if marker > midnight:
+            return marker
+    except OSError:
+        pass
+    return midnight
+
+
 def get_model_serving_stats():
     """Per-box: tps_now, serving-time-only tps average today, requests served
     in the last hour/day/week. Read from sqlite, cached 30s."""
@@ -1794,7 +1831,7 @@ def get_model_serving_stats():
             return model_serving_cache["data"]
 
     now = datetime.now()
-    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    midnight = stats_window_start()   # honours a manual reset
     hour_ago = (now - timedelta(hours=1)).isoformat()
     day_ago = (now - timedelta(days=1)).isoformat()
     week_ago = (now - timedelta(days=7)).isoformat()
@@ -2429,7 +2466,7 @@ def get_status():
         for name, config in CONFIG["targets"].items()
     }
 
-    today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    today_start = stats_window_start()   # honours a manual reset
     jobs_today = {}
     max_util_today = {}
     peaks_today = {}
@@ -2521,6 +2558,30 @@ def get_fleet():
 def api_ci_queue():
     """Queued/running GitHub Actions counts for armbrain-io/armbrain (cached)."""
     return jsonify(get_ci_queue_status())
+
+@app.route("/api/reset_stats", methods=["POST", "DELETE"])
+def api_reset_stats():
+    """Reset today's peaks and averages without destroying history."""
+    try:
+        if request.method == "DELETE":
+            try:
+                os.remove(STATS_RESET_FILE)
+            except FileNotFoundError:
+                pass
+            return jsonify({"reset_at": None, "note": "back to midnight"})
+        now_iso = datetime.now().isoformat()
+        os.makedirs(os.path.dirname(STATS_RESET_FILE), exist_ok=True)
+        with open(STATS_RESET_FILE, "w") as fh:
+            fh.write(now_iso)
+        # Drop the cached stats so the reset shows up immediately rather than
+        # after the next cache expiry.
+        with model_serving_cache_lock:
+            model_serving_cache["data"] = None
+            model_serving_cache["ts"] = 0.0
+        return jsonify({"reset_at": now_iso})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 
 @app.route("/armbrain-logo.svg", methods=["GET"])
 def armbrain_logo():
