@@ -1024,32 +1024,61 @@ def _model_processes(target_name, target_config):
 
 
 def get_ollama_loaded_models(target_config):
-    """What each ollama instance on a box has RESIDENT, and on which card.
+    """What each instance on a box has RESIDENT, and on which card.
 
-    ollama /v1/models lists everything PULLED, which would show green for
-    models that aren't loaded - /api/ps is the honest signal, and it reports
-    size_vram directly so no process matching is needed.
+    Handles BOTH engines, because aragorn is mid-migration from ollama to
+    llama.cpp (2026-07-30) and a per-port engine can change under us:
+      - ollama: /api/ps is the honest signal. Its /v1/models lists everything
+        PULLED, which would show models that are not loaded at all.
+      - llama.cpp: /api/ps 404s. Its /v1/models IS the resident set, because a
+        llama-server process holds exactly one model.
+    Trying ollama first and falling back means a port can flip engines without
+    the dashboard going blank - which is exactly what it just did.
     """
     host = target_config.get("ssh_host")
     models = []
     reachable = False
     for inst in target_config.get("ollama_instances", []):
+        port = inst["port"]
+        got = False
+        # --- ollama path
         try:
-            r = requests.get(f"http://{host}:{inst['port']}/api/ps", timeout=4)
-            if not r.ok:
-                continue
-            reachable = True
-            for m in r.json().get("models", []):
-                name = (m.get("model") or m.get("name") or "").replace(":latest", "")
-                if not name:
-                    continue
-                models.append({
-                    "name": name,
-                    "vram_gb": round(m["size_vram"] / (1024 ** 3), 1) if m.get("size_vram") else None,
-                    "where": inst.get("where"),
-                })
+            r = requests.get(f"http://{host}:{port}/api/ps", timeout=4)
+            if r.ok:
+                for m in r.json().get("models", []):
+                    name = (m.get("model") or m.get("name") or "").replace(":latest", "")
+                    if not name:
+                        continue
+                    reachable = True
+                    got = True
+                    models.append({
+                        "name": name,
+                        "vram_gb": round(m["size_vram"] / (1024 ** 3), 1) if m.get("size_vram") else None,
+                        "where": inst.get("where"),
+                    })
         except Exception as e:
-            logger.debug(f"ollama :{inst['port']} /api/ps unavailable: {e}")
+            logger.debug(f"ollama :{port} /api/ps unavailable: {e}")
+        if got:
+            continue
+        # --- llama.cpp path (a llama-server holds exactly one model, so its
+        #     model list IS what is resident)
+        try:
+            r = requests.get(f"http://{host}:{port}/v1/models", timeout=4)
+            if r.ok:
+                for m in r.json().get("data", []):
+                    mid = m.get("id")
+                    if not mid:
+                        continue
+                    reachable = True
+                    meta = m.get("meta") or {}
+                    size = meta.get("size")
+                    models.append({
+                        "name": mid,
+                        "vram_gb": round(size / (1024 ** 3), 1) if size else None,
+                        "where": inst.get("where"),
+                    })
+        except Exception as e:
+            logger.debug(f"llama.cpp :{port} /v1/models unavailable: {e}")
     return {"available": reachable, "models": models}
 
 
