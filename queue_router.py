@@ -5,6 +5,7 @@ Receives ComfyUI workflows and routes them to the best available GPU.
 """
 
 import json
+import os
 import re
 import sqlite3
 import uuid
@@ -18,6 +19,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from cascade_dashboard import load_cascade_report
 
 # Pushover notification settings
 PUSHOVER_CONFIG = {
@@ -136,6 +138,9 @@ GITHUB_CI_REPO = "armbrain-io/armbrain"
 GH_TOKEN_ENV_PATH = "/opt/overflow-controller/gh-token.env"   # same file the Shire autoscaler mints/refreshes every 15 min
 GATEWAY_KEY_ENV_PATH = "~/.config/gandalf-gateway/fleet.env"  # canonical fleet gateway key (per infra rules)
 GATEWAY_MODELS_URL = "http://gandalf.local:4000/v1/models"
+CASCADE_REPORT_PATH = os.environ.get(
+    "FLEET_CASCADE_REPORT", "/var/lib/cascade-scraper/report.json"
+)
 # The 🔒 local-only routes from the fleet gateway table - the ones that should
 # always be up. (opus/sonnet/codex/gemini/etc. are external and expected to
 # come and go with vendor availability, so they're left off this glance tile.)
@@ -1407,6 +1412,12 @@ def get_pipeline_status():
 def api_pipeline():
     return jsonify(get_pipeline_status())
 
+@app.route("/api/cascade", methods=["GET"])
+def api_cascade():
+    """Dollar-zero task rate and route waterfall from cascade-scraper."""
+    report = load_cascade_report(CASCADE_REPORT_PATH)
+    return jsonify(report), (200 if report["available"] else 503)
+
 @app.route("/api/ci_queue", methods=["GET"])
 def api_ci_queue():
     """Queued/running GitHub Actions counts for armbrain-io/armbrain (cached)."""
@@ -1643,7 +1654,7 @@ def index():
 }
 *{box-sizing:border-box}
 @media(min-width:1300px){body{display:grid;grid-template-columns:1fr 1fr;gap:0 14px;align-items:start}
-h1,#topbar,#monitors,#fleet-hosts,#ci-queue-card,#history{grid-column:1/-1}}
+h1,#topbar,#monitors,#fleet-hosts,#ci-queue-card,#cascade-card,#history{grid-column:1/-1}}
 body{font-family:'Rajdhani',sans-serif;background:var(--bg-dark);color:#e0e0e0;padding:10px;margin:0;
 background-image:radial-gradient(ellipse at top,#0d1a2d 0%,transparent 50%),
 linear-gradient(180deg,transparent 0%,rgba(0,255,242,0.03) 100%);min-height:100vh;font-size:14px}
@@ -1825,6 +1836,18 @@ border-radius:999px;border:1px solid #2a2a4e;background:var(--bg-panel);color:#8
 .pipe-stage.bad .pn{color:var(--neon-red);text-shadow:0 0 8px var(--neon-red)}
 .pipe-arrow{display:flex;align-items:center;color:var(--neon-magenta);padding:0 8px;font-size:1.3em;text-shadow:0 0 8px var(--neon-magenta)}
 .pipe-sub{font-size:0.72em;color:#667;margin-top:2px}
+.cascade-head{display:flex;gap:16px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
+.cascade-zero{font-family:'Orbitron',monospace;font-size:2.2em;color:var(--neon-green);text-shadow:var(--glow-green)}
+.cascade-waterfall{display:grid;grid-template-columns:repeat(4,minmax(130px,1fr));gap:8px}
+.cascade-tier{background:var(--bg-panel);border:1px solid #263348;border-radius:6px;padding:10px;position:relative}
+.cascade-tier-name{font-family:'Orbitron',monospace;font-size:0.72em;color:#9aa;letter-spacing:1px}
+.cascade-tier-value{font-family:'Orbitron',monospace;font-size:1.35em;color:var(--neon-cyan);margin-top:5px}
+.cascade-spark{color:var(--neon-magenta);letter-spacing:2px;font-size:0.8em;margin-top:5px}
+.cascade-links{display:flex;gap:8px;flex-wrap:wrap;margin-top:9px}
+.cascade-link{font-size:0.8em;color:#889;border:1px solid #263348;border-radius:999px;padding:3px 8px}
+.cascade-link.leaking{color:var(--neon-red);border-color:var(--neon-red);animation:pulse 1.5s infinite}
+.cascade-stale{color:var(--neon-red);border:1px solid var(--neon-red);padding:8px;border-radius:4px}
+@media(max-width:767px){.cascade-waterfall{grid-template-columns:1fr 1fr}}
 .route-pill.missing{color:var(--neon-red);border-color:var(--neon-red);box-shadow:0 0 8px rgba(255,0,68,0.25);animation:pulse 1.5s infinite}
 </style></head>
 <body><h1>GANDALF // FLEET MONITOR</h1>
@@ -1841,6 +1864,10 @@ border-radius:999px;border:1px solid #2a2a4e;background:var(--bg-panel);color:#8
 <div id="ci-queue-body"><p style="color:#667;margin:0">Loading pipeline...</p></div>
 </div>
 
+<div class=card id=cascade-card>
+<h3>💧 Cascade Monitor — dollar-zero resolution</h3>
+<div id=cascade-body><p style="color:#667;margin:0">Loading cascade rollup...</p></div>
+</div>
 
 <div class=card id=energy>
 <h3>⚡ Energy &amp; Cost — by Machine</h3>
@@ -1866,6 +1893,7 @@ border-radius:999px;border:1px solid #2a2a4e;background:var(--bg-panel);color:#8
 GET  /api/logs    - Job / usage history
 GET  /api/history - Historical metrics (range=hour|day|week|month)
 GET  /api/energy  - GPU energy + time-of-use cost (day/week/month)
+GET  /api/cascade - Dollar-zero resolution + tier waterfall
 GET  /api/health  - Health check</pre>
 </div>
 
@@ -2051,6 +2079,71 @@ function refreshCiQueue() {
     }).catch(() => {
         const el = document.getElementById('ci-queue-body');
         if (el) el.innerHTML = '<p class="glance-unavailable">Pipeline check failed to load.</p>';
+    });
+}
+
+function escapeCascade(value) {
+    return String(value).replace(/[&<>"']/g, c => (
+        {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]
+    ));
+}
+
+function cascadeSpark(values) {
+    if (!Array.isArray(values) || !values.length) return '—';
+    const bars = '▁▂▃▄▅▆▇█';
+    const max = Math.max(1, ...values.map(Number));
+    return values.map(v => bars[Math.min(7, Math.round(Number(v) * 7 / max))]).join('');
+}
+
+function refreshCascade() {
+    fetch('/api/cascade').then(async r => {
+        const data = await r.json();
+        if (!r.ok || !data.available) throw new Error(data.error || 'cascade report unavailable');
+        return data;
+    }).then(d => {
+        const el = document.getElementById('cascade-body');
+        const tasks = d.tasks || {};
+        const baseline = tasks.target_status === 'ready_to_set'
+            ? '14-day baseline complete — set the explicit target from measured performance'
+            : 'Collecting baseline: ' + (tasks.baseline_days || 0) + '/' + (tasks.baseline_days_required || 14) + ' observed days';
+        let html = '';
+        if (d.stale) {
+            html += '<div class="cascade-stale">⚠ Cascade data is stale. Latest routing event is older than 15 minutes.</div>';
+        }
+        html += '<div class="cascade-head"><div><div class="cascade-zero">' +
+            Number(tasks.dollar_zero_pct || 0).toFixed(1) + '%</div><div style="color:#889">dollar-zero tasks · ' +
+            Number(tasks.dollar_zero || 0) + '/' + Number(tasks.completed || 0) +
+            ' completed</div><div class="cascade-spark">' +
+            cascadeSpark((tasks.daily || []).map(day => day.dollar_zero_pct)) +
+            '</div></div><div style="color:#889">' + escapeCascade(baseline) + '</div></div>';
+        const tierLabels = {
+            local_free: 'LOCAL FREE', local_big: 'LOCAL BIG',
+            subscription: 'SUBSCRIPTION', metered: 'METERED'
+        };
+        const tierMap = Object.fromEntries((d.tiers || []).map(t => [t.tier, t]));
+        html += '<div class="cascade-waterfall">';
+        Object.keys(tierLabels).forEach(key => {
+            const t = tierMap[key] || {};
+            html += '<div class="cascade-tier"><div class="cascade-tier-name">' + tierLabels[key] +
+                '</div><div class="cascade-tier-value">' + Number(t.resolution_pct || 0).toFixed(1) +
+                '% resolved</div><div style="color:#889">' + Number(t.handled || 0) + ' handled · ' +
+                (t.median_latency_ms === null || t.median_latency_ms === undefined ? '—' : Number(t.median_latency_ms) + 'ms median') +
+                '</div><div class="cascade-spark">' + cascadeSpark(t.sparkline) + '</div></div>';
+        });
+        html += '</div><div class="cascade-links">';
+        (d.links || []).forEach(link => {
+            const reason = escapeCascade(link.top_reason || 'other').replaceAll('_', ' ');
+            html += '<span class="cascade-link ' + (link.leaking ? 'leaking' : '') + '">' +
+                escapeCascade(link.from_tier) + ' → ' + escapeCascade(link.to_tier) + ': ' +
+                Number(link.today_count || 0) + ' today · ' + Number(link.today_rate_pct || 0).toFixed(1) +
+                '% · ' + reason + (link.leaking ? ' · LEAKING' : '') + '</span>';
+        });
+        html += '</div><p style="color:#667;font-size:0.8em;margin:8px 0 0">' +
+            escapeCascade(d.definition || '') + '</p>';
+        el.innerHTML = html;
+    }).catch(err => {
+        const el = document.getElementById('cascade-body');
+        if (el) el.innerHTML = '<div class="cascade-stale">⚠ Cascade metric unavailable: ' + escapeCascade(err.message) + '</div>';
     });
 }
 
@@ -2708,7 +2801,7 @@ function refreshEnergy() {
 
 // --- Polling control: pause everything when the tab isn't visible, resume ---
 // --- with an immediate refresh when it becomes visible again.              ---
-let statusTimer = null, fleetTimer = null, historyTimer = null, energyTimer = null, ciQueueTimer = null, routeHealthTimer = null;
+let statusTimer = null, fleetTimer = null, historyTimer = null, energyTimer = null, ciQueueTimer = null, routeHealthTimer = null, cascadeTimer = null;
 
 function startPolling() {
     if (!statusTimer) statusTimer = setInterval(refresh, 12000);     // queue/GPU state: 12s
@@ -2717,6 +2810,7 @@ function startPolling() {
     if (!energyTimer) energyTimer = setInterval(refreshEnergy, 60000);
     if (!ciQueueTimer) ciQueueTimer = setInterval(refreshCiQueue, 45000);        // matches backend cache TTL
     if (!routeHealthTimer) routeHealthTimer = setInterval(refreshRouteHealth, 30000);
+    if (!cascadeTimer) cascadeTimer = setInterval(refreshCascade, 60000);
 }
 
 function stopPolling() {
@@ -2726,6 +2820,7 @@ function stopPolling() {
     clearInterval(energyTimer); energyTimer = null;
     clearInterval(ciQueueTimer); ciQueueTimer = null;
     clearInterval(routeHealthTimer); routeHealthTimer = null;
+    clearInterval(cascadeTimer); cascadeTimer = null;
 }
 
 document.addEventListener('visibilitychange', () => {
@@ -2739,6 +2834,7 @@ document.addEventListener('visibilitychange', () => {
         refreshEnergy();
         refreshCiQueue();
         refreshRouteHealth();
+        refreshCascade();
         startPolling();
     }
 });
@@ -2749,6 +2845,7 @@ refreshEnergy();
 refreshFleet();
 refreshCiQueue();
 refreshRouteHealth();
+refreshCascade();
 if (!document.hidden) startPolling();
 </script></body></html>'''
 
