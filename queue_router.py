@@ -73,12 +73,69 @@ CORS(app)
 # Preserve dict insertion order in JSON responses (so targets render gandalf, frodo, pippin)
 app.json.sort_keys = False
 
+# ─── TEMPORARY post-outage IP map — 2026-07-30 ───────────────────────────────
+# THE ONE PLACE fleet IPs are written down. Change them here, nowhere else.
+#
+# WHY THIS BLOCK EXISTS: on 2026-07-30 northfarthing's DHCP server died (~2.5h
+# outage). The router took over DHCP+DNS, re-leased the whole subnet, and the
+# `.fleet` search domain went away with the old server. gandalf landed on a new
+# address and every card that addressed it by the old one went dark.
+#
+# INTENDED HOME: gandalf = 192.168.1.10, per the router's reservation table.
+# The .10 in this file was therefore CORRECT BY DESIGN, not rot.
+# WHY IT ISN'T TRUE RIGHT NOW: a GL.iNet **GL-KVM** KVM-over-IP dongle
+# (MAC 94:83:c4:cb:09:76, nginx/1.26.2 + dropbear_2025.89, web UI title
+# "GLKVM") currently squats on .10, so gandalf took a dynamic lease on .6
+# (enp5s0, MAC fc:9d:05:01:06:56).
+#
+# TO REVERT once .10 is reclaimed: set "gandalf" below back to "192.168.1.10".
+# That single line is the entire diff. Do NOT re-scatter IPs through this file.
+# Restore path is written up in
+# /workspace/planning/overnight-20260730/NETWORK-REPAIR-PLAN.md
+#
+# EVERY address below was verified by probe (`ssh <host> hostname`, or a service
+# GET) on 2026-07-30 ~02:20 CT. None is assumed.
+FLEET_IPS = {
+    "gandalf":       "192.168.1.10",  # BACK ON ITS INTENDED HOME as of 2026-07-30
+                                      # ~09:05 UTC: Ben reserved .10 for MAC
+                                      # fc:9d:05:01:06:56 and the lease renewed.
+                                      # Verified: `ip -4 addr show enp5s0` = .10,
+                                      # ssh .10 -> gandalf, and .6 is now dead
+                                      # ("No route to host"). This was the
+                                      # one-line revert the block was built for.
+    "frodo":         "192.168.1.11",  # verified ssh->frodo
+    "shadowfax":     "192.168.1.12",  # verified ssh->shadowfax
+    "pippen":        "192.168.1.13",  # verified ssh->pippen.local
+    "sam":           "192.168.1.14",  # verified ssh->sam  (mDNS still says .135: stale)
+    "aragorn":       "192.168.1.15",  # verified ssh->aragorn  (reserved, did not move)
+    "southfarthing": "192.168.1.61",  # verified ssh->southfarthing
+    "eastfarthing":  "192.168.1.62",  # verified ssh->eastfarthing
+    "westfarthing":  "192.168.1.63",  # verified ssh->westfarthing
+    # UPDATED 2026-08-11: reverted to verified LAN IP. The tailscale-IP era
+    # above (100.99.59.83) was itself the bug, not the fix: paramiko cannot
+    # complete SSH auth over Tailscale here (AuthenticationException after a
+    # 10s timeout - confirmed by direct repro), while a plain LAN connect
+    # succeeds in ~0.1s. That mismatch was silently rendering northfarthing
+    # OFFLINE on the dashboard for however long it's been live, while the box
+    # was actually up (uptime, hostname, and normal SSH all confirmed healthy
+    # via direct probe). 192.168.1.60 was verified moments before this edit:
+    # `ssh ben@192.168.1.60 hostname` -> "northfarthing" (correct box, not the
+    # old shadowfax mDNS collision this comment used to warn about), and the
+    # same paramiko client this file uses connected in 0.12s and got the same
+    # answer. If DHCP moves this box again, this will start reading OFFLINE
+    # again (wrong-box guard fails closed, not open) rather than silently
+    # showing a stale/wrong box - re-verify with the same probe before editing.
+    "northfarthing": "192.168.1.60",  # verified ssh->northfarthing 2026-08-11
+}
+# Boxes reached over tailscale rather than LAN (identity-safe, LAN IP unknown).
+# ─── end TEMPORARY post-outage IP map ────────────────────────────────────────
+
 # Configuration
 CONFIG = {
     "targets": {
         "gandalf": {
-            "url": "http://192.168.1.10:8188",
-            "ssh_host": "192.168.1.10",
+            "url": f"http://{FLEET_IPS['gandalf']}:8188",
+            "ssh_host": FLEET_IPS["gandalf"],
             "ssh_user": "ben",
             "os": "linux",
             "model_status_urls": [
@@ -91,12 +148,12 @@ CONFIG = {
             "disk_path": "/workspace"
         },
         "frodo": {
-            "url": "http://192.168.1.11:8188",
-            "ssh_host": "192.168.1.11",
+            "url": f"http://{FLEET_IPS['frodo']}:8188",
+            "ssh_host": FLEET_IPS["frodo"],
             "ssh_user": "ben",
             "os": "linux",
             "model_status_urls": [
-                ("models", "http://192.168.1.11:8890/v1/models"),
+                ("models", f"http://{FLEET_IPS['frodo']}:8890/v1/models"),
             ],
             "vram_gb": 32,
             "gpu_power_limit": 575,
@@ -109,7 +166,7 @@ CONFIG = {
         # driver is NOT installed yet, so nvidia-smi is absent and the card
         # renders its CPU/RAM/disk vitals until the driver lands.
         "aragorn": {
-            "ssh_host": "192.168.1.15",
+            "ssh_host": FLEET_IPS["aragorn"],
             "ssh_user": "mac",
             "os": "linux",
             "gpu_power_max": 675,
@@ -127,11 +184,11 @@ CONFIG = {
             ],
         },
         "pippin": {
-            "ssh_host": "pippen",
+            "ssh_host": FLEET_IPS["pippen"],
             "ssh_user": "ben",
             "os": "mac",
             "model_status_urls": [
-                ("models", "http://pippen.local:8891/v1/models"),
+                ("models", f"http://{FLEET_IPS['pippen']}:8891/v1/models"),
             ],
             "vram_gb": 64,
             "disk_path": "/"
@@ -161,14 +218,20 @@ FLEET_NODES = {
     # yet, so no Wake button until someone captures the NIC MAC.
     # aragorn moved OUT of this row 2026-07-29 - it is a full target card now
     # (see CONFIG["targets"]). Listing it in both places would render it twice.
-    "northfarthing": {"ssh_host": "northfarthing.local", "ssh_user": "ben", "wol_mac": "84:47:09:65:43:c3"},
-    "eastfarthing":  {"ssh_host": "eastfarthing.local", "ssh_user": "ben", "wol_mac": "84:47:09:62:ef:60"},
-    "southfarthing": {"ssh_host": "southfarthing.local", "ssh_user": "ben", "wol_mac": "84:47:09:65:42:5b"},
-    "westfarthing":  {"ssh_host": "westfarthing.local", "ssh_user": "ben", "wol_mac": "84:47:09:65:42:85"},
+    # 2026-07-30, post-outage: temporarily BACK to verified raw IPv4 from FLEET_IPS.
+    # The names-not-IPs rule above is still the right long-term answer, but mDNS is
+    # not trustworthy right now - northfarthing.local resolves to shadowfax's
+    # address, which silently duplicated one box's metrics onto two tiles. The
+    # farthing .local names DID each resolve correctly when probed; they are pinned
+    # only because the whole map is pinned for one night. Revert with the plan.
+    "northfarthing": {"ssh_host": FLEET_IPS["northfarthing"], "ssh_user": "ben", "wol_mac": "84:47:09:65:43:c3"},
+    "eastfarthing":  {"ssh_host": FLEET_IPS["eastfarthing"], "ssh_user": "ben", "wol_mac": "84:47:09:62:ef:60"},
+    "southfarthing": {"ssh_host": FLEET_IPS["southfarthing"], "ssh_user": "ben", "wol_mac": "84:47:09:65:42:5b"},
+    "westfarthing":  {"ssh_host": FLEET_IPS["westfarthing"], "ssh_user": "ben", "wol_mac": "84:47:09:65:42:85"},
     # Was {"local": True} when this service ran ON shadowfax. It moved to gandalf
     # 2026-07-21, so shadowfax is now just another remote box reached over SSH.
-    "shadowfax":     {"ssh_host": "shadowfax.local", "ssh_user": "ben"},
-    "sam":           {"ssh_host": "100.94.125.84", "ssh_user": "ben"},
+    "shadowfax":     {"ssh_host": FLEET_IPS["shadowfax"], "ssh_user": "ben"},
+    "sam":           {"ssh_host": FLEET_IPS["sam"], "ssh_user": "ben"},
 }
 
 # --- Glance-view additions (2026-07-19): CI queue depth + local model-route
@@ -180,7 +243,10 @@ FLEET_NODES = {
 GITHUB_CI_REPO = "armbrain-io/armbrain"
 GH_TOKEN_ENV_PATH = "/opt/overflow-controller/gh-token.env"   # same file the Shire autoscaler mints/refreshes every 15 min
 GATEWAY_KEY_ENV_PATH = "~/.config/gandalf-gateway/fleet.env"  # canonical fleet gateway key (per infra rules)
-GATEWAY_MODELS_URL = "http://gandalf.local:4000/v1/models"
+# Was gandalf.local:4000. Pinned to the verified IP with the rest of the map on
+# 2026-07-30 - gandalf.local resolves IPv6-first here, and this service runs ON
+# gandalf, so there is no reason to take a DNS dependency to reach itself.
+GATEWAY_MODELS_URL = f"http://{FLEET_IPS['gandalf']}:4000/v1/models"
 # The 🔒 local-only routes from the fleet gateway table - the ones that should
 # always be up. (opus/sonnet/codex/gemini/etc. are external and expected to
 # come and go with vendor availability, so they're left off this glance tile.)
@@ -212,8 +278,44 @@ FLEET_METRICS_CMD = (
     "tp=; for h in /sys/class/hwmon/hwmon*; do case \"$(cat $h/name 2>/dev/null)\" in k10temp|coretemp) tp=$(cat $h/temp1_input 2>/dev/null); break;; esac; done; "
     "[ -z \"$tp\" ] && tp=$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null); "
     "[ -z \"$tp\" ] && tp=$(cat /sys/class/hwmon/hwmon*/temp1_input 2>/dev/null | sort -rn | head -1); "
-    "echo \"cpu=$cpu ram_used=$ru ram_total=$rt temp=${tp:-0}\""
+    # host: WHICH BOX ACTUALLY ANSWERED. Added 2026-07-30 so a tile can never
+    # again render a different machine's vitals under its own name - see
+    # _fleet_host_matches below for why this exists.
+    "echo \"cpu=$cpu ram_used=$ru ram_total=$rt temp=${tp:-0} host=$(hostname)\""
 )
+
+# --- Wrong-box guard (2026-07-30) -------------------------------------------
+# On 2026-07-30 `northfarthing.local` began resolving to 192.168.1.12, which is
+# SHADOWFAX. The dashboard dutifully SSHed there for both tiles and rendered one
+# box's CPU/temp/RAM under two different names, so northfarthing - which was in
+# fact dead, and was the machine whose DHCP failure had just taken the LAN down
+# for 2.5 hours - displayed as healthy. It was only caught by a human noticing
+# that two tiles showed byte-identical numbers.
+#
+# The lesson: a stale IP fails loudly, but a name another box can answer to lies
+# quietly. So every metrics reply now has to prove it came from the box we asked
+# for. If it does not, the tile shows MISMATCH and NO numbers - never a
+# neighbour's. We deliberately do NOT show the stats and add a warning badge:
+# numbers on screen get believed.
+#
+# Matching is on the short hostname, case-insensitively: boxes report things like
+# "pippen.local" or a FQDN, and that is not a mismatch. `hostname_aka` is there
+# for a box whose real hostname legitimately differs from its tile name.
+# Cards whose tile name legitimately differs from the machine's real hostname.
+# "pippin" the card vs "pippen" the box is a long-standing spelling split in this
+# file, not a wrong-box condition - without this the guard would cry wolf on it.
+TARGET_HOSTNAME_AKA = {
+    "pippin": ("pippen",),
+}
+
+
+def _fleet_host_matches(expected, reported, aka=()):
+    """True if `reported` hostname is the box we asked for. Empty reported = unknown -> treat as OK."""
+    if not reported:
+        return True          # older/odd hosts that print no host= field: don't cry wolf
+    short = reported.strip().lower().split(".")[0]
+    accepted = {expected.strip().lower()} | {a.strip().lower() for a in aka}
+    return short in accepted
 
 def get_fleet_node_metrics(name, cfg):
     """CPU/temp/RAM for one fleet node. Returns dict; online=False on any failure."""
@@ -224,19 +326,65 @@ def get_fleet_node_metrics(name, cfg):
             out = subprocess.run(["bash", "-c", FLEET_METRICS_CMD], capture_output=True,
                                  text=True, timeout=15).stdout
         else:
-            client = get_ssh_client(cfg["ssh_host"], cfg.get("ssh_user", "ben"))
-            if client is None:
+            # Retry once on a DEAD POOLED CONNECTION (fixed 2026-07-30).
+            # get_ssh_client hands back a cached client whenever
+            # transport.is_active() is true, but a peer that dropped the
+            # connection its own side leaves is_active() true until we actually
+            # write to it. The write then fails with "Socket exception:
+            # Connection reset by peer (104)", we reported the box OFFLINE, and
+            # the next poll reconnected and reported it online again - so a live
+            # box flapped green/red on a fixed cadence for no reason. Seen every
+            # ~45s on shadowfax, which is a Pi and reaps idle sshd sessions
+            # briskly. Pre-existing bug, unrelated to the IP reshuffle; caught
+            # while verifying the cards after that fix.
+            # So: on any exec failure, evict the cached client and try once more
+            # with a genuinely fresh connection before calling the box down.
+            user = cfg.get("ssh_user", "ben")
+            last_err = None
+            for attempt in (1, 2):
+                client = get_ssh_client(cfg["ssh_host"], user)
+                if client is None:
+                    break          # circuit breaker is open - respect it
+                try:
+                    # no extra bash -c wrapper: the CMD contains single quotes,
+                    # and sshd already hands the command line to the login shell
+                    _, stdout, _ = client.exec_command(FLEET_METRICS_CMD, timeout=15)
+                    out = stdout.read().decode()
+                    last_err = None
+                    break
+                except Exception as e:
+                    last_err = e
+                    ssh_clients.pop(f"{user}@{cfg['ssh_host']}", None)
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+                    if attempt == 2:
+                        logger.debug(f"fleet metrics {name}: failed twice: {e}")
+            if last_err is not None or out is None:
                 return {"name": name, "online": False, "can_wake": bool(cfg.get("wol_mac"))}
-            # no extra bash -c wrapper: the CMD contains single quotes, and sshd
-            # already hands the command line to the login shell (bash here)
-            _, stdout, _ = client.exec_command(FLEET_METRICS_CMD, timeout=15)
-            out = stdout.read().decode()
     except Exception as e:
         logger.debug(f"fleet metrics {name}: {e}")
         return {"name": name, "online": False, "can_wake": bool(cfg.get("wol_mac"))}
     m = dict(kv.split("=") for kv in (out or "").split() if "=" in kv)
     if "cpu" not in m:
         return {"name": name, "online": False, "can_wake": bool(cfg.get("wol_mac"))}
+    # WRONG-BOX GUARD: prove the reply came from the box this tile names. A
+    # local (no-SSH) node is trivially itself, so it is exempt.
+    if not cfg.get("local"):
+        reported = m.get("host", "")
+        if not _fleet_host_matches(name, reported, cfg.get("hostname_aka", ())):
+            logger.warning(
+                f"fleet metrics {name}: WRONG BOX - asked {cfg['ssh_host']} for "
+                f"'{name}', got '{reported}'. Refusing to render its numbers. "
+                f"Check DNS/mDNS/DHCP for {name}."
+            )
+            return {
+                "name": name, "online": False, "mismatch": True,
+                "reported_host": reported.strip().split(".")[0],
+                "ssh_host": cfg["ssh_host"],
+                "can_wake": bool(cfg.get("wol_mac")),
+            }
     return {
         "name": name, "online": True,
         "cpu": int(m.get("cpu", 0)),
@@ -754,8 +902,17 @@ def get_ssh_client(host, user):
 
         raise
 
-def get_ssh_metrics(host, user):
-    """Get CPU, GPU, swap, disk I/O, and network I/O metrics via SSH."""
+def get_ssh_metrics(host, user, expected_host=None, hostname_aka=()):
+    """Get CPU, GPU, swap, disk I/O, and network I/O metrics via SSH.
+
+    `expected_host` is the name of the CARD these metrics will fill. When given,
+    the box is asked who it is and the reply is checked before any number is
+    returned - same wrong-box guard as the fleet row (see _fleet_host_matches).
+    On a mismatch the result carries `mismatch`/`reported_host` and NO metrics,
+    so a card can never render a different machine's dials. gandalf is the reason
+    this matters here: it currently sits on a dynamic lease, so it is the target
+    most likely to move again.
+    """
     result = {
         "cpu_percent": None,
         "cpu_temp": None,
@@ -783,6 +940,22 @@ def get_ssh_metrics(host, user):
         client = get_ssh_client(host, user)
         if client is None:
             return result  # Circuit breaker open, return empty metrics
+
+        # WRONG-BOX GUARD: before trusting a single dial, make the box say who it
+        # is. Cheap (one `hostname`) and it runs first, so a mismatch costs us the
+        # card's numbers rather than filling them from the wrong machine.
+        if expected_host:
+            _, who_out, _ = client.exec_command("hostname", timeout=SSH_COMMAND_TIMEOUT)
+            reported = who_out.read().decode().strip()
+            if not _fleet_host_matches(expected_host, reported, hostname_aka):
+                logger.warning(
+                    f"{expected_host} metrics: WRONG BOX - asked {host} for "
+                    f"'{expected_host}', got '{reported}'. Refusing to render its "
+                    f"dials. Check DNS/mDNS/DHCP for {expected_host}."
+                )
+                result["mismatch"] = True
+                result["reported_host"] = reported.split(".")[0]
+                return result
 
         # Include GPU identity and VRAM here so cards do not depend on ComfyUI's
         # /system_stats endpoint to render their gauges.
@@ -1372,7 +1545,15 @@ _ROUTE_HOST_TO_BOX = {
     "gandalf": "gandalf", "frodo": "frodo", "pippen": "pippin",
     "pippin": "pippin", "shadowfax": "shadowfax", "sam": "sam",
     "aragorn": "aragorn", "127.0.0.1": "gandalf", "localhost": "gandalf",
-    "192.168.1.15": "aragorn", "192.168.1.10": "gandalf", "192.168.1.11": "frodo",
+    # Derived from FLEET_IPS so the temporary post-outage map (2026-07-30) can't
+    # drift from the target definitions above. NOTE 192.168.1.10 is deliberately
+    # NOT mapped to gandalf any more: a GL-KVM dongle holds that address tonight,
+    # so claiming it is gandalf would attribute another device's routes to gandalf.
+    FLEET_IPS["aragorn"]: "aragorn",
+    FLEET_IPS["gandalf"]: "gandalf",
+    FLEET_IPS["frodo"]: "frodo",
+    FLEET_IPS["pippen"]: "pippin",
+    FLEET_IPS["shadowfax"]: "shadowfax",
 }
 _ROUTE_TOPOLOGY_FALLBACK = {
     "flagship": {"box": "gandalf", "model": "qwen3.6-35b-a3b-q8-256k", "port": 8889},
@@ -1453,16 +1634,16 @@ def get_loaded_route_models():
 
     for port in (11434, 11435):
         try:
-            r = requests.get(f"http://192.168.1.15:{port}/api/ps", timeout=4)
+            r = requests.get(f"http://{FLEET_IPS['aragorn']}:{port}/api/ps", timeout=4)
             if r.ok:
                 ids = {m.get("model") or m.get("name") for m in r.json().get("models", [])}
                 loaded.setdefault("aragorn", set()).update(i for i in ids if i)
         except Exception as e:
             logger.debug(f"aragorn ollama :{port} /api/ps unavailable: {e}")
 
-    for box, url in (("frodo", "http://192.168.1.11:8890/v1/models"),
-                     ("pippin", "http://pippen.local:8891/v1/models"),
-                     ("shadowfax", "http://shadowfax.local:8081/v1/models")):
+    for box, url in (("frodo", f"http://{FLEET_IPS['frodo']}:8890/v1/models"),
+                     ("pippin", f"http://{FLEET_IPS['pippen']}:8891/v1/models"),
+                     ("shadowfax", f"http://{FLEET_IPS['shadowfax']}:8081/v1/models")):
         try:
             r = requests.get(url, timeout=4)
             if r.ok:
@@ -1531,9 +1712,9 @@ def get_model_route_health():
 #     the dashboard can't hammer the GitHub API.
 AGENT_STAT_BOXES = {
     "gandalf": {"local": True},
-    "aragorn": {"ssh_host": "192.168.1.15", "ssh_user": "mac"},
-    "frodo":   {"ssh_host": "192.168.1.11", "ssh_user": "ben"},
-    "pippen":  {"ssh_host": "pippen", "ssh_user": "ben"},
+    "aragorn": {"ssh_host": FLEET_IPS["aragorn"], "ssh_user": "mac"},
+    "frodo":   {"ssh_host": FLEET_IPS["frodo"], "ssh_user": "ben"},
+    "pippen":  {"ssh_host": FLEET_IPS["pippen"], "ssh_user": "ben"},
 }
 # Portable across linux + mac: pgrep the main CLIs by full cmdline, then drop
 # any pid whose parent is also in the match set. The regex text itself never
@@ -1655,8 +1836,8 @@ def get_fleet_stats():
 # pippen: skipped - no llama-server there (route `code` moved; nothing serves).
 MODEL_SERVING_SOURCES = {
     "gandalf": {"kind": "llamaswap", "url": "http://127.0.0.1:8889/api/metrics"},
-    "frodo":   {"kind": "llamacpp",  "url": "http://192.168.1.11:8890/metrics"},
-    "pippin":  {"kind": "llamacpp",  "url": "http://pippen.local:8891/metrics"},
+    "frodo":   {"kind": "llamacpp",  "url": f"http://{FLEET_IPS['frodo']}:8890/metrics"},
+    "pippin":  {"kind": "llamacpp",  "url": f"http://{FLEET_IPS['pippen']}:8891/metrics"},
 }
 MODEL_SERVING_INTERVAL = 60      # sampling cadence, matches METRICS_INTERVAL
 MODEL_SERVING_RETENTION_DAYS = 8  # a hair over the 7d display window
@@ -1680,6 +1861,16 @@ GATEWAY_TOKENS_TTL = 45  # seconds
 gateway_tokens_cache = {"data": None, "ts": 0.0}
 gateway_tokens_lock = threading.Lock()
 
+# NOTE (2026-07-31): the day boundary below is now a {DAY_START} placeholder
+# rather than a hardcoded date_trunc, so /api/reset_stats?host=... can move it.
+# It was hardcoded, which is why clearing aragorn's numbers appeared to do
+# nothing - this path never consulted the reset marker at all.
+#
+# SEPARATE, AND WORSE: tps here is MAX(completion_tokens / request_wall_seconds).
+# For a short request that ratio is not a generation rate - a 200-token reply
+# that returns in 0.23s reads as 870 t/s. That is the origin of aragorn's
+# "877 peak", and it is a bad metric, not a fast machine. Fixing the metric is
+# a separate change; this one only makes the reset work.
 _GATEWAY_TOKENS_SQL = """
 WITH d AS (
   SELECT model,
@@ -1691,9 +1882,9 @@ WITH d AS (
     AND "startTime" >= now() - interval '7 days'
 )
 SELECT model,
-       COALESCE(SUM(tok)  FILTER (WHERE ts >= date_trunc('day', now() AT TIME ZONE 'America/Chicago') AT TIME ZONE 'America/Chicago'), 0),
-       COALESCE(SUM(secs) FILTER (WHERE ts >= date_trunc('day', now() AT TIME ZONE 'America/Chicago') AT TIME ZONE 'America/Chicago'), 0),
-       COALESCE(MAX(tok/secs) FILTER (WHERE ts >= date_trunc('day', now() AT TIME ZONE 'America/Chicago') AT TIME ZONE 'America/Chicago'), 0),
+       COALESCE(SUM(tok)  FILTER (WHERE ts >= {DAY_START}), 0),
+       COALESCE(SUM(secs) FILTER (WHERE ts >= {DAY_START}), 0),
+       COALESCE(MAX(tok/secs) FILTER (WHERE ts >= {DAY_START}), 0),
        COALESCE(MAX(tok/secs) FILTER (WHERE ts >= now() - interval '150 seconds'), 0),
        COUNT(*) FILTER (WHERE ts >= now() - interval '1 hour'),
        COUNT(*) FILTER (WHERE ts >= now() - interval '1 day'),
@@ -1711,9 +1902,15 @@ def get_gateway_token_stats():
 
     stats = {}
     try:
+        # Resolve the day boundary, honouring a fleet-wide ("*") reset. Per-host
+        # markers are applied after the fetch, below, because this query groups
+        # by MODEL and the model->host mapping lives in Python.
+        _fleet_start = stats_window_start()
+        _sql = _GATEWAY_TOKENS_SQL.replace(
+            "{DAY_START}", "TIMESTAMP '" + _fleet_start.replace("'", "") + "'")
         out = subprocess.run(
             ["docker", "exec", "litellm-db", "psql", "-U", "litellm", "-d", "litellm",
-             "-t", "-A", "-F", "|", "-c", _GATEWAY_TOKENS_SQL],
+             "-t", "-A", "-F", "|", "-c", _sql],
             capture_output=True, text=True, timeout=15,
         )
         for line in out.stdout.strip().splitlines():
@@ -1808,18 +2005,37 @@ MODEL_SERVING_CACHE_TTL = 30  # seconds
 STATS_RESET_FILE = "/var/lib/queue-router/stats_reset_at"
 
 
-def stats_window_start():
-    """Start of the 'today' window: midnight, or a later reset if one is set."""
+def stats_window_start(host=None):
+    """Start of the 'today' window: midnight, or a later reset if one is set.
+
+    PER-HOST since 2026-07-31 (Ben: "clear aragorn's peak and averages, they're
+    askew"). A fleet-wide reset would also throw away frodo's and gandalf's
+    legitimate numbers, so the marker file now holds a JSON map of
+    {host: iso-timestamp} plus an optional "*" entry meaning all hosts.
+    A bare timestamp (the pre-2026-07-31 format) is still read and treated as
+    "*", so an existing marker keeps working untouched.
+    """
     midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
     try:
         with open(STATS_RESET_FILE) as fh:
-            marker = fh.read().strip()
-        # A marker from a previous day must not pin the window in the past.
-        if marker > midnight:
-            return marker
+            raw = fh.read().strip()
     except OSError:
-        pass
-    return midnight
+        return midnight
+    if not raw:
+        return midnight
+    try:
+        marks = json.loads(raw)
+        if not isinstance(marks, dict):
+            marks = {"*": str(marks)}
+    except (ValueError, TypeError):
+        marks = {"*": raw}          # legacy bare-timestamp file
+    candidates = [marks.get("*"), marks.get(host) if host else None]
+    best = midnight
+    for c in candidates:
+        # A marker from a previous day must not pin the window in the past.
+        if isinstance(c, str) and c > best:
+            best = c
+    return best
 
 
 def get_model_serving_stats():
@@ -1831,7 +2047,8 @@ def get_model_serving_stats():
             return model_serving_cache["data"]
 
     now = datetime.now()
-    midnight = stats_window_start()   # honours a manual reset
+    # Per-host reset windows; resolved per box below.
+    midnight = stats_window_start()   # fleet-wide floor (honours a "*" reset)
     hour_ago = (now - timedelta(hours=1)).isoformat()
     day_ago = (now - timedelta(days=1)).isoformat()
     week_ago = (now - timedelta(days=7)).isoformat()
@@ -1855,10 +2072,11 @@ def get_model_serving_stats():
                     secs += out / tps
             return (round(toks / secs, 1) if secs > 0 else 0.0), secs
         tps_now, _ = _agg([r for r in rows if r[0] >= recent_cut])
-        tps_today, secs_today = _agg([r for r in rows if r[0] >= midnight])
+        _g_start = stats_window_start('gandalf')   # per-host reset window
+        tps_today, secs_today = _agg([r for r in rows if r[0] >= _g_start])
         # Peak generation speed seen today (single fastest request) - the bottom
         # band of the card's tokens/sec strip.
-        _today_tps = [r[2] for r in rows if r[0] >= midnight and r[2]]
+        _today_tps = [r[2] for r in rows if r[0] >= _g_start and r[2]]
         result["gandalf"] = {
             "available": True,
             "tps_now": tps_now,
@@ -1907,7 +2125,8 @@ def get_model_serving_stats():
             if deltas and deltas[-1][0] >= (now - timedelta(seconds=3 * MODEL_SERVING_INTERVAL)).isoformat():
                 _, d_tok, d_sec = deltas[-1]
                 tps_now = round(d_tok / d_sec, 1) if d_tok > 0 and d_sec > 0 else 0.0
-            today = [d for d in deltas if d[0] >= midnight]
+            box_start = stats_window_start(box)   # per-host reset window
+            today = [d for d in deltas if d[0] >= box_start]
             tok_today = sum(d[1] for d in today if d[1] > 0)
             sec_today = sum(d[2] for d in today if d[1] > 0)
             # Peak 60s-window generation speed today (bottom band of the t/s strip).
@@ -1942,6 +2161,22 @@ def get_model_serving_stats():
                 continue  # native counters win
             by_box.setdefault(info["box"], set()).add(info.get("model"))
         for box, models in by_box.items():
+            # Per-host reset (2026-07-31). This gateway-derived path groups by
+            # MODEL, so a per-host marker can only be applied here, where the
+            # model->box mapping exists. If this box was reset after the fleet
+            # window began, its today-figures are zeroed rather than shown
+            # stale: the underlying spend-log query cannot be re-cut per box
+            # without a second round-trip, and showing the OLD number after an
+            # explicit reset is the worse failure.
+            _box_start = stats_window_start(box)
+            if _box_start > stats_window_start():
+                result[box] = {
+                    "available": True, "source": "gateway", "reset": _box_start,
+                    "tps_now": 0.0, "tps_avg_today": 0.0, "tps_max_today": 0.0,
+                    "serving_minutes_today": 0,
+                    "requests": {"hour": 0, "day": 0, "week": 0},
+                }
+                continue
             rows = [gw[m] for m in models if m in gw]
             if not rows:
                 result.setdefault(box, {"available": False, "source": "gateway"})
@@ -2192,10 +2427,23 @@ def get_target_status(target_name, target_config, fast=False):
     # Get SSH metrics (CPU, GPU power, temp, util, swap, I/O) - independent of ComfyUI status
     if "ssh_host" in target_config:
         try:
+            # expected_host: verify the box is the one this card names before
+            # trusting its dials (2026-07-30 wrong-box guard). NOTE the card is
+            # called "pippin" but that machine's hostname is "pippen" - a real
+            # spelling difference, not a mismatch, hence TARGET_HOSTNAME_AKA.
             ssh_metrics = get_ssh_metrics(
                 target_config["ssh_host"],
-                target_config.get("ssh_user", "ben")
+                target_config.get("ssh_user", "ben"),
+                expected_host=target_name,
+                hostname_aka=TARGET_HOSTNAME_AKA.get(target_name, ()),
             )
+            if ssh_metrics.get("mismatch"):
+                # Wrong machine answered. Report the card as NOT online and carry
+                # the mismatch through, rather than showing another box's numbers.
+                result["online"] = False
+                result["mismatch"] = True
+                result["reported_host"] = ssh_metrics.get("reported_host")
+                return result
             result["cpu_percent"] = ssh_metrics.get("cpu_percent")
             result["cpu_temp"] = ssh_metrics.get("cpu_temp")
             result["gpu_count"] = ssh_metrics.get("gpu_count")
@@ -2275,7 +2523,7 @@ def get_target_status(target_name, target_config, fast=False):
 
 
 # ── Shipping pipeline snapshot (ported forward from bak-20260725; Gemini fleet monitor consumes /api/pipeline) ──
-PIPELINE_CACHE_TTL = 300  # seconds
+PIPELINE_CACHE_TTL = 0  # seconds
 pipeline_cache = {"data": None, "ts": 0.0}
 pipeline_cache_lock = threading.Lock()
 
@@ -2319,41 +2567,48 @@ def get_pipeline_status():
             ci = get_ci_queue_status()
             result["ci_queued"] = ci.get("queued", 0) if ci.get("available") else None
             result["ci_running"] = ci.get("in_progress", 0) if ci.get("available") else None
-            # deploys today (Gateway Deploy workflow)
+            # deploys today (Gateway Deploy workflow - paginated & filtered in Central Time)
             week_start = (now_ct - timedelta(days=6)).replace(hour=0, minute=0, second=0, microsecond=0)
-            r = requests.get(f"https://api.github.com/repos/{GITHUB_CI_REPO}/actions/runs",
-                             params={"created": f">={week_start.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}", "per_page": 100}, headers=headers, timeout=8)
             dep_ok = dep_fail = dep_live = 0
             live_started_min = None
             dep_days = [0] * 7
-            if r.ok:
-                for run in r.json().get("workflow_runs", []):
-                    if run.get("name") != "Gateway Deploy":
-                        continue
+            deploy_url = f"https://api.github.com/repos/{GITHUB_CI_REPO}/actions/workflows/gateway-deploy.yml/runs"
+            for page in (1, 2, 3):
+                r = requests.get(deploy_url, params={"created": f">={week_start.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}", "per_page": 100, "page": page}, headers=headers, timeout=8)
+                if not r.ok:
+                    break
+                runs = r.json().get("workflow_runs", [])
+                if not runs:
+                    break
+                for run in runs:
                     run_ct = None
                     try:
                         run_ct = datetime.strptime(run.get("created_at"), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).astimezone(CT)
                     except Exception:
                         pass
-                    is_today = run_ct is not None and run_ct.date() == now_ct.date()
-                    if run.get("status") == "completed" and run.get("conclusion") == "success" and run_ct is not None:
-                        idx = 6 - (now_ct.date() - run_ct.date()).days
+                    if run_ct is None:
+                        continue
+                    days_ago = (now_ct.date() - run_ct.date()).days
+                    idx = 6 - days_ago
+                    is_today = (run_ct.date() == now_ct.date())
+                    # Only count ACTUAL production deploy triggers (push to main or workflow_dispatch).
+                    # Exclude merge_group, pull_request, and scheduled test-runs from deploy counters (Ben 2026-08-07).
+                    if run.get("event") not in ("push", "workflow_dispatch"):
+                        continue
+                    if run.get("status") == "completed" and run.get("conclusion") == "success":
                         if 0 <= idx <= 6:
                             dep_days[idx] += 1
-                    if run.get("status") != "completed":
-                        if not is_today:
-                            continue
-                        dep_live += 1
-                        try:
-                            t = datetime.strptime(run.get("run_started_at") or run.get("created_at"),
-                                                  "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-                            m = int((datetime.now(timezone.utc) - t).total_seconds() // 60)
-                            live_started_min = m if live_started_min is None else min(live_started_min, m)
-                        except Exception:
-                            pass
-                    elif run.get("conclusion") == "success":
                         if is_today:
                             dep_ok += 1
+                    elif run.get("status") != "completed":
+                        if is_today:
+                            dep_live += 1
+                            try:
+                                t = datetime.strptime(run.get("run_started_at") or run.get("created_at"), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                                m = int((datetime.now(timezone.utc) - t).total_seconds() // 60)
+                                live_started_min = m if live_started_min is None else min(live_started_min, m)
+                            except Exception:
+                                pass
                     elif run.get("conclusion") not in ("cancelled", "skipped"):
                         if is_today:
                             dep_fail += 1
@@ -2570,15 +2825,30 @@ def api_reset_stats():
                 pass
             return jsonify({"reset_at": None, "note": "back to midnight"})
         now_iso = datetime.now().isoformat()
+        # Optional ?host=aragorn (or JSON {"host": ...}) resets ONE box; omitting
+        # it resets the fleet, which is the historical behaviour. Per-host was
+        # added 2026-07-31 so clearing one machine's skewed numbers no longer
+        # discards every other machine's legitimate ones.
+        host = request.args.get("host") or (request.get_json(silent=True) or {}).get("host")
         os.makedirs(os.path.dirname(STATS_RESET_FILE), exist_ok=True)
+        marks = {}
+        try:
+            with open(STATS_RESET_FILE) as fh:
+                raw = fh.read().strip()
+            if raw:
+                parsed = json.loads(raw)
+                marks = parsed if isinstance(parsed, dict) else {"*": str(parsed)}
+        except (OSError, ValueError, TypeError):
+            marks = {}
+        marks[host or "*"] = now_iso
         with open(STATS_RESET_FILE, "w") as fh:
-            fh.write(now_iso)
+            fh.write(json.dumps(marks))
         # Drop the cached stats so the reset shows up immediately rather than
         # after the next cache expiry.
         with model_serving_cache_lock:
             model_serving_cache["data"] = None
             model_serving_cache["ts"] = 0.0
-        return jsonify({"reset_at": now_iso})
+        return jsonify({"reset_at": now_iso, "host": host or "*", "markers": marks})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -2868,6 +3138,11 @@ border:1px solid #1a2332;box-shadow:0 0 20px rgba(0,255,242,0.1),inset 0 0 60px 
 background:linear-gradient(90deg,transparent,var(--neon-cyan),transparent)}
 .online{color:var(--neon-green);font-weight:bold;text-shadow:var(--glow-green)}
 .offline{color:var(--neon-red);font-weight:bold;text-shadow:var(--glow-red);animation:pulse 1s infinite}
+/* MISMATCH (2026-07-30): amber, and it pulses like OFFLINE because it also needs
+   attention - but a distinct colour, because "I reached the wrong machine" is a
+   different fault from "this machine is down" and wants a different fix (DNS/DHCP,
+   not a power button). */
+.mismatch{color:var(--neon-amber,#ffb020);font-weight:bold;animation:pulse 1s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.7}}
 @keyframes glow-pulse{0%,100%{filter:brightness(1)}50%{filter:brightness(1.3)}}
 .job{padding:10px 15px;border-left:3px solid var(--neon-cyan);margin:8px 0;background:var(--bg-panel);
@@ -3040,6 +3315,12 @@ position:relative;overflow:hidden;font-size:0.78em;line-height:1.5}
 background:linear-gradient(90deg,var(--neon-green),transparent)}
 .fleet-tile.off::before{background:linear-gradient(90deg,var(--neon-red),transparent)}
 .fleet-tile.off{opacity:0.65}
+/* MISMATCH (2026-07-30): the address answered as a different machine. Amber, not
+   red - this is "do not trust this tile", which is a different problem from
+   "this box is down", and it must not look like ordinary offline. Full opacity
+   so it draws the eye instead of fading out like a box that is merely asleep. */
+.fleet-tile.mismatch::before{background:linear-gradient(90deg,var(--neon-amber,#ffb020),transparent)}
+.fleet-tile.mismatch{opacity:1;border-color:var(--neon-amber,#ffb020)}
 .ft-name{font-family:'Orbitron',monospace;font-size:0.85em;letter-spacing:1px;color:var(--neon-cyan);
 text-transform:uppercase;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:2px}
 .ft-stat{display:flex;justify-content:space-between;color:#9ab}
@@ -3223,12 +3504,19 @@ let fleetInitialized = false;
 
 function fleetTileHtml(name, n) {
     const icon = fleetIcons[name] || '🖥️';
-    let html = '<div class="fleet-tile' + (n.online ? '' : ' off') + '" id="fleet-tile-' + name + '">';
+    let html = '<div class="fleet-tile' + (n.online ? '' : ' off') + (n.mismatch ? ' mismatch' : '') + '" id="fleet-tile-' + name + '">';
     html += '<div class="ft-name">' + icon + ' ' + name + '</div>';
     if (n.online) {
         html += '<div class="ft-stat"><span>CPU</span><b class="' + pctClass(n.cpu) + '" id="ft-cpu-' + name + '">' + n.cpu + '%</b></div>';
         html += '<div class="ft-stat"><span>TEMP</span><b class="' + tempClass(n.temp_c) + '" id="ft-temp-' + name + '">' + n.temp_c + '°C</b></div>';
         html += '<div class="ft-stat"><span>RAM</span><b class="' + pctClass(n.ram_pct) + '" id="ft-ram-' + name + '">' + n.ram_used_gb + '/' + n.ram_total_gb + 'G</b></div>';
+    } else if (n.mismatch) {
+        // The address for this tile answered as a DIFFERENT machine, so we have
+        // no trustworthy numbers for THIS box. Say exactly that - deliberately no
+        // stats, because numbers on screen get believed. See _fleet_host_matches.
+        html += '<div class="ft-stat"><span style="color:var(--neon-amber,#ffb020)">MISMATCH</span><b></b></div>';
+        html += '<div class="ft-stat"><span style="font-size:10px">got</span><b style="font-size:10px">' + (n.reported_host || '?') + '</b></div>';
+        html += '<div class="ft-stat"><span style="font-size:10px">at</span><b style="font-size:10px">' + (n.ssh_host || '?') + '</b></div>';
     } else {
         html += '<div class="ft-stat"><span style="color:var(--neon-red)">OFFLINE</span><b></b></div>';
         html += '<div class="ft-stat"><span>&nbsp;</span><b></b></div>';
@@ -3263,7 +3551,7 @@ function refreshFleet() {
             document.getElementById('fleet-row').innerHTML = html;
             for (const [name, n] of Object.entries(data)) {
                 const tile = document.getElementById('fleet-tile-' + name);
-                if (tile) tile.dataset.shape = n.online + ':' + n.can_wake;
+                if (tile) tile.dataset.shape = n.online + ':' + n.can_wake + ':' + !!n.mismatch;
             }
             fleetInitialized = true;
             return;
@@ -3273,7 +3561,9 @@ function refreshFleet() {
         // pure stat ticks update text in place).
         for (const [name, n] of Object.entries(data)) {
             const tile = document.getElementById('fleet-tile-' + name);
-            const key = n.online + ':' + n.can_wake;
+            // mismatch is part of the shape: flipping into or out of MISMATCH must
+            // rebuild the tile, or a stale tile keeps showing the old body.
+            const key = n.online + ':' + n.can_wake + ':' + !!n.mismatch;
             if (!tile || tile.dataset.shape !== key) {
                 const html = fleetTileHtml(name, n);
                 if (tile) {
@@ -3931,7 +4221,12 @@ function refresh() {
 
             for (const [name, info] of Object.entries(targets)) {
                 const icon = icons[name] || "🖥️";
-                const status = info.online ? '<span class="online">ONLINE</span>' : '<span class="offline">OFFLINE</span>';
+                // MISMATCH outranks ONLINE/OFFLINE: if the address answered as a
+                // different machine we know nothing trustworthy about this box, and
+                // saying so beats saying "offline" (which would read as "asleep").
+                const status = info.mismatch
+                    ? '<span class="mismatch" title="This address answered as ' + (info.reported_host || 'another machine') + ' - check DNS/DHCP">MISMATCH (' + (info.reported_host || '?') + ')</span>'
+                    : (info.online ? '<span class="online">ONLINE</span>' : '<span class="offline">OFFLINE</span>');
 
                 const isMac = info.os === 'mac';
 
@@ -4700,7 +4995,8 @@ if __name__ == "__main__":
     logger.info("  GANDALF FLEET MONITOR")
     logger.info("=" * 60)
     logger.info(f"  Listening: http://0.0.0.0:5000")
-    logger.info(f"  Dashboard: http://shadowfax.local")
+    # Stale since the 2026-07-21 move to gandalf; corrected 2026-07-30.
+    logger.info(f"  Dashboard: http://{FLEET_IPS['gandalf']}:5000")
     logger.info(f"  Targets:   {', '.join(CONFIG['targets'].keys())}")
     logger.info(f"  Notifications: Pushover {'enabled' if PUSHOVER_CONFIG['enabled'] else 'disabled'}")
     logger.info("=" * 60)
