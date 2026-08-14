@@ -3448,6 +3448,7 @@ border-radius:999px;border:1px solid #2a2a4e;background:var(--bg-panel);color:#8
 <tr><th>Machine</th><th>Hardware</th><th>GPU</th><th>Role</th></tr>
 <tr><td>🧙 <b>Gandalf</b></td><td>Ryzen 9 9950X · 256GB</td><td><b style="color:#d9a54a">RTX PRO 6000 · 96GB</b></td><td>Video + heavy generation</td></tr>
 <tr><td>🧝 <b>Frodo</b></td><td>Core i9-9900K · 128GB</td><td><b style="color:#5a8a4a">RTX 5090 · 32GB</b></td><td>Flux / SDXL generation</td></tr>
+<tr><td>👑 <b>Aragorn</b></td><td>Ryzen 9 9950X · 123GB</td><td><b style="color:#5a8a4a">RTX 5080 + RTX 5070 · 28GB</b></td><td>Local LLM routes + CI runners</td></tr>
 <tr><td>🍎 <b>Pippin</b></td><td>Mac Studio M1 Max · 64GB</td><td><b style="color:#5a8a4a">32-core Apple GPU</b></td><td>Mac workloads</td></tr>
 </table>
 </div>
