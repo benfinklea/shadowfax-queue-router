@@ -1207,6 +1207,210 @@ def _model_processes(target_name, target_config):
     return rows
 
 
+VRAM_PROCESSES_CACHE_TTL = 5.0
+vram_processes_cache = {}
+vram_processes_cache_lock = threading.Lock()
+
+
+def _parse_vram_cmdline(cmdline, process_name):
+    """Extract port and model/service name from process cmdline."""
+    port = None
+    model = None
+
+    if cmdline:
+        port_match = re.search(r'(?:--port|-p|\bport=)\s*(\d+)', cmdline)
+        if port_match:
+            port = int(port_match.group(1))
+
+        model_match = re.search(r'(?:-m|--model)\s+([^\s]+)', cmdline)
+        if model_match:
+            raw = model_match.group(1)
+            p = Path(raw)
+            stem = p.stem
+            parent = p.parent.name
+            if parent and parent.lower() not in (
+                'gguf', 'models', 'weights', 'checkpoints', 'bin', 'ggml', '.', 'gguf-models'
+            ):
+                if stem.lower() != parent.lower() and not stem.lower().startswith(parent.lower()):
+                    model = f"{parent} ({stem})"
+                else:
+                    model = f"{parent} ({stem})" if len(stem) > len(parent) else parent
+            else:
+                model = stem
+        else:
+            script_match = re.search(r'([a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+\.py)', cmdline)
+            if not script_match:
+                script_match = re.search(r'([a-zA-Z0-9_-]+\.py)', cmdline)
+            if script_match:
+                model = script_match.group(1)
+
+    short_name = Path(process_name).name if process_name else "unknown"
+    return short_name, port, model
+
+
+def _fetch_vram_processes(target_name):
+    """Fetch live processes holding VRAM on a target GPU using nvidia-smi."""
+    target_config = CONFIG["targets"].get(target_name)
+    if not target_config or target_config.get("os") == "mac":
+        return {
+            "target": target_name,
+            "available": False,
+            "processes": [],
+            "sum_vram_mb": 0,
+            "total_vram_mb": 0,
+            "used_vram_mb": 0,
+            "free_vram_mb": 0,
+            "error": "Not an NVIDIA GPU target",
+        }
+
+    cmd_apps = (
+        "nvidia-smi --query-compute-apps=pid,process_name,used_memory "
+        "--format=csv,noheader,nounits"
+    )
+    cmd_gpu = (
+        "nvidia-smi --query-gpu=memory.total,memory.used,memory.free "
+        "--format=csv,noheader,nounits"
+    )
+
+    apps_out = ""
+    gpu_out = ""
+
+    if target_name == "gandalf":
+        try:
+            r1 = subprocess.run(
+                cmd_apps.split(), capture_output=True, text=True, timeout=5, check=False
+            )
+            apps_out = r1.stdout or ""
+            r2 = subprocess.run(
+                cmd_gpu.split(), capture_output=True, text=True, timeout=5, check=False
+            )
+            gpu_out = r2.stdout or ""
+
+            def read_cmdline(pid):
+                try:
+                    return Path(f"/proc/{pid}/cmdline").read_bytes().replace(
+                        b"\x00", b" "
+                    ).decode(errors="ignore")
+                except Exception:
+                    return ""
+        except Exception as e:
+            logger.warning(f"vram-processes query failed for {target_name}: {e}")
+            return {
+                "target": target_name,
+                "available": False,
+                "processes": [],
+                "sum_vram_mb": 0,
+                "total_vram_mb": 0,
+                "used_vram_mb": 0,
+                "free_vram_mb": 0,
+                "error": str(e),
+            }
+    else:
+        client = get_ssh_client(
+            target_config["ssh_host"], target_config.get("ssh_user", "ben")
+        )
+        if client is None:
+            return {
+                "target": target_name,
+                "available": False,
+                "processes": [],
+                "sum_vram_mb": 0,
+                "total_vram_mb": 0,
+                "used_vram_mb": 0,
+                "free_vram_mb": 0,
+                "error": "SSH client unavailable",
+            }
+        try:
+            _, stdout1, _ = client.exec_command(cmd_apps, timeout=5)
+            apps_out = stdout1.read().decode(errors="ignore")
+            _, stdout2, _ = client.exec_command(cmd_gpu, timeout=5)
+            gpu_out = stdout2.read().decode(errors="ignore")
+
+            def read_cmdline(pid):
+                try:
+                    _, cmdout, _ = client.exec_command(
+                        f"tr '\\0' ' ' < /proc/{pid}/cmdline 2>/dev/null", timeout=4
+                    )
+                    return cmdout.read().decode(errors="ignore")
+                except Exception:
+                    return ""
+        except Exception as e:
+            logger.warning(f"vram-processes SSH query failed for {target_name}: {e}")
+            return {
+                "target": target_name,
+                "available": False,
+                "processes": [],
+                "sum_vram_mb": 0,
+                "total_vram_mb": 0,
+                "used_vram_mb": 0,
+                "free_vram_mb": 0,
+                "error": str(e),
+            }
+
+    total_vram_mb = 0
+    used_vram_mb = 0
+    free_vram_mb = 0
+    for line in gpu_out.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) >= 3:
+            try:
+                total_vram_mb += int(float(parts[0]))
+                used_vram_mb += int(float(parts[1]))
+                free_vram_mb += int(float(parts[2]))
+            except ValueError:
+                pass
+
+    processes = []
+    for line in apps_out.strip().splitlines():
+        parts = [p.strip() for p in line.split(",", 2)]
+        if len(parts) != 3 or not parts[0].isdigit():
+            continue
+        try:
+            pid = int(parts[0])
+            process_name = parts[1]
+            vram_mb = int(float(parts[2]))
+            cmdline = read_cmdline(pid)
+            short_name, port, model = _parse_vram_cmdline(cmdline, process_name)
+            processes.append({
+                "pid": pid,
+                "process_name": short_name,
+                "full_process_name": process_name,
+                "vram_mb": vram_mb,
+                "port": port,
+                "model": model,
+                "cmdline": cmdline[:200],
+            })
+        except Exception as e:
+            logger.debug(f"error parsing process line '{line}': {e}")
+            continue
+
+    sum_vram_mb = sum(p["vram_mb"] for p in processes)
+
+    return {
+        "target": target_name,
+        "available": True,
+        "processes": processes,
+        "sum_vram_mb": sum_vram_mb,
+        "total_vram_mb": total_vram_mb,
+        "used_vram_mb": used_vram_mb,
+        "free_vram_mb": free_vram_mb,
+    }
+
+
+def get_vram_processes(target_name):
+    """Cached wrapper around _fetch_vram_processes (5s TTL)."""
+    now = time.time()
+    with vram_processes_cache_lock:
+        cached = vram_processes_cache.get(target_name)
+        if cached and (now - cached["ts"] < VRAM_PROCESSES_CACHE_TTL):
+            return cached["data"]
+
+    data = _fetch_vram_processes(target_name)
+    with vram_processes_cache_lock:
+        vram_processes_cache[target_name] = {"data": data, "ts": time.time()}
+    return data
+
+
 def get_ollama_loaded_models(target_config):
     """What each instance on a box has RESIDENT, and on which card.
 
@@ -2883,6 +3087,22 @@ def api_model_routes():
     """Live/missing status for each 🔒 local fleet-gateway route (cached)."""
     return jsonify(get_model_route_health())
 
+@app.route("/api/vram-processes", methods=["GET"])
+def api_vram_processes():
+    """Live VRAM processes per target GPU (cached for 5s)."""
+    target = request.args.get("target")
+    if target:
+        if target in CONFIG["targets"]:
+            return jsonify({target: get_vram_processes(target)})
+        else:
+            return jsonify({"error": f"Unknown target '{target}'"}), 404
+
+    results = {}
+    for name, config in CONFIG["targets"].items():
+        if config.get("os") != "mac":
+            results[name] = get_vram_processes(name)
+    return jsonify(results)
+
 @app.route("/api/fleet_power", methods=["POST"])
 def fleet_power():
     """Reboot a fleet-row host, or WoL-wake an offline farthing."""
@@ -3408,6 +3628,29 @@ box-shadow:0 0 7px #00fff2;transition:width 1.2s cubic-bezier(0.4,0,0.2,1)}
 border-radius:999px;border:1px solid #2a2a4e;background:var(--bg-panel);color:#889}
 .route-pill.live{color:var(--neon-green);border-color:var(--neon-green);box-shadow:0 0 8px rgba(57,255,20,0.25)}
 .route-pill.missing{color:var(--neon-red);border-color:var(--neon-red);box-shadow:0 0 8px rgba(255,0,68,0.25);animation:pulse 1.5s infinite}
+/* VRAM Hover Tooltip */
+.vram-row{cursor:pointer}
+.vram-row:hover .progress-bar{border-color:var(--neon-cyan);box-shadow:0 0 10px rgba(0,255,242,0.4)}
+.vram-tooltip{position:fixed;z-index:10000;background:var(--bg-card);border:1px solid var(--neon-cyan);
+border-radius:6px;padding:12px 14px;box-shadow:var(--glow-cyan),0 10px 30px rgba(0,0,0,0.8);
+font-family:'Rajdhani',sans-serif;color:#e0e0e0;font-size:15px;min-width:320px;max-width:480px;
+pointer-events:none;opacity:0;display:none;transition:opacity 0.15s ease-in-out}
+.vram-tooltip.visible{display:block;opacity:1}
+.vram-tooltip-hdr{font-family:'Orbitron',monospace;font-size:0.85em;font-weight:700;letter-spacing:1.5px;
+color:var(--neon-cyan);text-transform:uppercase;border-bottom:1px solid #1a2332;padding-bottom:6px;
+margin-bottom:8px;display:flex;justify-content:space-between;align-items:center}
+.vram-tooltip-list{display:flex;flex-direction:column;gap:8px;max-height:300px;overflow-y:auto}
+.vram-proc-item{background:var(--bg-panel);border-left:3px solid var(--neon-green);padding:6px 10px;border-radius:0 4px 4px 0}
+.vram-proc-hdr{display:flex;justify-content:space-between;align-items:center;font-weight:600;color:#fff}
+.vram-proc-name{font-family:'Orbitron',monospace;font-size:0.9em;color:var(--neon-cyan)}
+.vram-proc-vram{font-family:'Orbitron',monospace;color:var(--neon-green);font-weight:700}
+.vram-proc-details{font-size:0.85em;color:#aaa;margin-top:2px}
+.vram-proc-model{color:var(--neon-yellow)}
+.vram-proc-port{color:var(--neon-magenta);font-family:monospace}
+.vram-tooltip-footer{border-top:1px solid #1a2332;margin-top:8px;padding-top:6px;font-size:0.85em;
+color:#889;display:flex;justify-content:space-between;font-family:'Orbitron',monospace}
+.vram-tooltip-footer .sum-val{color:var(--neon-green)}
+.vram-tooltip-footer .free-val{color:var(--neon-cyan)}
 </style></head>
 <body><h1>GANDALF // FLEET MONITOR</h1>
 
@@ -3861,7 +4104,10 @@ function loadedModelsHtml(lm) {
 // Label + thin bar + value, all on ONE line (compact card layout).
 function miniRow(label, percent, cls, barId, labelId, valueText, peakPct) {
     const help = HELP[label.toLowerCase()] || '';
-    return '<div class="mini-row" title="' + help.replace(/"/g, '') + '"><span class="mini-label">' + label + '</span>' +
+    const isVram = (label === 'VRAM' || (barId && barId.startsWith('vram-')));
+    const targetAttr = isVram ? ' data-vram-target="' + barId.replace('vram-', '') + '"' : '';
+    const extraClass = isVram ? ' vram-row' : '';
+    return '<div class="mini-row' + extraClass + '"' + targetAttr + ' title="' + help.replace(/"/g, '') + '"><span class="mini-label">' + label + '</span>' +
         progressBar(percent, cls, barId, peakPct) +
         '<span class="mini-val" id="' + labelId + '">' + valueText + '</span></div>';
 }
@@ -4656,6 +4902,148 @@ function stopPolling() {
     clearInterval(modelServingTimer); modelServingTimer = null;
 }
 
+let vramTooltipEl = null;
+let activeVramTarget = null;
+let lastVramFetchTime = 0;
+let cachedVramData = {};
+
+function initVramTooltip() {
+    if (document.getElementById('vram-tooltip')) return;
+    vramTooltipEl = document.createElement('div');
+    vramTooltipEl.id = 'vram-tooltip';
+    vramTooltipEl.className = 'vram-tooltip';
+    document.body.appendChild(vramTooltipEl);
+
+    document.addEventListener('mouseover', function(e) {
+        const row = e.target.closest('.vram-row');
+        if (row && row.dataset.vramTarget) {
+            showVramTooltip(row.dataset.vramTarget, e);
+        }
+    });
+
+    document.addEventListener('mousemove', function(e) {
+        const row = e.target.closest('.vram-row');
+        if (row && vramTooltipEl && vramTooltipEl.classList.contains('visible')) {
+            positionVramTooltip(e);
+        }
+    });
+
+    document.addEventListener('mouseout', function(e) {
+        const row = e.target.closest('.vram-row');
+        if (row) {
+            const related = e.relatedTarget ? e.relatedTarget.closest('.vram-row') : null;
+            if (related !== row) {
+                hideVramTooltip();
+            }
+        }
+    });
+}
+
+function positionVramTooltip(e) {
+    if (!vramTooltipEl) return;
+    const padding = 15;
+    let left = e.clientX + padding;
+    let top = e.clientY + padding;
+
+    const rect = vramTooltipEl.getBoundingClientRect();
+    if (left + rect.width > window.innerWidth - 10) {
+        left = e.clientX - rect.width - padding;
+    }
+    if (top + rect.height > window.innerHeight - 10) {
+        top = e.clientY - rect.height - padding;
+    }
+    vramTooltipEl.style.left = Math.max(10, left) + 'px';
+    vramTooltipEl.style.top = Math.max(10, top) + 'px';
+}
+
+function showVramTooltip(targetName, e) {
+    if (!vramTooltipEl) initVramTooltip();
+    activeVramTarget = targetName;
+    positionVramTooltip(e);
+    vramTooltipEl.classList.add('visible');
+
+    const now = Date.now();
+    if (cachedVramData[targetName] && (now - lastVramFetchTime < 3000)) {
+        renderVramTooltipContent(targetName, cachedVramData[targetName]);
+        return;
+    }
+
+    if (!cachedVramData[targetName]) {
+        vramTooltipEl.innerHTML = '<div class="vram-tooltip-hdr"><span>🧠 VRAM Processes</span><span>' + targetName.toUpperCase() + '</span></div><div>Loading VRAM processes…</div>';
+    }
+
+    fetch('/api/vram-processes?target=' + encodeURIComponent(targetName))
+        .then(r => r.json())
+        .then(data => {
+            const targetData = data[targetName] || data;
+            cachedVramData[targetName] = targetData;
+            lastVramFetchTime = Date.now();
+            if (activeVramTarget === targetName) {
+                renderVramTooltipContent(targetName, targetData);
+            }
+        })
+        .catch(err => {
+            if (activeVramTarget === targetName) {
+                vramTooltipEl.innerHTML = '<div class="vram-tooltip-hdr"><span>🧠 VRAM Processes</span><span>' + targetName.toUpperCase() + '</span></div><div style="color:var(--neon-red)">Error loading VRAM processes</div>';
+            }
+        });
+}
+
+function hideVramTooltip() {
+    activeVramTarget = null;
+    if (vramTooltipEl) {
+        vramTooltipEl.classList.remove('visible');
+    }
+}
+
+function renderVramTooltipContent(targetName, data) {
+    if (!vramTooltipEl) return;
+    if (!data || !data.available) {
+        vramTooltipEl.innerHTML = '<div class="vram-tooltip-hdr"><span>🧠 VRAM Processes</span><span>' + targetName.toUpperCase() + '</span></div>' +
+            '<div style="color:#889">GPU process data unavailable</div>';
+        return;
+    }
+
+    const procs = data.processes || [];
+    let html = '<div class="vram-tooltip-hdr"><span>🧠 VRAM Processes</span><span>' + targetName.toUpperCase() + '</span></div>';
+
+    if (procs.length === 0) {
+        html += '<div style="color:#889;padding:6px 0">No active compute processes holding VRAM</div>';
+    } else {
+        html += '<div class="vram-tooltip-list">';
+        for (const p of procs) {
+            html += '<div class="vram-proc-item">';
+            html += '<div class="vram-proc-hdr">';
+            html += '<span class="vram-proc-name">' + (p.process_name || 'unknown') + ' <span style="color:#889;font-size:0.85em">(PID ' + p.pid + ')</span></span>';
+            html += '<span class="vram-proc-vram">' + p.vram_mb.toLocaleString() + ' MiB</span>';
+            html += '</div>';
+
+            const details = [];
+            if (p.model) details.push('<span class="vram-proc-model">' + p.model + '</span>');
+            if (p.port) details.push('<span class="vram-proc-port">port ' + p.port + '</span>');
+            if (details.length > 0) {
+                html += '<div class="vram-proc-details">' + details.join(' · ') + '</div>';
+            }
+            html += '</div>';
+        }
+        html += '</div>';
+    }
+
+    const sumMb = data.sum_vram_mb !== undefined ? data.sum_vram_mb : (data.used_vram_mb || 0);
+    const freeMb = data.free_vram_mb !== undefined ? data.free_vram_mb : 0;
+    const totalMb = data.total_vram_mb !== undefined ? data.total_vram_mb : 0;
+
+    html += '<div class="vram-tooltip-footer">';
+    html += '<span>Sum: <span class="sum-val">' + sumMb.toLocaleString() + ' MiB</span></span>';
+    html += '<span>Free: <span class="free-val">' + freeMb.toLocaleString() + ' MiB</span></span>';
+    if (totalMb > 0) {
+        html += '<span>Total: ' + totalMb.toLocaleString() + ' MiB</span>';
+    }
+    html += '</div>';
+
+    vramTooltipEl.innerHTML = html;
+}
+
 document.addEventListener('visibilitychange', () => {
     if (document.hidden) {
         stopPolling();
@@ -4674,6 +5062,7 @@ document.addEventListener('visibilitychange', () => {
     }
 });
 
+initVramTooltip();
 refresh();
 refreshHistory();
 refreshEnergy();
