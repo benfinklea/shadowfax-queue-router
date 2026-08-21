@@ -2730,6 +2730,7 @@ def get_target_status(target_name, target_config, fast=False):
 PIPELINE_CACHE_TTL = 0  # seconds
 pipeline_cache = {"data": None, "ts": 0.0}
 pipeline_cache_lock = threading.Lock()
+pipeline_gh_failing_since = None
 
 def get_pipeline_status():
     """Shipping-pipeline snapshot for armbrain: issues -> PRs -> CI -> merged
@@ -2739,7 +2740,9 @@ def get_pipeline_status():
         if pipeline_cache["data"] is not None and (now - pipeline_cache["ts"]) < PIPELINE_CACHE_TTL:
             return pipeline_cache["data"]
 
+    global pipeline_gh_failing_since
     result = {"available": False, "repo": GITHUB_CI_REPO}
+    github_reads_ok = False
     token = get_gh_ci_token()
     if token:
         try:
@@ -2855,9 +2858,20 @@ def get_pipeline_status():
                             break
             except Exception as e:
                 logger.warning(f"last-deploy lookup failed: {e}")
-            result["available"] = True
+            github_reads_ok = all(result.get(field) is not None for field in (
+                "issues_open", "prs_open", "merged_today", "ci_queued", "ci_running"
+            ))
         except Exception as e:
             logger.warning(f"pipeline status failed: {e}")
+
+    if github_reads_ok:
+        pipeline_gh_failing_since = None
+        result["available"] = True
+    else:
+        if pipeline_gh_failing_since is None:
+            from datetime import timezone
+            pipeline_gh_failing_since = datetime.now(timezone.utc).isoformat()
+        result["gh_auth_failing_since"] = pipeline_gh_failing_since
 
     with pipeline_cache_lock:
         pipeline_cache["data"] = result
@@ -3877,7 +3891,12 @@ function refreshShipFlow() {
         const el = document.getElementById('ship-flow');
         if (!el) return;
         if (!d.available) {
-            el.innerHTML = '<span class="gdim">shipping pipeline unavailable (GitHub read failed) — stale, not an outage</span>';
+            let since = '';
+            if (d.gh_auth_failing_since) {
+                const t = new Date(d.gh_auth_failing_since);
+                since = ' since ' + t.toLocaleString('en-US', {month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZone: 'America/Chicago', timeZoneName: 'short'});
+            }
+            el.innerHTML = '<span class="gdim">shipping pipeline unavailable (GitHub read failed)' + since + ' — stale, not an outage</span>';
             return;
         }
         const ARROW = '<div class="ship-arrow">&#10148;</div>';
