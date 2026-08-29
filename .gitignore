@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
+queue_router.db
 .DS_Store
 ._.DS_Store
 *.bak-*
