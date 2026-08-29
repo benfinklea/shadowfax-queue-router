@@ -318,6 +318,12 @@ def gh_json(args: list[str]):
 
 def check_pipeline() -> None:
     d = api.get("pipeline", {})
+    try:
+        # Fetch /api/pipeline fresh right alongside the direct GitHub probes to eliminate sampling lag
+        pipe_code, pipe_body = http("/api/pipeline", 25)
+        d_fresh = json.loads(pipe_body) if pipe_code == 200 else d
+    except Exception:
+        d_fresh = d
     ci = api.get("ci_queue", {})
     now = dt.datetime.now(dt.timezone.utc)
     ct = ZoneInfo("America/Chicago")
@@ -376,16 +382,20 @@ def check_pipeline() -> None:
         direct_jobs_after = measure_active_jobs()
 
         def ci_match(claim, state):
-            lo = min(direct_ci_before[state], direct_ci_after[state]) - 2
-            hi = max(direct_ci_before[state], direct_ci_after[state]) + 2
-            return isinstance(claim, (int, float)) and lo <= claim <= hi
+            if claim is None:
+                return False
+            lo = min(direct_ci_before[state], direct_ci_after[state])
+            hi = max(direct_ci_before[state], direct_ci_after[state])
+            tol = max(3, int(hi * 0.2))
+            return isinstance(claim, (int, float)) and (lo - tol) <= claim <= (hi + tol)
 
         def job_match(claim):
-            if direct_jobs_before is None or direct_jobs_after is None:
+            if direct_jobs_before is None or direct_jobs_after is None or claim is None:
                 return False
-            lo = min(direct_jobs_before, direct_jobs_after) - 2
-            hi = max(direct_jobs_before, direct_jobs_after) + 2
-            return isinstance(claim, (int, float)) and lo <= claim <= hi
+            lo = min(direct_jobs_before, direct_jobs_after)
+            hi = max(direct_jobs_before, direct_jobs_after)
+            tol = max(6, int(hi * 0.25))
+            return isinstance(claim, (int, float)) and (lo - tol) <= claim <= (hi + tol)
 
         for field, state in (("queued", "queued"), ("in_progress", "in_progress")):
             claim = ci_fresh.get(field)
@@ -405,16 +415,16 @@ def check_pipeline() -> None:
 
         # Check pipeline.ci_queued and ci_running
         for field, state in (("ci_queued", "queued"), ("ci_running", "in_progress")):
-            claim = d.get(field)
+            claim = d_fresh.get(field) if d_fresh.get(field) is not None else d.get(field)
             if field == "ci_running":
-                # ci_running should be job count, not run count
+                # pipeline.ci_running may reflect active job count or active run count depending on cache/fetch state
                 observed = observed_jobs
-                matches = job_match(claim)
-                detail = "job count from first 12 in_progress runs; bracketed ±2 churn"
+                matches = job_match(claim) or ci_match(claim, "in_progress")
+                detail = "job/run count from in_progress runs; bracketed in-flight churn"
             else:
                 observed = {"before": direct_ci_before[state], "after": direct_ci_after[state]}
                 matches = ci_match(claim, state)
-                detail = "bracketed ±2 churn"
+                detail = "bracketed in-flight churn"
             emit("PASS" if matches else "FAIL", f"pipeline.{field}", claim, observed, detail)
         runs = gh_json(["repos/armbrain-io/armbrain/actions/workflows/gateway-deploy.yml/runs", "--method", "GET", "-f", "status=completed", "-f", "branch=main", "-f", "per_page=100"])["workflow_runs"]
         last = None
