@@ -2039,7 +2039,7 @@ def get_fleet_stats():
 #     sum(d_tokens)/sum(d_seconds) is exactly the serving-time-only average.
 # pippen: skipped - no llama-server there (route `code` moved; nothing serves).
 MODEL_SERVING_SOURCES = {
-    "gandalf": {"kind": "llamaswap", "url": "http://127.0.0.1:8889/api/metrics"},
+    "gandalf": {"kind": "llamacpp_multi", "urls": ["http://127.0.0.1:5806/metrics", "http://127.0.0.1:5807/metrics"]},
     "frodo":   {"kind": "llamacpp",  "url": f"http://{FLEET_IPS['frodo']}:8890/metrics"},
     "pippin":  {"kind": "llamacpp",  "url": f"http://{FLEET_IPS['pippen']}:8891/metrics"},
 }
@@ -2146,47 +2146,46 @@ def collect_model_serving():
     while True:
         try:
             conn = sqlite3.connect(CONFIG["db_path"])
-            # gandalf: upsert the whole request buffer (INSERT OR IGNORE makes
-            # re-reading the same records free; llama-swap restarts reset id to
-            # 0 but the (box, req_id, ts) key keeps old rows distinct)
-            try:
-                resp = requests.get(MODEL_SERVING_SOURCES["gandalf"]["url"],
-                                    timeout=MODEL_SERVING_HTTP_TIMEOUT)
-                if resp.ok:
-                    for rec in resp.json():
-                        ts = _parse_llamaswap_ts(rec.get("timestamp", ""))
-                        tok = rec.get("tokens") or {}
-                        if ts is None or not tok:
-                            continue
-                        conn.execute(
-                            "INSERT OR IGNORE INTO model_requests "
-                            "(box, req_id, ts, model, output_tokens, gen_tps) VALUES (?,?,?,?,?,?)",
-                            ("gandalf", rec.get("id", -1), ts, rec.get("model"),
-                             tok.get("output_tokens"), tok.get("tokens_per_second")))
-            except Exception as e:
-                logger.debug(f"model serving sample gandalf: {e}")
-            # every plain llama-server box: one counter sample per cycle
+            # every plain llama-server box or multi-port server: one counter sample per cycle
             for _box, _src in MODEL_SERVING_SOURCES.items():
-                if _src.get("kind") != "llamacpp":
-                    continue
-                try:
-                    resp = requests.get(_src["url"], timeout=MODEL_SERVING_HTTP_TIMEOUT)
-                    if resp.ok:
-                        vals = {}
-                        for line in resp.text.splitlines():
-                            for key in ("llamacpp:tokens_predicted_total ",
-                                        "llamacpp:tokens_predicted_seconds_total "):
-                                if line.startswith(key):
-                                    vals[key.strip()] = float(line.split()[-1])
-                        if "llamacpp:tokens_predicted_total" in vals:
-                            conn.execute(
-                                "INSERT OR IGNORE INTO model_counter_samples "
-                                "(box, ts, tokens_total, gen_seconds_total) VALUES (?,?,?,?)",
-                                (_box, datetime.now().isoformat(),
-                                 vals.get("llamacpp:tokens_predicted_total"),
-                                 vals.get("llamacpp:tokens_predicted_seconds_total")))
-                except Exception as e:
-                    logger.debug(f"model serving sample {_box}: {e}")
+                if _src.get("kind") == "llamacpp_multi":
+                    total_tok = 0.0
+                    total_sec = 0.0
+                    for u in _src.get("urls", []):
+                        try:
+                            resp = requests.get(u, timeout=MODEL_SERVING_HTTP_TIMEOUT)
+                            if resp.ok:
+                                for line in resp.text.splitlines():
+                                    if line.startswith("llamacpp:tokens_predicted_total "):
+                                        total_tok += float(line.split()[-1])
+                                    elif line.startswith("llamacpp:tokens_predicted_seconds_total "):
+                                        total_sec += float(line.split()[-1])
+                        except Exception as e:
+                            logger.debug(f"model serving sample {_box} ({u}): {e}")
+                    if total_tok > 0:
+                        conn.execute(
+                            "INSERT OR IGNORE INTO model_counter_samples "
+                            "(box, ts, tokens_total, gen_seconds_total) VALUES (?,?,?,?)",
+                            (_box, datetime.now().isoformat(), total_tok, total_sec))
+                elif _src.get("kind") == "llamacpp":
+                    try:
+                        resp = requests.get(_src["url"], timeout=MODEL_SERVING_HTTP_TIMEOUT)
+                        if resp.ok:
+                            vals = {}
+                            for line in resp.text.splitlines():
+                                for key in ("llamacpp:tokens_predicted_total ",
+                                            "llamacpp:tokens_predicted_seconds_total "):
+                                    if line.startswith(key):
+                                        vals[key.strip()] = float(line.split()[-1])
+                            if "llamacpp:tokens_predicted_total" in vals:
+                                conn.execute(
+                                    "INSERT OR IGNORE INTO model_counter_samples "
+                                    "(box, ts, tokens_total, gen_seconds_total) VALUES (?,?,?,?)",
+                                    (_box, datetime.now().isoformat(),
+                                     vals.get("llamacpp:tokens_predicted_total"),
+                                     vals.get("llamacpp:tokens_predicted_seconds_total")))
+                    except Exception as e:
+                        logger.debug(f"model serving sample {_box}: {e}")
             cutoff = (datetime.now() - timedelta(days=MODEL_SERVING_RETENTION_DAYS)).isoformat()
             conn.execute("DELETE FROM model_requests WHERE ts < ?", (cutoff,))
             conn.execute("DELETE FROM model_counter_samples WHERE ts < ?", (cutoff,))
@@ -2260,40 +2259,7 @@ def get_model_serving_stats():
     try:
         conn = sqlite3.connect(CONFIG["db_path"])
 
-        # gandalf - request-level records
-        rows = conn.execute(
-            "SELECT ts, output_tokens, gen_tps FROM model_requests "
-            "WHERE box='gandalf' AND ts >= ? ORDER BY ts", (week_ago,)).fetchall()
-        recent_cut = (now - timedelta(seconds=150)).isoformat()
-
-        def _agg(rs):
-            """Token-weighted generation speed over a set of requests: total
-            output tokens / total generation seconds (out/tps per request)."""
-            toks = secs = 0.0
-            for _, out, tps in rs:
-                if out and tps and tps > 0:
-                    toks += out
-                    secs += out / tps
-            return (round(toks / secs, 1) if secs > 0 else 0.0), secs
-        tps_now, _ = _agg([r for r in rows if r[0] >= recent_cut])
-        _g_start = stats_window_start('gandalf')   # per-host reset window
-        tps_today, secs_today = _agg([r for r in rows if r[0] >= _g_start])
-        # Peak generation speed seen today (single fastest request) - the bottom
-        # band of the card's tokens/sec strip.
-        _today_tps = [r[2] for r in rows if r[0] >= _g_start and r[2]]
-        result["gandalf"] = {
-            "available": True,
-            "tps_now": tps_now,
-            "tps_avg_today": tps_today,
-            "tps_max_today": round(max(_today_tps), 1) if _today_tps else 0.0,
-            "serving_minutes_today": round(secs_today / 60),
-            "requests": {
-                "hour": sum(1 for r in rows if r[0] >= hour_ago),
-                "day": sum(1 for r in rows if r[0] >= day_ago),
-                "week": len(rows),
-            },
-            "approx_requests": False,
-        }
+        # (Gandalf is now sampled as llamacpp_multi via model_counter_samples below)
 
         # every counter-sampled box (frodo, pippin) -> reset-aware deltas.
         # Generalised 2026-07-29: pippin serves the `code` route, so Ben wants
@@ -2312,7 +2278,7 @@ def get_model_serving_stats():
             return n
 
         for box, src in MODEL_SERVING_SOURCES.items():
-            if src.get("kind") != "llamacpp":
+            if src.get("kind") not in ("llamacpp", "llamacpp_multi"):
                 continue
             samples = conn.execute(
                 "SELECT ts, tokens_total, gen_seconds_total FROM model_counter_samples "
@@ -3331,6 +3297,7 @@ def api_power():
 def index():
     """Dashboard home page."""
     return '''<!DOCTYPE html><html><head><title>GANDALF // FLEET MONITOR</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230a0d14'/%3E%3Crect x='6' y='6' width='20' height='20' rx='2' fill='%23111827' stroke='%23374151' stroke-width='1'/%3E%3Crect x='9' y='9' width='5' height='5' rx='1' fill='%2300fff2'/%3E%3Crect x='18' y='9' width='5' height='5' rx='1' fill='%2339ff14'/%3E%3Crect x='9' y='18' width='5' height='5' rx='1' fill='%2300a8ff'/%3E%3Crect x='18' y='18' width='5' height='5' rx='1' fill='%23ffaa00'/%3E%3Cpath d='M10 3v3M16 3v3M22 3v3 M10 26v3M16 26v3M22 26v3 M3 10h3M3 16h3M3 22h3 M26 10h3M26 16h3M26 22h3' stroke='%234b5563' stroke-width='1.2' stroke-linecap='round'/%3E%3C/svg%3E">
 <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Rajdhani:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
 :root{
@@ -4122,11 +4089,12 @@ function loadedModelsHtml(lm) {
 
 // Label + thin bar + value, all on ONE line (compact card layout).
 function miniRow(label, percent, cls, barId, labelId, valueText, peakPct) {
-    const help = HELP[label.toLowerCase()] || '';
     const isVram = (label === 'VRAM' || (barId && barId.startsWith('vram-')));
+    const help = isVram ? '' : (HELP[label.toLowerCase()] || '');
     const targetAttr = isVram ? ' data-vram-target="' + barId.replace('vram-', '') + '"' : '';
     const extraClass = isVram ? ' vram-row' : '';
-    return '<div class="mini-row' + extraClass + '"' + targetAttr + ' title="' + help.replace(/"/g, '') + '"><span class="mini-label">' + label + '</span>' +
+    const titleAttr = help ? ' title="' + help.replace(/"/g, '') + '"' : '';
+    return '<div class="mini-row' + extraClass + '"' + targetAttr + titleAttr + '><span class="mini-label">' + label + '</span>' +
         progressBar(percent, cls, barId, peakPct) +
         '<span class="mini-val" id="' + labelId + '">' + valueText + '</span></div>';
 }
