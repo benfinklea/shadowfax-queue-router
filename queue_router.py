@@ -16,7 +16,7 @@ import threading
 import time
 import paramiko
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
@@ -2693,10 +2693,11 @@ def get_target_status(target_name, target_config, fast=False):
 
 
 # ── Shipping pipeline snapshot (ported forward from bak-20260725; Gemini fleet monitor consumes /api/pipeline) ──
-PIPELINE_CACHE_TTL = 0  # seconds
+PIPELINE_CACHE_TTL = 300  # seconds
 pipeline_cache = {"data": None, "ts": 0.0}
 pipeline_cache_lock = threading.Lock()
 pipeline_gh_failing_since = None
+pipeline_last_good = None
 
 def get_pipeline_status():
     """Shipping-pipeline snapshot for armbrain: issues -> PRs -> CI -> merged
@@ -2706,13 +2707,17 @@ def get_pipeline_status():
         if pipeline_cache["data"] is not None and (now - pipeline_cache["ts"]) < PIPELINE_CACHE_TTL:
             return pipeline_cache["data"]
 
-    global pipeline_gh_failing_since
-    result = {"available": False, "repo": GITHUB_CI_REPO}
+    global pipeline_gh_failing_since, pipeline_last_good
+    result = {
+        "available": False,
+        "repo": GITHUB_CI_REPO,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
     github_reads_ok = False
+    github_fetches_ok = True
     token = get_gh_ci_token()
     if token:
         try:
-            from datetime import datetime, timezone
             headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
             # "Today" is CENTRAL TIME (Ben's day), not UTC - counters were resetting at 7pm CT.
             from zoneinfo import ZoneInfo
@@ -2722,9 +2727,14 @@ def get_pipeline_status():
             ct_midnight_utc = now_ct.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
             today = ct_midnight_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
             def search_count(q):
+                nonlocal github_fetches_ok
                 r = requests.get("https://api.github.com/search/issues",
                                  params={"q": q, "per_page": 1}, headers=headers, timeout=8)
-                return r.json().get("total_count", 0) if r.ok else None
+                if not r.ok:
+                    github_fetches_ok = False
+                    logger.warning("GitHub search_count fetch failed: HTTP %s", r.status_code)
+                    return None
+                return r.json().get("total_count", 0)
             result["issues_open"] = search_count(f"repo:{GITHUB_CI_REPO} type:issue state:open")
             result["prs_open"] = search_count(f"repo:{GITHUB_CI_REPO} type:pr state:open")
             result["merged_today"] = search_count(f"repo:{GITHUB_CI_REPO} type:pr merged:>={today}")
@@ -2734,7 +2744,8 @@ def get_pipeline_status():
                 d1 = d0 + timedelta(days=1)
                 q = (f"repo:{GITHUB_CI_REPO} type:pr merged:{d0.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}"
                      f"..{d1.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}")
-                spark.append(search_count(q) or 0)
+                count = search_count(q)
+                spark.append(count if count is not None else 0)
             spark.append(result.get("merged_today") or 0)
             result["merged_spark"] = spark
             ci = get_ci_queue_status()
@@ -2749,6 +2760,8 @@ def get_pipeline_status():
             for page in (1, 2, 3):
                 r = requests.get(deploy_url, params={"created": f">={week_start.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}", "per_page": 100, "page": page}, headers=headers, timeout=8)
                 if not r.ok:
+                    github_fetches_ok = False
+                    logger.warning("GitHub deploy-runs fetch failed: HTTP %s", r.status_code)
                     break
                 runs = r.json().get("workflow_runs", [])
                 if not runs:
@@ -2801,6 +2814,8 @@ def get_pipeline_status():
                                              "per_page": 100, "page": page},
                                      headers=headers, timeout=8)
                     if not r.ok:
+                        github_fetches_ok = False
+                        logger.warning("GitHub deploy-runs fetch failed: HTTP %s", r.status_code)
                         break
                     runs = r.json().get("workflow_runs", [])
                     if not runs:
@@ -2814,6 +2829,8 @@ def get_pipeline_status():
                         jr = requests.get(run["jobs_url"], params={"per_page": 100},
                                           headers=headers, timeout=8)
                         if not jr.ok:
+                            github_fetches_ok = False
+                            logger.warning("GitHub deploy-jobs fetch failed: HTTP %s", jr.status_code)
                             continue
                         dep_job = next((j for j in jr.json().get("jobs", [])
                                         if j.get("name") == "deploy" and j.get("conclusion") == "success"), None)
@@ -2823,8 +2840,9 @@ def get_pipeline_status():
                             found = True
                             break
             except Exception as e:
+                github_fetches_ok = False
                 logger.warning(f"last-deploy lookup failed: {e}")
-            github_reads_ok = all(result.get(field) is not None for field in (
+            github_reads_ok = github_fetches_ok and all(result.get(field) is not None for field in (
                 "issues_open", "prs_open", "merged_today", "ci_queued", "ci_running"
             ))
         except Exception as e:
@@ -2833,10 +2851,15 @@ def get_pipeline_status():
     if github_reads_ok:
         pipeline_gh_failing_since = None
         result["available"] = True
+        result["degraded"] = False
+        result["generated_at"] = datetime.now(timezone.utc).isoformat()
+        pipeline_last_good = dict(result)
     else:
         if pipeline_gh_failing_since is None:
-            from datetime import timezone
             pipeline_gh_failing_since = datetime.now(timezone.utc).isoformat()
+        if pipeline_last_good is not None:
+            result = dict(pipeline_last_good)
+            result["degraded"] = True
         result["gh_auth_failing_since"] = pipeline_gh_failing_since
 
     with pipeline_cache_lock:
@@ -3584,6 +3607,10 @@ font-size:0.9em;text-shadow:0 0 8px var(--neon-magenta)}
 .ship-spark{display:flex;align-items:flex-end;gap:2px;height:11px;margin-top:3px}
 .ship-spark i{width:5px;background:var(--neon-cyan);box-shadow:0 0 4px var(--neon-cyan);
 border-radius:1px 1px 0 0;min-height:1px}
+.ship-updated{align-self:center;margin-left:9px;padding:3px 7px;border:1px solid #2a3450;
+border-radius:999px;color:#758097;font-size:0.62em;white-space:nowrap}
+.ship-updated.stale{color:var(--neon-yellow);border-color:rgba(255,255,0,0.55);
+background:rgba(255,255,0,0.06);box-shadow:0 0 7px rgba(255,255,0,0.16)}
 .gstrip{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px;align-items:center}
 .gcell{display:flex;align-items:center;gap:9px;padding:2px 4px;border-left:2px solid #24304d;min-width:0}
 .gcell .gicon{font-size:1.15em;line-height:1;flex:0 0 auto}
@@ -3878,6 +3905,14 @@ function refreshShipFlow() {
             const t = new Date(d.last_deploy_at);
             stamp = t.toLocaleString('en-US', {month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZone: 'America/Chicago'});
         }
+        const generated = d.generated_at ? new Date(d.generated_at) : null;
+        const generatedValid = generated && !Number.isNaN(generated.getTime());
+        const updatedTime = generatedValid
+            ? generated.toLocaleTimeString('en-US', {hour: 'numeric', minute: '2-digit', second: '2-digit', timeZone: 'America/Chicago'})
+            : '--';
+        const stale = generatedValid && (Date.now() - generated.getTime() > 10 * 60 * 1000);
+        const degradedNote = d.degraded ? ' (GitHub read failing - showing last good)' : '';
+        const updatedChip = '<div class="ship-updated' + (stale ? ' stale' : '') + '">updated ' + updatedTime + ' CT' + degradedNote + '</div>';
         el.innerHTML =
             '<div class="ship-label"><img src="/armbrain-logo.svg" alt="Armbrain" class="ship-logo" title="Armbrain - the product this pipeline ships">SHIPPING</div>' +
             shipStage(d.issues_open, 'issues open', '', '', null, HELP.issues) + ARROW +
@@ -3887,10 +3922,11 @@ function refreshShipFlow() {
             shipStage(d.deploys_ok_today, 'deployed today', d.deploys_failed_today ? 'hot' : '', deploySub, d.deploys_spark, HELP.deployed) + ARROW +
             '<div class="ship-stage" title="' + HELP.lastdep.replace(/"/g, '') + '"><div class="ship-num stamp">' + stamp + '</div>'
               + '<div class="ship-cap">last deploy (CT)</div>'
-              + (d.last_deploy_sha ? '<div class="ship-sub">⎇ ' + d.last_deploy_sha + '</div>' : '') + '</div>';
+              + (d.last_deploy_sha ? '<div class="ship-sub">⎇ ' + d.last_deploy_sha + '</div>' : '') + '</div>'
+              + updatedChip;
     }).catch(() => {
         const el = document.getElementById('ship-flow');
-        if (el) el.innerHTML = '<span class="gdim">shipping pipeline failed to load.</span>';
+        if (el && !el.querySelector('.ship-stage')) el.innerHTML = '<span class="gdim">shipping pipeline failed to load.</span>';
     });
 }
 
