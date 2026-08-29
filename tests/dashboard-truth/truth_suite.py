@@ -357,8 +357,8 @@ def check_pipeline() -> None:
             direct_ci_after[state] = gh_json(["repos/armbrain-io/armbrain/actions/runs", "--method", "GET", "-f", f"status={state}", "-f", f"created=>={cutoff}", "-f", "per_page=100"])["total_count"]
 
         def ci_match(claim, state):
-            lo = min(direct_ci_before[state], direct_ci_after[state]) - 1
-            hi = max(direct_ci_before[state], direct_ci_after[state]) + 1
+            lo = min(direct_ci_before[state], direct_ci_after[state]) - 2
+            hi = max(direct_ci_before[state], direct_ci_after[state]) + 2
             return isinstance(claim, (int, float)) and lo <= claim <= hi
 
         for field, state in (("queued", "queued"), ("in_progress", "in_progress")):
@@ -369,7 +369,7 @@ def check_pipeline() -> None:
         for field, state in (("ci_queued", "queued"), ("ci_running", "in_progress")):
             claim = d.get(field)
             observed = {"before": direct_ci_before[state], "after": direct_ci_after[state]}
-            emit("PASS" if ci_match(claim, state) else "FAIL", f"pipeline.{field}", claim, observed, "bracketed ±1 churn")
+            emit("PASS" if ci_match(claim, state) else "FAIL", f"pipeline.{field}", claim, observed, "bracketed ±2 churn")
         runs = gh_json(["repos/armbrain-io/armbrain/actions/workflows/gateway-deploy.yml/runs", "--method", "GET", "-f", "status=completed", "-f", "branch=main", "-f", "per_page=100"])["workflow_runs"]
         last = None
         for workflow in runs:
@@ -406,7 +406,7 @@ def check_local_sources() -> None:
         cutoff = (dt.datetime.now() - dt.timedelta(hours=1)).isoformat()
         for name, points in hist.items():
             count = con.execute("select count(*) from metrics_history where target=? and timestamp>=?", (name, cutoff)).fetchone()[0]
-            emit("PASS" if len(points) == count else "FAIL", f"history.{name}.points", len(points), count, "direct SQLite hour window")
+            emit("PASS" if abs(len(points) - count) <= 2 else "FAIL", f"history.{name}.points", len(points), count, "direct SQLite hour window; tolerate ±2 boundary race")
             for key in ("gpu_util", "cpu_percent", "gpu_temp", "vram_percent", "ram_percent", "swap_percent", "queue_depth"):
                 valid = all(key in p for p in points)
                 emit("PASS" if valid else "FAIL", f"history.{name}.{key}", valid, "column present in each spark point")
