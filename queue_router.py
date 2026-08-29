@@ -2200,7 +2200,7 @@ def get_fleet_stats():
 #     sum(d_tokens)/sum(d_seconds) is exactly the serving-time-only average.
 # pippen: skipped - no llama-server there (route `code` moved; nothing serves).
 MODEL_SERVING_SOURCES = {
-    "gandalf": {"kind": "llamacpp_multi", "urls": ["http://127.0.0.1:5806/metrics", "http://127.0.0.1:5807/metrics"]},
+    "gandalf": {"kind": "llamacpp", "url": "http://127.0.0.1:8889/upstream/qwen3.8-27b/metrics"},
     "frodo":   {"kind": "llamacpp",  "url": f"http://{FLEET_IPS['frodo']}:8890/metrics"},
     "pippin":  {"kind": "llamacpp",  "url": f"http://{FLEET_IPS['pippen']}:8891/metrics"},
 }
