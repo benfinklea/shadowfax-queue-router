@@ -1732,6 +1732,167 @@ def get_ci_queue_status():
         ci_queue_cache["ts"] = time.time()
     return result
 
+runson_cache = {"data": None, "ts": 0.0}
+runson_cache_lock = threading.Lock()
+RUNSON_CACHE_TTL = 120  # seconds - AWS reads are slower and credentials are short-lived
+RUNSON_AWS_PROFILE = "armbrain"
+RUNSON_AWS_TIMEOUT = 12
+RUNSON_STACK_NAME = "runs-on"
+RUNSON_WORKFLOW_JOBS_TABLE = "runs-on-workflow-jobs"
+
+def _runson_aws_json(args, region):
+    """Run one read-only AWS CLI call with a hard timeout and sanitized errors."""
+    cmd = [
+        "/snap/bin/aws", "--profile", RUNSON_AWS_PROFILE, "--region", region,
+        *args, "--output", "json", "--no-cli-pager",
+    ]
+    try:
+        completed = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=RUNSON_AWS_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning("RunsOn AWS %s call timed out", args[0])
+        return None, "timeout"
+    except Exception as e:
+        logger.warning("RunsOn AWS %s call failed to start: %s", args[0], type(e).__name__)
+        return None, "aws"
+
+    if completed.returncode != 0:
+        error_text = (completed.stderr or "").lower()
+        if "does not exist" in error_text and args[:2] == ["cloudformation", "describe-stacks"]:
+            return None, "not_found"
+        credential_markers = (
+            "session has expired", "expiredtoken", "unable to locate credentials",
+            "config profile", "credential process", "could not be found",
+        )
+        if any(marker in error_text for marker in credential_markers):
+            return None, "credentials"
+        logger.warning("RunsOn AWS %s read failed (exit %s)", args[0], completed.returncode)
+        return None, "aws"
+
+    try:
+        return json.loads(completed.stdout or "{}"), None
+    except json.JSONDecodeError:
+        logger.warning("RunsOn AWS %s returned invalid JSON", args[0])
+        return None, "aws"
+
+def _runson_error_result(error):
+    if error == "credentials":
+        return {
+            "available": False,
+            "deployed": None,
+            "error": "credentials",
+            "message": "AWS creds expired - run: aws login --remote --profile armbrain --region us-east-2",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+    return {
+        "available": False,
+        "deployed": None,
+        "error": error or "aws",
+        "message": "RunsOn AWS data unavailable",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+def get_runson_status():
+    """RunsOn runners, daily jobs, trial fuse, and credits; cached and read-only."""
+    now = time.time()
+    with runson_cache_lock:
+        if runson_cache["data"] is not None and (now - runson_cache["ts"]) < RUNSON_CACHE_TTL:
+            return runson_cache["data"]
+
+    stack, stack_error = _runson_aws_json(
+        ["cloudformation", "describe-stacks", "--stack-name", RUNSON_STACK_NAME],
+        "us-east-2",
+    )
+    if stack_error == "not_found":
+        result = {
+            "available": True,
+            "deployed": False,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+    elif stack_error:
+        result = _runson_error_result(stack_error)
+    elif not (stack or {}).get("Stacks"):
+        result = _runson_error_result("aws")
+    else:
+        from zoneinfo import ZoneInfo
+        today_ct = datetime.now(ZoneInfo("America/Chicago")).date()
+        date_key = today_ct.isoformat()
+        jobs_values = json.dumps({":date": {"S": date_key}})
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            runners_future = executor.submit(
+                _runson_aws_json,
+                [
+                    "ec2", "describe-instances", "--filters",
+                    "Name=instance-state-name,Values=running,pending",
+                    f"Name=tag:runs-on-stack-name,Values={RUNSON_STACK_NAME}",
+                ],
+                "us-east-2",
+            )
+            jobs_future = executor.submit(
+                _runson_aws_json,
+                [
+                    "dynamodb", "query", "--table-name", RUNSON_WORKFLOW_JOBS_TABLE,
+                    "--index-name", "daily-activity-index",
+                    "--key-condition-expression", "created_at_date = :date",
+                    "--expression-attribute-values", jobs_values,
+                    "--select", "COUNT",
+                ],
+                "us-east-2",
+            )
+            credits_future = executor.submit(
+                _runson_aws_json,
+                ["freetier", "get-account-plan-state"],
+                "us-east-1",
+            )
+            runners_data, runners_error = runners_future.result()
+            jobs_data, jobs_error = jobs_future.result()
+            credits_data, credits_error = credits_future.result()
+
+        read_error = runners_error or jobs_error or credits_error
+        if read_error:
+            result = _runson_error_result(read_error)
+        else:
+            runner_rows = []
+            now_utc = datetime.now(timezone.utc)
+            for reservation in (runners_data or {}).get("Reservations", []):
+                for instance in reservation.get("Instances", []):
+                    launch_text = instance.get("LaunchTime")
+                    age_minutes = None
+                    if launch_text:
+                        try:
+                            launched = datetime.fromisoformat(launch_text.replace("Z", "+00:00"))
+                            age_minutes = max(0, int((now_utc - launched).total_seconds() // 60))
+                        except (TypeError, ValueError):
+                            pass
+                    runner_rows.append({
+                        "instance_type": instance.get("InstanceType") or "unknown",
+                        "state": (instance.get("State") or {}).get("Name") or "unknown",
+                        "age_minutes": age_minutes,
+                    })
+
+            credits = (credits_data or {}).get("accountPlanRemainingCredits") or {}
+            charge_date = datetime(2026, 9, 12).date()
+            result = {
+                "available": True,
+                "deployed": True,
+                "live_runners": len(runner_rows),
+                "runners": runner_rows,
+                "jobs_today": int((jobs_data or {}).get("Count", 0)),
+                "trial_days_remaining": max(0, (charge_date - today_ct).days),
+                "trial_charge_date": charge_date.isoformat(),
+                "subscription_usd_per_year": 350,
+                "credits_remaining": credits.get("amount"),
+                "credits_unit": credits.get("unit") or "USD",
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+    with runson_cache_lock:
+        runson_cache["data"] = result
+        runson_cache["ts"] = time.time()
+    return result
+
 route_health_cache = {"data": None, "ts": 0.0}
 route_health_cache_lock = threading.Lock()
 ROUTE_HEALTH_CACHE_TTL = 30  # seconds
@@ -3021,6 +3182,11 @@ def api_ci_queue():
     """Queued/running GitHub Actions counts for armbrain-io/armbrain (cached)."""
     return jsonify(get_ci_queue_status())
 
+@app.route("/api/runson", methods=["GET"])
+def api_runson():
+    """RunsOn runner usage, trial fuse, and AWS credits (cached)."""
+    return jsonify(get_runson_status())
+
 @app.route("/api/reset_stats", methods=["POST", "DELETE"])
 def api_reset_stats():
     """Reset today's peaks and averages without destroying history."""
@@ -3611,6 +3777,19 @@ border-radius:1px 1px 0 0;min-height:1px}
 border-radius:999px;color:#758097;font-size:0.62em;white-space:nowrap}
 .ship-updated.stale{color:var(--neon-yellow);border-color:rgba(255,255,0,0.55);
 background:rgba(255,255,0,0.06);box-shadow:0 0 7px rgba(255,255,0,0.16)}
+.runson-grid{display:flex;gap:22px;align-items:center;flex-wrap:wrap}
+.runson-live{min-width:180px}
+.runson-count{font-family:'Orbitron',monospace;font-size:2em;font-weight:700;line-height:1;
+color:var(--neon-green);text-shadow:var(--glow-green)}
+.runson-count.zero{color:#778;text-shadow:none}
+.runson-label{font-family:'Orbitron',monospace;font-size:0.62em;letter-spacing:1.3px;
+text-transform:uppercase;color:#7a839c;margin-top:4px}
+.runson-runners{display:flex;gap:6px;flex-wrap:wrap;margin-top:7px}
+.runson-runner{border:1px solid #2a3450;border-radius:999px;padding:3px 8px;color:#aab2c4;font-size:0.78em}
+.runson-facts{display:flex;gap:22px;flex-wrap:wrap;align-items:center}
+.runson-fact b{display:block;font-family:'Orbitron',monospace;color:var(--neon-cyan);font-size:1.15em}
+.runson-fact span{color:#778;font-size:0.75em}
+.runson-warning{color:var(--neon-yellow);margin:0;font-family:'Rajdhani',sans-serif}
 .gstrip{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px;align-items:center}
 .gcell{display:flex;align-items:center;gap:9px;padding:2px 4px;border-left:2px solid #24304d;min-width:0}
 .gcell .gicon{font-size:1.15em;line-height:1;flex:0 0 auto}
@@ -3677,6 +3856,11 @@ color:#889;display:flex;justify-content:space-between;font-family:'Orbitron',mon
 <div id=fleet-row class=fleet-row><p style="grid-column:1/-1;color:#667;margin:0">Scanning fleet hosts...</p></div>
 </div>
 
+<div class=card id=runson-card>
+<h3>☁️ RunsOn CI</h3>
+<div id=runson-body><p>Loading...</p></div>
+</div>
+
 <div class=card id=history>
 <h3>📈 Historical Metrics</h3>
 <div class="time-range">
@@ -3715,6 +3899,7 @@ GET  /api/history - Historical metrics (range=hour|day|week|month)
 GET  /api/energy  - GPU energy + time-of-use cost (day/week/month)
 GET  /api/fleet_stats - CLI agent sessions per box + CI runner busy/total
 GET  /api/model_serving - tokens/sec dials + requests served (model boxes)
+GET  /api/runson  - RunsOn live runners + jobs/trial/credits
 GET  /api/health  - Health check</pre>
 </div>
 
@@ -4897,9 +5082,63 @@ function refreshEnergy() {
     });
 }
 
+function runsonEscape(value) {
+    return String(value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+}
+
+function runsonAge(minutes) {
+    if (minutes === null || minutes === undefined) return 'age unknown';
+    if (minutes < 60) return minutes + 'm';
+    if (minutes < 1440) return Math.floor(minutes / 60) + 'h ' + (minutes % 60) + 'm';
+    return Math.floor(minutes / 1440) + 'd ' + Math.floor((minutes % 1440) / 60) + 'h';
+}
+
+function refreshRunsOn() {
+    fetch('/api/runson').then(r => r.json()).then(d => {
+        const card = document.getElementById('runson-card');
+        const body = document.getElementById('runson-body');
+        if (!card || !body) return;
+        if (d.deployed === false) {
+            card.style.display = 'none';
+            return;
+        }
+        card.style.display = '';
+        if (!d.available) {
+            const warning = d.error === 'credentials'
+                ? '⚠ AWS creds expired - run: aws login --remote --profile armbrain --region us-east-2'
+                : '⚠ RunsOn AWS data unavailable';
+            body.innerHTML = '<p class="runson-warning">' + warning + '</p>';
+            return;
+        }
+
+        const count = Number(d.live_runners || 0);
+        const runners = (d.runners || []).map(r =>
+            '<span class="runson-runner">' + runsonEscape(r.instance_type || 'unknown') + ' · '
+            + runsonEscape(runsonAge(r.age_minutes)) + '</span>').join('');
+        const runnerDetail = count === 0
+            ? '<div class="runson-label">no runners active</div>'
+            : '<div class="runson-runners">' + runners + '</div>';
+        const creditsNumber = (d.credits_remaining === null || d.credits_remaining === undefined)
+            ? Number.NaN : Number(d.credits_remaining);
+        const credits = Number.isFinite(creditsNumber) ? '$' + creditsNumber.toFixed(2) : '--';
+        body.innerHTML = '<div class="runson-grid">'
+            + '<div class="runson-live"><div class="runson-count' + (count === 0 ? ' zero' : '') + '">' + count + '</div>'
+            + '<div class="runson-label">live runners</div>' + runnerDetail + '</div>'
+            + '<div class="runson-facts">'
+            + '<div class="runson-fact"><b>' + Number(d.jobs_today || 0) + '</b><span>jobs today</span></div>'
+            + '<div class="runson-fact"><b>' + Number(d.trial_days_remaining || 0) + ' days</b><span>to $'
+            + Number(d.subscription_usd_per_year || 350) + '/year charge · ' + runsonEscape(d.trial_charge_date || '2026-09-12') + '</span></div>'
+            + '<div class="runson-fact"><b>' + credits + '</b><span>AWS credits remaining</span></div>'
+            + '</div></div>';
+    }).catch(() => {
+        const body = document.getElementById('runson-body');
+        if (body) body.innerHTML = '<p class="runson-warning">⚠ RunsOn panel failed to load</p>';
+    });
+}
+
 // --- Polling control: pause everything when the tab isn't visible, resume ---
 // --- with an immediate refresh when it becomes visible again.              ---
-let statusTimer = null, fleetTimer = null, historyTimer = null, energyTimer = null, ciQueueTimer = null, routeHealthTimer = null, fleetStatsTimer = null, modelServingTimer = null, shipFlowTimer = null;
+let statusTimer = null, fleetTimer = null, historyTimer = null, energyTimer = null, ciQueueTimer = null, routeHealthTimer = null, fleetStatsTimer = null, modelServingTimer = null, shipFlowTimer = null, runsonTimer = null;
 
 function startPolling() {
     if (!statusTimer) statusTimer = setInterval(refresh, 12000);     // queue/GPU state: 12s
@@ -4908,6 +5147,7 @@ function startPolling() {
     if (!energyTimer) energyTimer = setInterval(refreshEnergy, 60000);
     if (!ciQueueTimer) ciQueueTimer = setInterval(refreshCiQueue, 45000);        // matches backend cache TTL
     if (!shipFlowTimer) shipFlowTimer = setInterval(refreshShipFlow, 120000);    // /api/pipeline is cached 5 min
+    if (!runsonTimer) runsonTimer = setInterval(refreshRunsOn, 120000);           // matches AWS cache TTL
     if (!routeHealthTimer) routeHealthTimer = setInterval(refreshRouteHealth, 30000);
     if (!fleetStatsTimer) fleetStatsTimer = setInterval(refreshFleetStats, 60000); // matches backend cache TTL
     if (!modelServingTimer) modelServingTimer = setInterval(refreshModelServing, 60000); // matches sampler cadence
@@ -4920,6 +5160,7 @@ function stopPolling() {
     clearInterval(energyTimer); energyTimer = null;
     clearInterval(ciQueueTimer); ciQueueTimer = null;
     clearInterval(shipFlowTimer); shipFlowTimer = null;
+    clearInterval(runsonTimer); runsonTimer = null;
     clearInterval(routeHealthTimer); routeHealthTimer = null;
     clearInterval(fleetStatsTimer); fleetStatsTimer = null;
     clearInterval(modelServingTimer); modelServingTimer = null;
@@ -5078,6 +5319,7 @@ document.addEventListener('visibilitychange', () => {
         refreshEnergy();
         refreshCiQueue();
         refreshShipFlow();
+        refreshRunsOn();
         refreshRouteHealth();
         refreshFleetStats();
         refreshModelServing();
@@ -5092,6 +5334,7 @@ refreshEnergy();
 refreshFleet();
 refreshCiQueue();
 refreshShipFlow();
+refreshRunsOn();
 refreshRouteHealth();
 refreshFleetStats();
 // first serving refresh waits for the target cards (built by refresh()) to exist
