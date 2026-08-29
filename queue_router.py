@@ -2864,7 +2864,7 @@ def get_target_status(target_name, target_config, fast=False):
 
 
 # ── Shipping pipeline snapshot (ported forward from bak-20260725; Gemini fleet monitor consumes /api/pipeline) ──
-PIPELINE_CACHE_TTL = 300  # seconds
+PIPELINE_CACHE_TTL = 45  # seconds - must match CI_QUEUE_CACHE_TTL so ci_running measurement scope is consistent
 pipeline_cache = {"data": None, "ts": 0.0}
 pipeline_cache_lock = threading.Lock()
 pipeline_gh_failing_since = None
@@ -2939,7 +2939,8 @@ def get_pipeline_status():
             result["merged_spark"] = spark
             ci = get_ci_queue_status()
             result["ci_queued"] = ci.get("queued", 0) if ci.get("available") else None
-            result["ci_running"] = ci.get("in_progress", 0) if ci.get("available") else None
+            # Use active_jobs (job count from first 12 runs) if available; fallback to run count
+            result["ci_running"] = (ci.get("active_jobs") if ci.get("active_jobs") is not None else ci.get("in_progress", 0)) if ci.get("available") else None
             # deploys today (Gateway Deploy workflow - paginated & filtered in Central Time)
             week_start = (now_ct - timedelta(days=6)).replace(hour=0, minute=0, second=0, microsecond=0)
             dep_ok = dep_fail = dep_live = 0
