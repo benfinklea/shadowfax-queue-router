@@ -2899,6 +2899,24 @@ def get_pipeline_status():
             result["issues_open"] = search_count(f"repo:{GITHUB_CI_REPO} type:issue state:open")
             result["prs_open"] = search_count(f"repo:{GITHUB_CI_REPO} type:pr state:open")
             result["merged_today"] = search_count(f"repo:{GITHUB_CI_REPO} type:pr merged:>={today}")
+            # merged in last 60 minutes
+            hour_ago = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            result["merged_last_hour"] = search_count(f"repo:{GITHUB_CI_REPO} type:pr merged:>={hour_ago}")
+            # most recent merge timestamp
+            result["last_merge_at"] = None
+            try:
+                r = requests.get(f"https://api.github.com/repos/{GITHUB_CI_REPO}/pulls",
+                                 params={"state": "closed", "sort": "updated", "direction": "desc", "per_page": 30},
+                                 headers=headers, timeout=8)
+                if r.ok:
+                    prs = r.json()
+                    merged_at_times = [pr.get("merged_at") for pr in prs if pr.get("merged_at")]
+                    if merged_at_times:
+                        result["last_merge_at"] = max(merged_at_times)
+                else:
+                    logger.warning("GitHub last-merge fetch failed: HTTP %s", r.status_code)
+            except Exception as e:
+                logger.warning(f"last-merge lookup failed: {e}")
             spark = []
             for i in range(6, 0, -1):
                 d0 = (now_ct - timedelta(days=i)).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -3930,8 +3948,7 @@ function updateFleetSummary() {
     const coreColor = (coreUp === coreTotal) ? 'var(--neon-green)' : 'var(--neon-red)';
     el.innerHTML =
         '<b>Core:</b> <span style="color:' + coreColor + ';font-weight:bold">' + coreUp + '/' + coreTotal + ' up</span>' +
-        ' &nbsp;·&nbsp; <b>Reserve (Shire):</b> <span style="color:#8a8">' + reserveUp + '/' + reserveTotal + ' up</span>' +
-        ' <span style="color:#556;font-size:0.85em">— reserve boxes are on-demand, not always-on</span>';
+        ' &nbsp;·&nbsp; <b>Reserve (Shire):</b> <span style="color:#8a8">' + reserveUp + '/' + reserveTotal + ' up</span>';
 }
 
 function tempClass(t) { return t >= 85 ? "hot" : (t >= 70 ? "warn" : ""); }
@@ -4085,6 +4102,11 @@ function refreshShipFlow() {
         if (d.deploys_in_flight) deploySub = d.deploys_in_flight + ' in flight' + (d.deploy_started_min !== null && d.deploy_started_min !== undefined ? ' · ' + d.deploy_started_min + 'm' : '');
         else if (d.deploys_failed_today) deploySub = d.deploys_failed_today + ' failed';
         else if (d.deploys_ok_today) deploySub = 'all landed';
+        let mergedSub = '';
+        if (d.last_merge_at) {
+            const t = new Date(d.last_merge_at).toLocaleTimeString('en-US', {hour:'numeric', minute:'2-digit', timeZone:'America/Chicago'}).toLowerCase().replace(' ','');
+            mergedSub = 'Last: ' + t + (d.merged_last_hour !== null && d.merged_last_hour !== undefined ? ' · 60m: ' + d.merged_last_hour : '');
+        }
         let stamp = '--';
         if (d.last_deploy_at) {
             const t = new Date(d.last_deploy_at);
@@ -4103,7 +4125,7 @@ function refreshShipFlow() {
             shipStage(d.issues_open, 'issues open', '', '', null, HELP.issues) + ARROW +
             shipStage(d.prs_open, 'prs open', '', '', null, HELP.prs) + ARROW +
             shipStage(ciNum, 'ci q/run', ciCls, '', null, HELP.ciqr) + ARROW +
-            shipStage(d.merged_today, 'merged today', 'ok', '', d.merged_spark, HELP.merged) + ARROW +
+            shipStage(d.merged_today, 'merged today', 'ok', mergedSub, d.merged_spark, HELP.merged) + ARROW +
             shipStage(d.deploys_ok_today, 'deployed today', d.deploys_failed_today ? 'hot' : '', deploySub, d.deploys_spark, HELP.deployed) + ARROW +
             '<div class="ship-stage" title="' + HELP.lastdep.replace(/"/g, '') + '"><div class="ship-num stamp">' + stamp + '</div>'
               + '<div class="ship-cap">last deploy (CT)</div>'
