@@ -153,7 +153,10 @@ CONFIG = {
             "ssh_user": "ben",
             "os": "linux",
             "model_status_urls": [
-                ("models", f"http://{FLEET_IPS['frodo']}:8890/v1/models"),
+                # /v1/models exposes the configured alias, which can hide the
+                # quantization actually loaded. /props model_path is the exact
+                # resident GGUF identity and must drive the dashboard label.
+                ("props", f"http://{FLEET_IPS['frodo']}:8890/props"),
             ],
             "vram_gb": 32,
             "gpu_power_limit": 575,
@@ -188,7 +191,7 @@ CONFIG = {
             "ssh_user": "ben",
             "os": "mac",
             "model_status_urls": [
-                ("models", f"http://{FLEET_IPS['pippen']}:8891/v1/models"),
+                ("props", f"http://{FLEET_IPS['pippen']}:8891/props"),
             ],
             "vram_gb": 64,
             "disk_path": "/"
@@ -1148,9 +1151,16 @@ def _served_model_ids(target_config):
             response.raise_for_status()
             payload = response.json()
             available = True
-            records = payload.get("running", []) if source_type == "running" else (
-                payload.get("data") or payload.get("models") or []
-            )
+            if source_type == "running":
+                records = payload.get("running", [])
+            elif source_type == "props":
+                # llama.cpp's /v1/models ID is caller-configurable and may be a
+                # friendly alias. The basename of /props.model_path is the exact
+                # file (including quantization) held by this process.
+                model_path = payload.get("model_path") or ""
+                records = [os.path.basename(model_path)] if model_path else []
+            else:
+                records = payload.get("data") or payload.get("models") or []
             for record in records:
                 model_id = record if isinstance(record, str) else (
                     record.get("id") or record.get("model") or record.get("name")
@@ -3864,6 +3874,7 @@ color:#889;display:flex;justify-content:space-between;font-family:'Orbitron',mon
 <div class=card id=glance-strip style="padding:9px 12px;margin:10px 0">
 <div id="ship-flow" class="ship-flow"><span class="gdim">shipping pipeline…</span></div>
 <div class="gstrip">
+<div class="gcell" id="ci-queue-body"><span class="gdim">CI queue…</span></div>
 <div class="gcell" id="route-health-body"><span class="gdim">routes…</span></div>
 <div class="gcell" id="fleet-stats-body"><span class="gdim">agents…</span></div>
 </div>
@@ -3946,6 +3957,9 @@ function updateFleetSummary() {
     const reserveUp = RESERVE_FLEET_NAMES.filter(n => lastFleetOnline[n]).length;
     const reserveTotal = RESERVE_FLEET_NAMES.length;
     const coreColor = (coreUp === coreTotal) ? 'var(--neon-green)' : 'var(--neon-red)';
+    el.title = (!lastFleetOnline['shadowfax'] && coreUp < coreTotal)
+        ? 'Core detail: shadowfax unreachable from gandalf (primary SSH path)'
+        : 'Core and reserve availability as seen from gandalf';
     el.innerHTML =
         '<b>Core:</b> <span style="color:' + coreColor + ';font-weight:bold">' + coreUp + '/' + coreTotal + ' up</span>' +
         ' &nbsp;·&nbsp; <b>Reserve (Shire):</b> <span style="color:#8a8">' + reserveUp + '/' + reserveTotal + ' up</span>';
