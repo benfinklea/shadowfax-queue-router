@@ -679,6 +679,24 @@ def init_db():
             PRIMARY KEY (box, model_name)
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS runson_credit_samples (
+            ts TEXT PRIMARY KEY,
+            credits REAL NOT NULL CHECK (credits >= 0)
+        )
+    """)
+    conn.executemany(
+        "INSERT OR IGNORE INTO runson_credit_samples(ts, credits) VALUES (?, ?)",
+        RUNSON_CREDIT_ANCHORS,
+    )
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS runson_cost_cache (
+            cache_key TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            fetched_at TEXT NOT NULL,
+            payload TEXT NOT NULL
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -1819,11 +1837,21 @@ def get_ci_queue_status():
 
 runson_cache = {"data": None, "ts": 0.0}
 runson_cache_lock = threading.Lock()
+runson_cost_cache_lock = threading.Lock()
 RUNSON_CACHE_TTL = 120  # seconds - AWS reads are slower and credentials are short-lived
 RUNSON_AWS_PROFILE = "armbrain-dashboard"  # permanent scoped read-only key (council 2026-08-30); "armbrain" login sessions expire ~12h
 RUNSON_AWS_TIMEOUT = 12
 RUNSON_STACK_NAME = "runs-on"
 RUNSON_WORKFLOW_JOBS_TABLE = "runs-on-workflow-jobs"
+RUNSON_COST_CACHE_TTL = 6 * 60 * 60  # CE calls cost money; never fetch more than four times/day.
+RUNSON_DAILY_BUDGET_USD = 10.0
+RUNSON_MONTHLY_GUARD_USD = 25.0
+RUNSON_CREDIT_BURN_BUDGET_USD = 60.0
+RUNSON_CREDIT_ANCHORS = (
+    ("2026-08-30T02:00:00+00:00", 139.75),  # Aug 29 evening CT
+    ("2026-08-30T19:00:00+00:00", 139.39),  # Aug 30 ~14:00 CT
+    ("2026-08-30T21:00:00+00:00", 139.13),  # Aug 30 ~16:00 CT
+)
 
 def _runson_aws_json(args, region):
     """Run one read-only AWS CLI call with a hard timeout and sanitized errors."""
@@ -1852,6 +1880,8 @@ def _runson_aws_json(args, region):
         )
         if any(marker in error_text for marker in credential_markers):
             return None, "credentials"
+        if "accessdenied" in error_text or "not authorized" in error_text:
+            return None, "access_denied"
         logger.warning("RunsOn AWS %s read failed (exit %s)", args[0], completed.returncode)
         return None, "aws"
 
@@ -1860,6 +1890,179 @@ def _runson_aws_json(args, region):
     except json.JSONDecodeError:
         logger.warning("RunsOn AWS %s returned invalid JSON", args[0])
         return None, "aws"
+
+def _record_runson_credit_sample(credits, sampled_at):
+    """Persist a real Free Tier credit observation; anchors are inserted by init_db."""
+    if credits is None:
+        return
+    try:
+        amount = float(credits)
+    except (TypeError, ValueError):
+        return
+    with sqlite3.connect(CONFIG["db_path"]) as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO runson_credit_samples(ts, credits) VALUES (?, ?)",
+            (sampled_at.astimezone(timezone.utc).isoformat(), amount),
+        )
+
+def _runson_credit_budget_data(now_utc, today_ct):
+    """Derive observed net credit burn without inventing zero-spend days."""
+    from zoneinfo import ZoneInfo
+
+    chicago = ZoneInfo("America/Chicago")
+    window_start = today_ct - timedelta(days=29)
+    with sqlite3.connect(CONFIG["db_path"]) as conn:
+        rows = conn.execute(
+            "SELECT ts, credits FROM runson_credit_samples ORDER BY ts"
+        ).fetchall()
+    samples = []
+    for ts, credits in rows:
+        try:
+            moment = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(timezone.utc)
+            samples.append((moment, float(credits)))
+        except (TypeError, ValueError):
+            continue
+
+    daily = []
+    for offset in range(30):
+        day = window_start + timedelta(days=offset)
+        day_rows = [(ts, value) for ts, value in samples if ts.astimezone(chicago).date() == day]
+        before = [(ts, value) for ts, value in samples if ts.astimezone(chicago).date() < day]
+        spend = None
+        if day_rows and before:
+            spend = round(max(0.0, before[-1][1] - day_rows[-1][1]), 4)
+        elif len(day_rows) >= 2:
+            spend = round(max(0.0, day_rows[0][1] - day_rows[-1][1]), 4)
+        daily.append({"date": day.isoformat(), "spend": spend})
+
+    today_spend = daily[-1]["spend"]
+    month_rows = [
+        row for row in samples
+        if row[0].astimezone(chicago).date().replace(day=1) == today_ct.replace(day=1)
+    ]
+    month_spend = None
+    if len(month_rows) >= 2:
+        month_spend = round(max(0.0, month_rows[0][1] - month_rows[-1][1]), 4)
+
+    recent_cutoff = now_utc - timedelta(days=7)
+    recent = [row for row in samples if row[0] >= recent_cutoff]
+    burn_per_day = None
+    projection_date = None
+    if len(recent) >= 2:
+        elapsed_days = (recent[-1][0] - recent[0][0]).total_seconds() / 86400
+        burned = recent[0][1] - recent[-1][1]
+        if elapsed_days > 0 and burned > 0:
+            burn_per_day = round(burned / elapsed_days, 4)
+            days_left = recent[-1][1] / burn_per_day
+            projection_date = (now_utc + timedelta(days=days_left)).date().isoformat()
+    return {
+        "daily_spend": daily,
+        "spent_today": today_spend,
+        "spent_month": month_spend,
+        "burn_per_day_7d": burn_per_day,
+        "projection_date": projection_date,
+        "samples": [
+            {"ts": ts.isoformat(), "credits": round(value, 4)}
+            for ts, value in samples[-120:]
+        ],
+        "observed_since": samples[0][0].isoformat() if samples else None,
+    }
+
+def _runson_ce_cost_data_unlocked(today_ct, account_id):
+    """Probe CE once per six-hour cache window, then optionally read budget actuals."""
+    cache_key = "ce_daily_unblended"
+    now_utc = datetime.now(timezone.utc)
+    with sqlite3.connect(CONFIG["db_path"]) as conn:
+        cached = conn.execute(
+            "SELECT status, fetched_at, payload FROM runson_cost_cache WHERE cache_key = ?",
+            (cache_key,),
+        ).fetchone()
+    if cached:
+        try:
+            fetched = datetime.fromisoformat(cached[1].replace("Z", "+00:00"))
+            if (now_utc - fetched).total_seconds() < RUNSON_COST_CACHE_TTL:
+                return json.loads(cached[2]) if cached[0] == "available" else None
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+
+    month_start = today_ct.replace(day=1).isoformat()
+    tomorrow = (today_ct + timedelta(days=1)).isoformat()
+    cost_filter = json.dumps({
+        "Not": {"Dimensions": {"Key": "RECORD_TYPE", "Values": ["Credit", "Refund"]}}
+    }, separators=(",", ":"))
+    ce_data, ce_error = _runson_aws_json(
+        [
+            "ce", "get-cost-and-usage",
+            "--time-period", f"Start={month_start},End={tomorrow}",
+            "--granularity", "DAILY", "--metrics", "UnblendedCost",
+            "--filter", cost_filter,
+        ],
+        "us-east-1",
+    )
+    if ce_error:
+        with sqlite3.connect(CONFIG["db_path"]) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO runson_cost_cache(cache_key,status,fetched_at,payload) VALUES (?,?,?,?)",
+                (cache_key, "unavailable", now_utc.isoformat(), "{}"),
+            )
+        return None
+
+    daily_map = {}
+    for period in (ce_data or {}).get("ResultsByTime", []):
+        day = ((period.get("TimePeriod") or {}).get("Start"))
+        amount = (((period.get("Total") or {}).get("UnblendedCost") or {}).get("Amount"))
+        try:
+            daily_map[day] = round(float(amount), 4)
+        except (TypeError, ValueError):
+            continue
+    window_start = today_ct - timedelta(days=29)
+    daily = [
+        {"date": (window_start + timedelta(days=i)).isoformat(),
+         "spend": daily_map.get((window_start + timedelta(days=i)).isoformat())}
+        for i in range(30)
+    ]
+    result = {
+        "daily_spend": daily,
+        "spent_today": daily_map.get(today_ct.isoformat()),
+        "spent_month": round(sum(daily_map.values()), 4) if daily_map else None,
+        "budget_actuals": {},
+    }
+
+    if account_id:
+        budget_names = (
+            "runs-on-app-daily-budget", "armbrain-monthly-guard", "armbrain-credit-burn",
+        )
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {
+                name: executor.submit(
+                    _runson_aws_json,
+                    ["budgets", "describe-budget", "--account-id", account_id, "--budget-name", name],
+                    "us-east-1",
+                )
+                for name in budget_names
+            }
+            for name, future in futures.items():
+                budget_data, budget_error = future.result()
+                if budget_error:
+                    continue
+                actual = (((budget_data or {}).get("Budget") or {}).get("CalculatedSpend") or {}).get("ActualSpend") or {}
+                try:
+                    result["budget_actuals"][name] = round(float(actual.get("Amount")), 4)
+                except (TypeError, ValueError):
+                    pass
+
+    with sqlite3.connect(CONFIG["db_path"]) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO runson_cost_cache(cache_key,status,fetched_at,payload) VALUES (?,?,?,?)",
+            (cache_key, "available", now_utc.isoformat(), json.dumps(result, separators=(",", ":"))),
+        )
+    return result
+
+def _runson_ce_cost_data(today_ct, account_id):
+    # Serialize the persistent-cache probe so concurrent browsers cannot turn
+    # one expired window into duplicate paid Cost Explorer calls.
+    with runson_cost_cache_lock:
+        return _runson_ce_cost_data_unlocked(today_ct, account_id)
 
 def _runson_error_result(error):
     if error == "credentials":
@@ -1958,6 +2161,13 @@ def get_runson_status():
                     })
 
             credits = (credits_data or {}).get("accountPlanRemainingCredits") or {}
+            credit_amount = credits.get("amount")
+            _record_runson_credit_sample(credit_amount, now_utc)
+            credit_costs = _runson_credit_budget_data(now_utc, today_ct)
+            stack_id = ((stack or {}).get("Stacks") or [{}])[0].get("StackId") or ""
+            account_match = re.match(r"^arn:aws:cloudformation:[^:]+:(\d+):", stack_id)
+            ce_costs = _runson_ce_cost_data(today_ct, account_match.group(1) if account_match else None)
+            costs = ce_costs or credit_costs
             charge_date = datetime(2026, 9, 12).date()
             result = {
                 "available": True,
@@ -1968,8 +2178,24 @@ def get_runson_status():
                 "trial_days_remaining": max(0, (charge_date - today_ct).days),
                 "trial_charge_date": charge_date.isoformat(),
                 "subscription_usd_per_year": 350,
-                "credits_remaining": credits.get("amount"),
+                "credits_remaining": credit_amount,
                 "credits_unit": credits.get("unit") or "USD",
+                "cost_source": "cost_explorer" if ce_costs else "credits",
+                "cost_source_label": "AWS Cost Explorer" if ce_costs else "net of credits",
+                "spent_today": costs.get("spent_today"),
+                "spent_month": costs.get("spent_month"),
+                "daily_spend": costs.get("daily_spend", []),
+                "credits_runway": {
+                    "burn_per_day_7d": credit_costs.get("burn_per_day_7d"),
+                    "projection_date": credit_costs.get("projection_date"),
+                    "samples": credit_costs.get("samples", []),
+                },
+                "budget_limits": {
+                    "daily": RUNSON_DAILY_BUDGET_USD,
+                    "monthly_guard": RUNSON_MONTHLY_GUARD_USD,
+                    "credit_burn_monthly": RUNSON_CREDIT_BURN_BUDGET_USD,
+                },
+                "budget_actuals": (ce_costs or {}).get("budget_actuals", {}),
                 "generated_at": datetime.now(timezone.utc).isoformat(),
             }
 
@@ -4054,6 +4280,26 @@ text-transform:uppercase;color:#7a839c;margin-top:4px}
 .runson-fact b{display:block;font-family:'Orbitron',monospace;color:var(--neon-cyan);font-size:1.15em}
 .runson-fact span{color:#778;font-size:0.75em}
 .runson-warning{color:var(--neon-yellow);margin:0;font-family:'Rajdhani',sans-serif}
+.runson-budget{width:100%;margin-top:15px;padding-top:13px;border-top:1px solid #27304a}
+.runson-budget-head{display:flex;gap:24px;align-items:flex-end;flex-wrap:wrap;margin-bottom:10px}
+.runson-spend{min-width:128px}
+.runson-spend strong{display:block;font:700 1.35em 'Orbitron',monospace;color:var(--neon-cyan)}
+.runson-spend small,.runson-source{color:#778;font-size:.72em}
+.runson-source{margin-left:auto;text-transform:uppercase;letter-spacing:.8px}
+.runson-na{color:#596174!important;text-shadow:none!important}
+.runson-visuals{display:grid;grid-template-columns:minmax(260px,1.3fr) minmax(220px,1fr);gap:14px}
+.runson-chart{border:1px solid #252e47;border-radius:6px;padding:8px 9px;background:rgba(8,12,24,.35);min-width:0}
+.runson-chart-title{font:600 .66em 'Orbitron',monospace;color:#8992aa;letter-spacing:1px;text-transform:uppercase;margin-bottom:4px}
+.runson-chart svg{display:block;width:100%;height:74px;overflow:visible}
+.runson-bar{fill:#39d7ff;opacity:.75}.runson-bar.zero{opacity:.5}.runson-bar.missing{fill:#424a5d;opacity:.35}
+.runson-credit-line{fill:none;stroke:#39ff14;stroke-width:2;filter:drop-shadow(0 0 3px rgba(57,255,20,.5))}
+.runson-credit-dot{fill:#39ff14}.runson-runway{color:#8c96aa;font-size:.76em;margin-top:4px}
+.runson-gauges{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px}
+.runson-gauge-label{display:flex;justify-content:space-between;color:#8992aa;font-size:.72em;margin-bottom:4px}
+.runson-gauge-track{height:7px;background:#20283c;border-radius:999px;overflow:hidden}
+.runson-gauge-fill{height:100%;border-radius:999px;transition:width .3s}.runson-gauge-fill.good{background:#39ff14}.runson-gauge-fill.warn{background:#d9a54a}.runson-gauge-fill.bad{background:#d94a4a}
+.runson-gauge.dim{opacity:.45}
+@media(max-width:720px){.runson-visuals{grid-template-columns:1fr}.runson-gauges{grid-template-columns:1fr}.runson-source{margin-left:0}}
 .gstrip{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px;align-items:center}
 .gcell{display:flex;align-items:center;gap:9px;padding:2px 4px;border-left:2px solid #24304d;min-width:0}
 .gcell .gicon{font-size:1.15em;line-height:1;flex:0 0 auto}
@@ -5473,6 +5719,73 @@ function runsonAge(minutes) {
     return Math.floor(minutes / 1440) + 'd ' + Math.floor((minutes % 1440) / 60) + 'h';
 }
 
+function runsonMoney(value) {
+    if (value === null || value === undefined || !Number.isFinite(Number(value))) {
+        return '<span class="runson-na">n/a</span>';
+    }
+    return '$' + Number(value).toFixed(2);
+}
+
+function runsonDailySpendChart(rows) {
+    const points = Array.isArray(rows) ? rows.slice(-30) : [];
+    while (points.length < 30) points.unshift({date: '', spend: null});
+    const measured = points.map(p => Number(p.spend)).filter((v, i) =>
+        points[i].spend !== null && points[i].spend !== undefined && Number.isFinite(v));
+    const maxSpend = measured.length ? Math.max(0.01, ...measured) : 1;
+    const bars = points.map((p, i) => {
+        const known = p.spend !== null && p.spend !== undefined && Number.isFinite(Number(p.spend));
+        const value = known ? Math.max(0, Number(p.spend)) : null;
+        // A measured zero is a visible baseline tick; missing data is a dimmed tick, never a fake zero.
+        const height = known ? (value === 0 ? 2 : Math.max(3, 58 * value / maxSpend)) : 2;
+        const cls = known ? (value === 0 ? 'runson-bar zero' : 'runson-bar') : 'runson-bar missing';
+        const title = (p.date || 'no sample') + ' · ' + (known ? '$' + value.toFixed(2) : 'n/a');
+        return '<rect class="' + cls + '" x="' + (i * 10 + 1) + '" y="' + (68 - height)
+            + '" width="7" height="' + height + '"><title>' + runsonEscape(title) + '</title></rect>';
+    }).join('');
+    return '<svg id="runson-spend-chart" viewBox="0 0 300 74" role="img" aria-label="Daily spend, last 30 days">'
+        + '<line x1="0" y1="68" x2="300" y2="68" stroke="#30394f"/>' + bars + '</svg>';
+}
+
+function runsonCreditsChart(runway, remaining) {
+    const samples = ((runway || {}).samples || []).filter(p =>
+        Number.isFinite(Number(p.credits)) && Number.isFinite(Date.parse(p.ts)));
+    let svg = '<svg id="runson-credits-chart" viewBox="0 0 300 74" role="img" aria-label="Remaining AWS credits">';
+    if (samples.length >= 2) {
+        const times = samples.map(p => Date.parse(p.ts));
+        const values = samples.map(p => Number(p.credits));
+        const minT = Math.min(...times), maxT = Math.max(...times);
+        const minV = Math.min(...values), maxV = Math.max(...values);
+        const coords = samples.map((p, i) => {
+            const x = 4 + 292 * (times[i] - minT) / Math.max(1, maxT - minT);
+            const y = maxV === minV ? 35 : 6 + 58 * (maxV - values[i]) / (maxV - minV);
+            return {x: x, y: y, p: p};
+        });
+        svg += '<polyline class="runson-credit-line" points="' + coords.map(c => c.x + ',' + c.y).join(' ') + '"/>';
+        svg += coords.map(c => '<circle class="runson-credit-dot" cx="' + c.x + '" cy="' + c.y
+            + '" r="2"><title>' + runsonEscape(c.p.ts + ' · $' + Number(c.p.credits).toFixed(2)) + '</title></circle>').join('');
+    } else {
+        svg += '<line x1="0" y1="68" x2="300" y2="68" stroke="#424a5d" opacity=".35"/>';
+    }
+    svg += '</svg>';
+    const projection = (runway || {}).projection_date;
+    const caption = projection
+        ? 'credits last until ~' + runsonEscape(projection) + ' at this pace'
+        : '<span class="runson-na">runway n/a</span>';
+    return svg + '<div class="runson-runway">' + runsonMoney(remaining) + ' remaining · ' + caption + '</div>';
+}
+
+function runsonBudgetGauge(label, spent, limit) {
+    const known = spent !== null && spent !== undefined && Number.isFinite(Number(spent));
+    const safeLimit = Number(limit) > 0 ? Number(limit) : 1;
+    const percent = known ? 100 * Math.max(0, Number(spent)) / safeLimit : 0;
+    // Spend semantics invert the dashboard's capacity colors: HIGH spend is bad.
+    const tone = percent > 90 ? 'bad' : (percent >= 60 ? 'warn' : 'good');
+    return '<div class="runson-gauge' + (known ? '' : ' dim') + '"><div class="runson-gauge-label"><span>'
+        + runsonEscape(label) + '</span><span>' + (known ? runsonMoney(spent) + ' / $' + safeLimit.toFixed(0) : 'n/a')
+        + '</span></div><div class="runson-gauge-track"><div class="runson-gauge-fill ' + tone
+        + '" style="width:' + Math.min(100, percent) + '%"></div></div></div>';
+}
+
 function refreshRunsOn() {
     fetch('/api/runson').then(r => r.json()).then(d => {
         const card = document.getElementById('runson-card');
@@ -5500,7 +5813,23 @@ function refreshRunsOn() {
             : '<div class="runson-runners">' + runners + '</div>';
         const creditsNumber = (d.credits_remaining === null || d.credits_remaining === undefined)
             ? Number.NaN : Number(d.credits_remaining);
-        const credits = Number.isFinite(creditsNumber) ? '$' + creditsNumber.toFixed(2) : '--';
+        const credits = Number.isFinite(creditsNumber) ? '$' + creditsNumber.toFixed(2) : 'n/a';
+        const limits = d.budget_limits || {};
+        const budgetStrip = '<div class="runson-budget" id="runson-budget-strip">'
+            + '<div class="runson-budget-head">'
+            + '<div class="runson-spend"><strong id="runson-spent-today">' + runsonMoney(d.spent_today)
+            + '</strong><small>Spent today</small></div>'
+            + '<div class="runson-spend"><strong id="runson-spent-month">' + runsonMoney(d.spent_month)
+            + '</strong><small>Spent this month</small></div>'
+            + '<div class="runson-source">' + runsonEscape(d.cost_source_label || 'n/a') + '</div></div>'
+            + '<div class="runson-visuals"><div class="runson-chart"><div class="runson-chart-title">Daily spend · 30 days</div>'
+            + runsonDailySpendChart(d.daily_spend) + '</div>'
+            + '<div class="runson-chart"><div class="runson-chart-title">Credits runway</div>'
+            + runsonCreditsChart(d.credits_runway, d.credits_remaining) + '</div></div>'
+            + '<div class="runson-gauges" id="runson-budget-gauges">'
+            + runsonBudgetGauge('Daily fuse', d.spent_today, limits.daily || 10)
+            + runsonBudgetGauge('Monthly guard', d.spent_month, limits.monthly_guard || 25)
+            + '</div></div>';
         body.innerHTML = '<div class="runson-grid">'
             + '<div class="runson-live"><div class="runson-count' + (count === 0 ? ' zero' : '') + '">' + count + '</div>'
             + '<div class="runson-label">live runners</div>' + runnerDetail + '</div>'
@@ -5509,7 +5838,7 @@ function refreshRunsOn() {
             + '<div class="runson-fact"><b>' + Number(d.trial_days_remaining || 0) + ' days</b><span>to $'
             + Number(d.subscription_usd_per_year || 350) + '/year charge · ' + runsonEscape(d.trial_charge_date || '2026-09-12') + '</span></div>'
             + '<div class="runson-fact"><b>' + credits + '</b><span>AWS credits remaining</span></div>'
-            + '</div></div>';
+            + '</div>' + budgetStrip + '</div>';
     }).catch(() => {
         const body = document.getElementById('runson-body');
         if (body) body.innerHTML = '<p class="runson-warning">⚠ RunsOn panel failed to load</p>';

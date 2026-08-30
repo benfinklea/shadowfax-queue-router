@@ -669,17 +669,103 @@ console.log(JSON.stringify({
             "RSS <number> GB or RSS n/a; never measuring…",
             "headless DOM after initial render + two 12s refresh intervals",
         )
+        budget_text = ""
+        budget_match = re.search(
+            r'<div class="runson-budget" id="runson-budget-strip">(.*?)<div class="runson-gauges" id="runson-budget-gauges">',
+            chrome.stdout,
+            re.S,
+        )
+        if budget_match:
+            budget_text = html.unescape(re.sub(r"<[^>]+>", " ", budget_match.group(1)))
+            budget_text = re.sub(r"\s+", " ", budget_text).strip()
+        budget_render_ok = (
+            chrome.returncode == 0
+            and "runson-spend-chart" in chrome.stdout
+            and "runson-credits-chart" in chrome.stdout
+            and "runson-budget-gauges" in chrome.stdout
+            and "Spent today" in budget_text
+            and "Spent this month" in budget_text
+        )
+        emit(
+            "PASS" if budget_render_ok else "FAIL",
+            "runson.budget_strip.rendered",
+            budget_text or "strip unreadable",
+            "spent today + spent this month + daily chart + runway chart + gauges",
+            "headless rendered DOM",
+        )
+        no_placeholder = (
+            budget_render_ok
+            and "measuring" not in budget_text.lower()
+            and "loading" not in budget_text.lower()
+        )
+        emit(
+            "PASS" if no_placeholder else "FAIL",
+            "runson.budget_strip.no_eternal_placeholder",
+            budget_text or "strip unreadable",
+            "rendered values or dimmed n/a; never loading/measuring",
+        )
     except Exception as exc:
         emit("FAIL", "page.render", "unavailable", "HTTP 200 + valid JS", str(exc))
     r = api.get("runson", {})
     if r.get("available"):
-        ok = all(k in r for k in ("live_runners", "runners", "jobs_today", "trial_days_remaining", "credits_remaining"))
+        ok = all(k in r for k in (
+            "live_runners", "runners", "jobs_today", "trial_days_remaining", "credits_remaining",
+            "cost_source", "cost_source_label", "spent_today", "spent_month", "daily_spend",
+            "credits_runway", "budget_limits",
+        )) and len(r.get("daily_spend") or []) == 30
         instrument = "AWS data schema"
     else:
         text = (r.get("message") or "").lower()
         ok = r.get("error") == "credentials" and "creds expired" in text and "aws login" in text
         instrument = "expired credentials must be explicit and actionable"
     emit("PASS" if ok else "FAIL", "runson.render_state", r, instrument)
+    source = (ROOT / "queue_router.py").read_text()
+    fallback_contract = (
+        '"cost_source": "cost_explorer" if ce_costs else "credits"' in source
+        and 'costs = ce_costs or credit_costs' in source
+        and '"cost_source_label": "AWS Cost Explorer" if ce_costs else "net of credits"' in source
+    )
+    fallback_probe = run([
+        str(ROOT / "venv/bin/python"), "-c", """
+import json, os, tempfile
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+import queue_router as q
+fd, path = tempfile.mkstemp(prefix='runson-truth-', suffix='.db'); os.close(fd)
+try:
+    q.CONFIG['db_path'] = path
+    q.init_db()
+    q._runson_aws_json = lambda args, region: (None, 'access_denied')
+    now = datetime(2026, 8, 30, 21, 10, tzinfo=timezone.utc)
+    credits = q._runson_credit_budget_data(now, now.astimezone(ZoneInfo('America/Chicago')).date())
+    ce = q._runson_ce_cost_data(now.astimezone(ZoneInfo('America/Chicago')).date(), '000000000000')
+    costs = ce or credits
+    print(json.dumps({'ce': ce, 'source': 'cost_explorer' if ce else 'credits',
+                      'label': 'AWS Cost Explorer' if ce else 'net of credits',
+                      'today': costs['spent_today'], 'month': costs['spent_month']}))
+finally:
+    os.unlink(path)
+""",
+    ], timeout=15)
+    try:
+        fallback_result = json.loads(fallback_probe.stdout)
+    except json.JSONDecodeError:
+        fallback_result = {}
+    fallback_live = (
+        fallback_probe.returncode == 0
+        and fallback_result.get("ce") is None
+        and fallback_result.get("source") == "credits"
+        and fallback_result.get("label") == "net of credits"
+        and close(fallback_result.get("today"), .62, .0001)
+        and close(fallback_result.get("month"), .62, .0001)
+    )
+    emit(
+        "PASS" if fallback_contract and fallback_live else "FAIL",
+        "runson.budget_strip.ce_fallback",
+        fallback_result or fallback_probe.stderr.strip() or "probe unreadable",
+        "CE AccessDenied falls back to numeric credit deltas labeled net of credits",
+        "isolated AccessDenied fixture with seeded credit anchors",
+    )
 
 
 def notify_cron(failures: list[dict], signature: str) -> None:
