@@ -1747,7 +1747,7 @@ def get_ci_queue_status():
 runson_cache = {"data": None, "ts": 0.0}
 runson_cache_lock = threading.Lock()
 RUNSON_CACHE_TTL = 120  # seconds - AWS reads are slower and credentials are short-lived
-RUNSON_AWS_PROFILE = "armbrain"
+RUNSON_AWS_PROFILE = "armbrain-dashboard"  # permanent scoped read-only key (council 2026-08-30); "armbrain" login sessions expire ~12h
 RUNSON_AWS_TIMEOUT = 12
 RUNSON_STACK_NAME = "runs-on"
 RUNSON_WORKFLOW_JOBS_TABLE = "runs-on-workflow-jobs"
