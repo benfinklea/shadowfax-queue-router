@@ -647,7 +647,8 @@ def init_db():
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_model_requests_box_ts ON model_requests(box, ts)")
-    # . . . and Prometheus counter samples from frodo's bare llama-server
+    # . . . and Prometheus counter samples from bare llama-servers (including
+    # frodo and pippin)
     # (tokens_predicted_total / tokens_predicted_seconds_total), sampled every
     # MODEL_SERVING_INTERVAL so rates and serving-time-only averages can be
     # derived across restarts.
@@ -2257,14 +2258,13 @@ def get_fleet_stats():
 #     /upstream/<model>/metrics MUST NOT be probed - hitting an upstream path
 #     triggers a model LOAD/swap (44-72s, evicts whatever is resident).
 #     The request buffer is in-memory, so we persist rows into sqlite.
-#   frodo/aragorn: bare llama-server --metrics exposes Prometheus counters
+#   frodo/aragorn/pippin: bare llama-server --metrics exposes Prometheus counters
 #     llamacpp:tokens_predicted_total + llamacpp:tokens_predicted_seconds_total.
 #     (Its *_tokens_seconds gauges are LIFETIME averages, not instantaneous -
 #     verified: 1.227e6 tok / 6436s = the exact 190.7 the gauge showed.)
 #     We sample the counters every 60s; deltas give rates, and the
 #     seconds_total counter only advances WHILE GENERATING, so
 #     sum(d_tokens)/sum(d_seconds) is exactly the serving-time-only average.
-# pippen: skipped - no llama-server there (route `code` moved; nothing serves).
 MODEL_SERVING_SOURCES = {
     "gandalf": {"kind": "llamacpp", "url": "http://127.0.0.1:8889/upstream/qwen3.8-27b/metrics"},
     "frodo":   {"kind": "llamacpp",  "url": f"http://{FLEET_IPS['frodo']}:8890/metrics"},
@@ -4314,6 +4314,7 @@ const TPS_DIAL_BOXES = {
     gandalf: 'tps-dial-gandalf',
     frodo: 'tps-dial-frodo',
     aragorn: 'tps-dial-aragorn',
+    pippin: 'tps-dial-pippin',
 };
 function tpsDialZones(avgToday, peakToday) {
     const average = Math.max(0, Math.min(TPS_GAUGE_MAX, Number(avgToday) || 0));
@@ -4893,6 +4894,9 @@ function refresh() {
                     html += '<div class="dial-strip">';
                     html += renderGauge(info.gpu_util, 0, 100, "GPU", "%", false, 0.7, true, 'util-' + name, info.max_util_today);
                     html += renderGauge(info.cpu_percent, 0, 100, "CPU", "%", false, 0.7, false, 'cpu-' + name, pk.cpu_percent);
+                    if (hasTpsDial) {
+                        html += renderGauge(null, 0, TPS_GAUGE_MAX, "TOK/S", " t/s", false, 0.7, true, TPS_DIAL_BOXES[name], null);
+                    }
                     const swapPct = info.swap ? info.swap.percent : 0;
                     html += renderSwapGauge(swapPct, 100, 0.7, 'swap-' + name, pk.swap_percent);
                     html += '</div>';

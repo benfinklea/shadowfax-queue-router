@@ -537,7 +537,7 @@ def check_rendering() -> None:
                     "energy-by-machine", "energy-fleet-body")
         missing = [x for x in required if not re.search(rf'id=(?:["\']{re.escape(x)}["\']|{re.escape(x)}(?:\s|>))', page)]
         emit("PASS" if code == 200 and not missing else "FAIL", "page.cards", {"http": code, "missing": missing}, list(required))
-        for name in ("gandalf", "frodo", "aragorn"):
+        for name in ("gandalf", "frodo", "aragorn", "pippin"):
             marker = f"tps-dial-{name}"
             found = marker in page
             emit("PASS" if found else "FAIL", f"page.tps_dial.{name}", found, marker)
@@ -583,7 +583,7 @@ console.log(JSON.stringify({
             fixture.get("tanEnd") == 120
             and capped.get("tanEnd") == 20
             and "updateTpsGauge(dialId, s.tps_now, s.tps_avg_today, s.tps_max_today)" in page
-            and set((tps_probe or {}).get("boxes", {})) == {"gandalf", "frodo", "aragorn"}
+            and set((tps_probe or {}).get("boxes", {})) == {"gandalf", "frodo", "aragorn", "pippin"}
         )
         emit("PASS" if avg_binding_ok else "FAIL", "page.tps_dial.average_boundary",
              {"fixture": fixture, "capped": capped}, "tan->green boundary equals tps_avg_today for all TPS boxes")
