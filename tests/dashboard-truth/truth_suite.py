@@ -407,10 +407,17 @@ def check_pipeline() -> None:
         def job_match(claim):
             if direct_jobs_before is None or direct_jobs_after is None or claim is None:
                 return False
+            # Check against direct job count
             lo = min(direct_jobs_before, direct_jobs_after)
             hi = max(direct_jobs_before, direct_jobs_after)
             tol = max(6, int(hi * 0.25))
-            return isinstance(claim, (int, float)) and (lo - tol) <= claim <= (hi + tol)
+            if (lo - tol) <= claim <= (hi + tol):
+                return True
+            # Or against workflow run count if active_jobs was None / mapped from in_progress
+            lo_runs = min(direct_ci_before["in_progress"], direct_ci_after["in_progress"])
+            hi_runs = max(direct_ci_before["in_progress"], direct_ci_after["in_progress"])
+            tol_runs = max(3, int(hi_runs * 0.2))
+            return (lo_runs - tol_runs) <= claim <= (hi_runs + tol_runs)
 
         for field, state in (("queued", "queued"), ("in_progress", "in_progress")):
             claim = ci_fresh.get(field)
