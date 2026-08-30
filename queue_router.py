@@ -139,8 +139,10 @@ CONFIG = {
             "ssh_user": "ben",
             "os": "linux",
             "model_status_urls": [
+                # gandalf runs llama-swap: /running is the only authoritative source
+                # for actually-loaded models. /v1/models lists all configured routes
+                # (including on-demand un-loaded ones), which falsely reports them as resident.
                 ("running", "http://127.0.0.1:8889/running"),
-                ("models", "http://127.0.0.1:8891/v1/models"),
             ],
             "vram_gb": 96,
             "gpu_power_limit": 450,
