@@ -727,7 +727,8 @@ console.log(JSON.stringify({
     )
     fallback_probe = run([
         str(ROOT / "venv/bin/python"), "-c", """
-import json, os, tempfile
+import sys, json, os, tempfile
+sys.path.insert(0, str(sys.argv[1]))
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 import queue_router as q
@@ -745,27 +746,37 @@ try:
                       'today': costs['spent_today'], 'month': costs['spent_month']}))
 finally:
     os.unlink(path)
-""",
+""", str(ROOT),
     ], timeout=15)
+    fallback_crashed = fallback_probe.returncode != 0
     try:
         fallback_result = json.loads(fallback_probe.stdout)
     except json.JSONDecodeError:
         fallback_result = {}
     fallback_live = (
-        fallback_probe.returncode == 0
+        not fallback_crashed
         and fallback_result.get("ce") is None
         and fallback_result.get("source") == "credits"
         and fallback_result.get("label") == "net of credits"
         and close(fallback_result.get("today"), .62, .0001)
         and close(fallback_result.get("month"), .62, .0001)
     )
-    emit(
-        "PASS" if fallback_contract and fallback_live else "FAIL",
-        "runson.budget_strip.ce_fallback",
-        fallback_result or fallback_probe.stderr.strip() or "probe unreadable",
-        "CE AccessDenied falls back to numeric credit deltas labeled net of credits",
-        "isolated AccessDenied fixture with seeded credit anchors",
-    )
+    if fallback_crashed:
+        emit(
+            "UNKNOWN",
+            "runson.budget_strip.ce_fallback",
+            fallback_probe.stderr.strip() or "probe crashed",
+            "CE AccessDenied falls back to numeric credit deltas labeled net of credits",
+            "isolated AccessDenied fixture probe crashed; cannot determine",
+        )
+    else:
+        emit(
+            "PASS" if fallback_contract and fallback_live else "FAIL",
+            "runson.budget_strip.ce_fallback",
+            fallback_result or "probe unreadable",
+            "CE AccessDenied falls back to numeric credit deltas labeled net of credits",
+            "isolated AccessDenied fixture with seeded credit anchors",
+        )
 
 
 def notify_cron(failures: list[dict], signature: str) -> None:
