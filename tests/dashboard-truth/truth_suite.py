@@ -6,6 +6,7 @@ from __future__ import annotations
 import concurrent.futures
 import datetime as dt
 import hashlib
+import html
 import json
 import os
 import re
@@ -550,6 +551,33 @@ def check_rendering() -> None:
         for fn in ("refresh", "refreshFleet", "refreshHistory", "refreshEnergy", "refreshCiQueue", "refreshShipFlow", "refreshRunsOn", "refreshRouteHealth", "refreshFleetStats", "refreshModelServing"):
             found = f"function {fn}(" in page
             emit("PASS" if found else "FAIL", f"page.renderer.{fn}", found, "renderer declared")
+
+        # The status timer runs every 12 seconds. Let a real browser complete
+        # the initial render plus two refresh intervals, then inspect the
+        # Pippin card's rendered model-memory field (not merely its API JSON).
+        chrome = run([
+            "google-chrome", "--headless", "--no-sandbox", "--disable-gpu",
+            "--virtual-time-budget=26000", "--dump-dom", BASE + "/",
+        ], timeout=40)
+        match = re.search(
+            r'<div id="loaded-models-pippin"[^>]*>(.*?)</div>',
+            chrome.stdout, re.S,
+        )
+        card_text = ""
+        if match:
+            card_text = html.unescape(re.sub(r"<[^>]+>", "", match.group(1))).strip()
+        pippin_memory_ok = (
+            chrome.returncode == 0
+            and "measuring…" not in card_text
+            and bool(re.search(r"\bRSS (?:\d+(?:\.\d+)? GB|n/a)\b", card_text))
+        )
+        emit(
+            "PASS" if pippin_memory_ok else "FAIL",
+            "page.pippin.memory_after_two_refreshes",
+            card_text or "card unreadable",
+            "RSS <number> GB or RSS n/a; never measuring…",
+            "headless DOM after initial render + two 12s refresh intervals",
+        )
     except Exception as exc:
         emit("FAIL", "page.render", "unavailable", "HTTP 200 + valid JS", str(exc))
     r = api.get("runson", {})

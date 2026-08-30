@@ -51,6 +51,7 @@ The suite treats the dashboard as a claim and reads the underlying system again 
 | CPU, RAM, swap, disk, disk I/O, network I/O | SSH `/proc`, `free`, `df`, counters | API required values/ranges and fresh host identity; history columns verify persistence |
 | Peak-hold markers and max utilization today | SQLite metrics since reset/midnight | direct history presence and typed peaks |
 | Loaded model identity | serving `/props`; Gandalf llama-swap `/running` | exact normalized model filename; no alias/fuzzy identity match |
+| Pippin loaded-model memory | resident `llama-server` RSS from guarded SSH process probe | headless DOM after two 12-second refresh intervals must show `RSS <number> GB` or dimmed `RSS n/a`, never `measuring…` |
 | Tokens/sec now, peak, average | direct llama.cpp `/metrics` counters or gateway spend log | live counters/source continuity and numeric sanity; current display is a 60-second delta |
 | Requests served 1h/24h/7d; serving minutes | counter burst estimates or gateway spend log | typed model-serving schema and direct source continuity |
 | Model route chips: live/loaded/idle/missing, box, model | gateway `/v1/models`, live config, serving resident set | exact live route membership from gateway; identity tests cover resident model |
@@ -63,4 +64,4 @@ The suite treats the dashboard as a claim and reads the underlying system again 
 | All cards and polling/render functions | inline HTML/JavaScript | required containers/functions present and JavaScript passes `node --check` |
 | Control buttons (wake/reboot/shutdown/power limit/clear swap/reset) | declared Flask routes and JS handlers | static contract only; hourly checker remains read-only |
 
-The inventory contains 19 API route contracts (14 read-only request forms plus 5 mutating contracts) and 55 rendered signal groups, for **74 enumerated signals/groups**. Per-box/per-route expansion produces one result line for each concrete live signal.
+The inventory contains 19 API route contracts (14 read-only request forms plus 5 mutating contracts) and 56 rendered signal groups, for **75 enumerated signals/groups**. Per-box/per-route expansion produces one result line for each concrete live signal.

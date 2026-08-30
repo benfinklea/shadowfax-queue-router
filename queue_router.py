@@ -1176,6 +1176,53 @@ def _served_model_ids(target_config):
 
 def _model_processes(target_name, target_config):
     """Return live llama-server processes and their nvidia-smi VRAM footprints."""
+    if target_config.get("os") == "mac":
+        rows = []
+        client = get_ssh_client(
+            target_config["ssh_host"], target_config.get("ssh_user", "ben")
+        )
+        if client is None:
+            return rows
+
+        # Apple Silicon has unified memory, not dedicated VRAM. /props has no
+        # memory field, so read the resident llama-server's RSS over the same
+        # cached SSH path as the card's hardware dials. Prove the reply came
+        # from the intended box before trusting any process number.
+        _, who_out, _ = client.exec_command("hostname", timeout=SSH_COMMAND_TIMEOUT)
+        reported = who_out.read().decode().strip()
+        if not _fleet_host_matches(
+            target_name, reported, TARGET_HOSTNAME_AKA.get(target_name, ())
+        ):
+            logger.warning(
+                f"{target_name} model RSS: WRONG BOX - asked "
+                f"{target_config['ssh_host']} for '{target_name}', got '{reported}'. "
+                "Refusing to render its process memory."
+            )
+            return rows
+
+        _, stdout, _ = client.exec_command(
+            "ps -axo pid=,rss=,command=", timeout=SSH_COMMAND_TIMEOUT
+        )
+        for line in stdout.read().decode(errors="ignore").splitlines():
+            parts = line.strip().split(None, 2)
+            if len(parts) != 3 or not parts[0].isdigit():
+                continue
+            executable = parts[2].split(None, 1)[0]
+            if Path(executable).name != "llama-server":
+                continue
+            try:
+                rows.append({
+                    "pid": int(parts[0]),
+                    # macOS ps reports RSS in KiB; retain the existing internal
+                    # MiB unit so get_loaded_models' GiB conversion stays exact.
+                    "vram_mb": float(parts[1]) / 1024,
+                    "memory_label": "RSS",
+                    "cmdline": parts[2],
+                })
+            except ValueError:
+                continue
+        return rows
+
     command = (
         "nvidia-smi --query-compute-apps=pid,process_name,used_memory "
         "--format=csv,noheader,nounits"
@@ -1512,6 +1559,13 @@ def get_loaded_models(target_name, target_config):
             result["models"].append({
                 "name": _model_display_name(model_id),
                 "vram_gb": round(match["vram_mb"] / 1024, 1) if match else None,
+                # On Apple Silicon this number is process RSS in unified
+                # memory. Keep the existing numeric key for API compatibility,
+                # but tell the renderer the honest label.
+                "memory_label": (
+                    match.get("memory_label") if match
+                    else ("RSS" if target_config.get("os") == "mac" else None)
+                ),
             })
     except Exception as e:
         logger.debug(f"loaded-model check failed for {target_name}: {e}")
@@ -4367,11 +4421,16 @@ function loadedModelsHtml(lm) {
     if (!lm.models || !lm.models.length) {
         return '<span class="dim">no model loaded</span>';
     }
-    return lm.models.map(model =>
-        '<b>● ' + model.name + '</b> <span class="tps">' +
-        (model.vram_gb === null || model.vram_gb === undefined ? 'measuring…' : model.vram_gb.toFixed(1) + ' GB') +
-        '</span>' + (model.where ? ' <span class="dim">on ' + model.where + '</span>' : '')
-    ).join('<br>');
+    return lm.models.map(model => {
+        const missingMemory = model.vram_gb === null || model.vram_gb === undefined;
+        const memoryLabel = model.memory_label ? model.memory_label + ' ' : '';
+        const memoryValue = missingMemory
+            ? '<span class="dim">n/a</span>'
+            : model.vram_gb.toFixed(1) + ' GB';
+        return '<b>● ' + model.name + '</b> <span class="tps">' +
+            memoryLabel + memoryValue + '</span>' +
+            (model.where ? ' <span class="dim">on ' + model.where + '</span>' : '');
+    }).join('<br>');
 }
 
 // Label + thin bar + value, all on ONE line (compact card layout).
