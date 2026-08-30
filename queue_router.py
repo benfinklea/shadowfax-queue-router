@@ -658,7 +658,25 @@ def init_db():
             ts TEXT NOT NULL,
             tokens_total REAL,
             gen_seconds_total REAL,
+            model_name TEXT,
             PRIMARY KEY (box, ts)
+        )
+    """)
+    # Existing databases predate per-model TPS records. Keep every historical
+    # sample and tag the legacy rows during the one-time peak seed, once the
+    # sampler has resolved the model that is currently serving on each box.
+    counter_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(model_counter_samples)")
+    }
+    if "model_name" not in counter_columns:
+        conn.execute("ALTER TABLE model_counter_samples ADD COLUMN model_name TEXT")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS model_tps_peaks (
+            box TEXT NOT NULL,
+            model_name TEXT NOT NULL,
+            peak_tps REAL NOT NULL CHECK (peak_tps >= 0),
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (box, model_name)
         )
     """)
     conn.commit()
@@ -2266,17 +2284,121 @@ def get_fleet_stats():
 #     seconds_total counter only advances WHILE GENERATING, so
 #     sum(d_tokens)/sum(d_seconds) is exactly the serving-time-only average.
 MODEL_SERVING_SOURCES = {
-    "gandalf": {"kind": "llamacpp", "url": "http://127.0.0.1:8889/upstream/qwen3.8-27b/metrics"},
-    "frodo":   {"kind": "llamacpp",  "url": f"http://{FLEET_IPS['frodo']}:8890/metrics"},
+    "gandalf": {"kind": "llamacpp", "url": "http://127.0.0.1:8889/upstream/qwen3.8-27b/metrics",
+                "identity_url": "http://127.0.0.1:8889/running"},
+    "frodo":   {"kind": "llamacpp", "url": f"http://{FLEET_IPS['frodo']}:8890/metrics",
+                "identity_url": f"http://{FLEET_IPS['frodo']}:8890/v1/models"},
     "aragorn": {"kind": "llamacpp_multi", "urls": [
         f"http://{FLEET_IPS['aragorn']}:11434/metrics",
         f"http://{FLEET_IPS['aragorn']}:11435/metrics",
+    ], "identity_urls": [
+        f"http://{FLEET_IPS['aragorn']}:11434/v1/models",
+        f"http://{FLEET_IPS['aragorn']}:11435/v1/models",
     ]},
-    "pippin":  {"kind": "llamacpp",  "url": f"http://{FLEET_IPS['pippen']}:8891/metrics"},
+    "pippin":  {"kind": "llamacpp", "url": f"http://{FLEET_IPS['pippen']}:8891/metrics",
+                "identity_url": f"http://{FLEET_IPS['pippen']}:8891/v1/models"},
 }
 MODEL_SERVING_INTERVAL = 60      # sampling cadence, matches METRICS_INTERVAL
 MODEL_SERVING_RETENTION_DAYS = 8  # a hair over the 7d display window
 MODEL_SERVING_HTTP_TIMEOUT = 6
+
+model_identity_cache = {}
+
+
+def _current_counter_model(box, source):
+    """Return a stable identity for exactly the counter set sampled on a box."""
+    urls = source.get("identity_urls") or [source.get("identity_url")]
+    model_ids = set()
+    try:
+        for url in (u for u in urls if u):
+            response = requests.get(url, timeout=MODEL_SERVING_HTTP_TIMEOUT)
+            if not response.ok:
+                continue
+            payload = response.json()
+            rows = payload.get("running") if "running" in payload else payload.get("data", [])
+            for row in rows or []:
+                if isinstance(row, str):
+                    model_id = row
+                else:
+                    model_id = row.get("model") or row.get("id") or row.get("name")
+                if model_id:
+                    model_ids.add(str(model_id).strip())
+    except Exception as e:
+        logger.debug(f"model identity {box}: {e}")
+    if model_ids:
+        # A multi-server box has one aggregate counter and therefore one
+        # canonical composite model identity for that aggregate rate.
+        model_identity_cache[box] = " + ".join(sorted(model_ids))
+    return model_identity_cache.get(box)
+
+
+def _upsert_model_tps_peak(conn, box, model_name, rate, observed_at):
+    """Persist a monotonic all-time peak for one exact (box, model) pair."""
+    if not model_name or rate is None or rate <= 0:
+        return
+    conn.execute("""
+        INSERT INTO model_tps_peaks (box, model_name, peak_tps, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(box, model_name) DO UPDATE SET
+            peak_tps = MAX(model_tps_peaks.peak_tps, excluded.peak_tps),
+            updated_at = CASE
+                WHEN excluded.peak_tps > model_tps_peaks.peak_tps
+                THEN excluded.updated_at ELSE model_tps_peaks.updated_at END
+    """, (box, model_name, float(rate), observed_at))
+
+
+def _counter_sample_deltas(samples):
+    """Yield model-aware counter deltas without crossing a model switch."""
+    deltas = []
+    for i in range(1, len(samples)):
+        ts, tok, sec, model_name = samples[i]
+        _pts, ptok, psec, previous_model = samples[i - 1]
+        if not model_name or model_name != previous_model:
+            continue
+        d_tok = tok - ptok
+        d_sec = (sec - psec) if sec is not None and psec is not None else 0.0
+        if d_tok < 0 or d_sec < 0:  # counter reset (llama-server restart)
+            d_tok, d_sec = tok, sec or 0.0
+        deltas.append((ts, d_tok, d_sec, model_name))
+    return deltas
+
+
+model_peaks_seed_lock = threading.Lock()
+model_peaks_seeded = False
+
+
+def _seed_model_tps_peaks(conn, current_models):
+    """Seed records from every history row present at migration/restart."""
+    global model_peaks_seeded
+    with model_peaks_seed_lock:
+        if model_peaks_seeded:
+            return
+        for box, model_name in current_models.items():
+            if model_name:
+                conn.execute(
+                    "UPDATE model_counter_samples SET model_name=? "
+                    "WHERE box=? AND (model_name IS NULL OR model_name='')",
+                    (model_name, box),
+                )
+        rows = conn.execute(
+            "SELECT box, ts, tokens_total, gen_seconds_total, model_name "
+            "FROM model_counter_samples ORDER BY box, ts"
+        ).fetchall()
+        by_box = {}
+        for box, ts, tok, sec, model_name in rows:
+            by_box.setdefault(box, []).append((ts, tok, sec, model_name))
+        for box, samples in by_box.items():
+            for ts, d_tok, d_sec, model_name in _counter_sample_deltas(samples):
+                if d_tok > 0 and d_sec > 0:
+                    _upsert_model_tps_peak(conn, box, model_name, d_tok / d_sec, ts)
+        for box, model_name, peak, observed_at in conn.execute(
+            "SELECT box, model, MAX(gen_tps), MAX(ts) FROM model_requests "
+            "WHERE model IS NOT NULL AND model != '' AND gen_tps > 0 "
+            "GROUP BY box, model"
+        ):
+            _upsert_model_tps_peak(conn, box, model_name, peak, observed_at)
+        conn.commit()
+        model_peaks_seeded = True
 
 def _parse_llamaswap_ts(ts):
     """llama-swap timestamps are UTC RFC3339 with nanoseconds - normalize to
@@ -2379,6 +2501,7 @@ def collect_model_serving():
             conn = sqlite3.connect(CONFIG["db_path"])
             # every plain llama-server box or multi-port server: one counter sample per cycle
             for _box, _src in MODEL_SERVING_SOURCES.items():
+                model_name = _current_counter_model(_box, _src)
                 if _src.get("kind") == "llamacpp_multi":
                     total_tok = 0.0
                     total_sec = 0.0
@@ -2396,10 +2519,24 @@ def collect_model_serving():
                         except Exception as e:
                             logger.debug(f"model serving sample {_box} ({u}): {e}")
                     if sampled:
+                        sampled_at = datetime.now().isoformat()
                         conn.execute(
                             "INSERT OR IGNORE INTO model_counter_samples "
-                            "(box, ts, tokens_total, gen_seconds_total) VALUES (?,?,?,?)",
-                            (_box, datetime.now().isoformat(), total_tok, total_sec))
+                            "(box, ts, tokens_total, gen_seconds_total, model_name) VALUES (?,?,?,?,?)",
+                            (_box, sampled_at, total_tok, total_sec, model_name))
+                        previous = conn.execute(
+                            "SELECT ts, tokens_total, gen_seconds_total, model_name "
+                            "FROM model_counter_samples WHERE box=? AND ts<? ORDER BY ts DESC LIMIT 1",
+                            (_box, sampled_at),
+                        ).fetchone() if model_name else None
+                        if previous and previous[3] == model_name:
+                            d_tok = total_tok - previous[1]
+                            d_sec = total_sec - previous[2]
+                            if d_tok < 0 or d_sec < 0:
+                                d_tok, d_sec = total_tok, total_sec
+                            if d_tok > 0 and d_sec > 0:
+                                _upsert_model_tps_peak(
+                                    conn, _box, model_name, d_tok / d_sec, sampled_at)
                 elif _src.get("kind") == "llamacpp":
                     try:
                         resp = requests.get(_src["url"], timeout=MODEL_SERVING_HTTP_TIMEOUT)
@@ -2411,12 +2548,27 @@ def collect_model_serving():
                                     if line.startswith(key):
                                         vals[key.strip()] = float(line.split()[-1])
                             if "llamacpp:tokens_predicted_total" in vals:
+                                sampled_at = datetime.now().isoformat()
+                                total_tok = vals.get("llamacpp:tokens_predicted_total")
+                                total_sec = vals.get("llamacpp:tokens_predicted_seconds_total")
                                 conn.execute(
                                     "INSERT OR IGNORE INTO model_counter_samples "
-                                    "(box, ts, tokens_total, gen_seconds_total) VALUES (?,?,?,?)",
-                                    (_box, datetime.now().isoformat(),
-                                     vals.get("llamacpp:tokens_predicted_total"),
-                                     vals.get("llamacpp:tokens_predicted_seconds_total")))
+                                    "(box, ts, tokens_total, gen_seconds_total, model_name) VALUES (?,?,?,?,?)",
+                                    (_box, sampled_at, total_tok, total_sec, model_name))
+                                previous = conn.execute(
+                                    "SELECT ts, tokens_total, gen_seconds_total, model_name "
+                                    "FROM model_counter_samples WHERE box=? AND ts<? ORDER BY ts DESC LIMIT 1",
+                                    (_box, sampled_at),
+                                ).fetchone() if model_name else None
+                                if (previous and previous[3] == model_name
+                                        and total_sec is not None and previous[2] is not None):
+                                    d_tok = total_tok - previous[1]
+                                    d_sec = total_sec - previous[2]
+                                    if d_tok < 0 or d_sec < 0:
+                                        d_tok, d_sec = total_tok, total_sec
+                                    if d_tok > 0 and d_sec > 0:
+                                        _upsert_model_tps_peak(
+                                            conn, _box, model_name, d_tok / d_sec, sampled_at)
                     except Exception as e:
                         logger.debug(f"model serving sample {_box}: {e}")
             cutoff = (datetime.now() - timedelta(days=MODEL_SERVING_RETENTION_DAYS)).isoformat()
@@ -2491,6 +2643,11 @@ def get_model_serving_stats():
     result = {}
     try:
         conn = sqlite3.connect(CONFIG["db_path"])
+        current_models = {
+            box: _current_counter_model(box, source)
+            for box, source in MODEL_SERVING_SOURCES.items()
+        }
+        _seed_model_tps_peaks(conn, current_models)
 
         # (Gandalf is now sampled as llamacpp_multi via model_counter_samples below)
 
@@ -2514,17 +2671,21 @@ def get_model_serving_stats():
             if src.get("kind") not in ("llamacpp", "llamacpp_multi"):
                 continue
             samples = conn.execute(
-                "SELECT ts, tokens_total, gen_seconds_total FROM model_counter_samples "
+                "SELECT ts, tokens_total, gen_seconds_total, model_name FROM model_counter_samples "
                 "WHERE box=? AND ts >= ? ORDER BY ts", (box, week_ago)).fetchall()
-            deltas = []  # (ts, d_tokens, d_secs)
-            for i in range(1, len(samples)):
-                ts, tok, sec = samples[i]
-                ptok, psec = samples[i - 1][1], samples[i - 1][2]
-                d_tok, d_sec = tok - ptok, (sec - psec) if sec is not None and psec is not None else 0.0
-                if d_tok < 0 or d_sec < 0:  # counter reset (llama-server restart)
-                    d_tok, d_sec = tok, sec or 0.0
-                deltas.append((ts, d_tok, d_sec))
-            fresh = bool(samples) and samples[-1][0] >= (now - timedelta(seconds=3 * MODEL_SERVING_INTERVAL)).isoformat()
+            model_name = current_models.get(box)
+            if not model_name and samples:
+                model_name = samples[-1][3]
+            deltas = [
+                (ts, d_tok, d_sec)
+                for ts, d_tok, d_sec, delta_model in _counter_sample_deltas(samples)
+                if delta_model == model_name
+            ]
+            fresh = (
+                bool(samples)
+                and samples[-1][3] == model_name
+                and samples[-1][0] >= (now - timedelta(seconds=3 * MODEL_SERVING_INTERVAL)).isoformat()
+            )
             tps_now = 0.0
             if deltas and fresh:
                 _, d_tok, d_sec = deltas[-1]
@@ -2535,11 +2696,17 @@ def get_model_serving_stats():
             sec_today = sum(d[2] for d in today if d[1] > 0)
             # Peak 60s-window generation speed today (bottom band of the t/s strip).
             _win_tps = [d[1] / d[2] for d in today if d[1] > 0 and d[2] > 0]
+            record_row = conn.execute(
+                "SELECT peak_tps FROM model_tps_peaks WHERE box=? AND model_name=?",
+                (box, model_name),
+            ).fetchone() if model_name else None
             result[box] = {
                 "available": len(samples) >= 2 and fresh,
+                "model_name": model_name,
                 "tps_now": tps_now,
                 "tps_avg_today": round(tok_today / sec_today, 1) if sec_today > 0 else 0.0,
                 "tps_max_today": round(max(_win_tps), 1) if _win_tps else 0.0,
+                "tps_record": round(record_row[0], 1) if record_row else 0.0,
                 "serving_minutes_today": round(sec_today / 60),
                 "requests": {
                     "hour": _bursts([d for d in deltas if d[0] >= hour_ago]),
@@ -2576,7 +2743,9 @@ def get_model_serving_stats():
             if _box_start > stats_window_start():
                 result[box] = {
                     "available": True, "source": "gateway", "reset": _box_start,
+                    "model_name": " + ".join(sorted(m for m in models if m)),
                     "tps_now": 0.0, "tps_avg_today": 0.0, "tps_max_today": 0.0,
+                    "tps_record": 0.0,
                     "serving_minutes_today": 0,
                     "requests": {"hour": 0, "day": 0, "week": 0},
                 }
@@ -2590,9 +2759,11 @@ def get_model_serving_stats():
             result[box] = {
                 "available": True,
                 "source": "gateway",
+                "model_name": " + ".join(sorted(m for m in models if m)),
                 "tps_now": max(r["tps_now"] for r in rows),
                 "tps_avg_today": round(tok / secs, 1) if secs > 0 else 0.0,
                 "tps_max_today": max(r["tps_max_today"] for r in rows),
+                "tps_record": max(r["tps_max_today"] for r in rows),
                 "serving_minutes_today": round(secs / 60),
                 "requests": {
                     "hour": sum(r["requests"]["hour"] for r in rows),
@@ -4305,7 +4476,7 @@ function refreshRouteHealth() {
 // requests served 1h/24h/7d. Containers live inside the model-serving target
 // cards (built on the initial /api/status render), so this fills them lazily
 // and just updates the gauges afterwards.
-const TPS_GAUGE_MAX = 400;
+const TPS_GAUGE_PLACEHOLDER_MAX = 1;
 // TPS-only thresholds. The red band is 15% of today's observed peak, capped
 // at the average so the visible bands can never invert. The tan->green edge
 // is always the live serving-time average for this specific box.
@@ -4316,11 +4487,13 @@ const TPS_DIAL_BOXES = {
     aragorn: 'tps-dial-aragorn',
     pippin: 'tps-dial-pippin',
 };
-function tpsDialZones(avgToday, peakToday) {
-    const average = Math.max(0, Math.min(TPS_GAUGE_MAX, Number(avgToday) || 0));
+function tpsDialZones(avgToday, peakToday, allTimeRecord) {
+    const record = Number(allTimeRecord);
+    const average = Math.max(0, Number(avgToday) || 0);
     const peak = Math.max(0, Number(peakToday) || 0);
+    if (!Number.isFinite(record) || record <= 0 || average >= record) return null;
     const redEnd = Math.min(average, peak * TPS_RED_PEAK_FRACTION);
-    return {redEnd: redEnd, tanEnd: average, max: TPS_GAUGE_MAX};
+    return {redEnd: redEnd, tanEnd: average, max: record};
 }
 function tpsGaugeGradient(zones) {
     const redDeg = (zones.redEnd / zones.max) * 180;
@@ -4330,20 +4503,28 @@ function tpsGaugeGradient(zones) {
         + '#d9a54a ' + redDeg + 'deg, #d9a54a ' + tanDeg + 'deg, '
         + '#39ff14 ' + tanDeg + 'deg, #39ff14 180deg, transparent 180deg)';
 }
-function updateTpsGauge(id, value, avgToday, peakToday) {
+function updateTpsGauge(id, value, avgToday, peakToday, allTimeRecord) {
     const gauge = document.getElementById(id);
     const hasZones = avgToday !== null && avgToday !== undefined
         && peakToday !== null && peakToday !== undefined
-        && Number.isFinite(Number(avgToday)) && Number.isFinite(Number(peakToday));
-    const zones = hasZones ? tpsDialZones(avgToday, peakToday) : null;
+        && allTimeRecord !== null && allTimeRecord !== undefined
+        && Number.isFinite(Number(avgToday)) && Number.isFinite(Number(peakToday))
+        && Number.isFinite(Number(allTimeRecord));
+    const zones = hasZones ? tpsDialZones(avgToday, peakToday, allTimeRecord) : null;
     if (gauge && zones) {
         const bg = gauge.querySelector('.gauge-bg');
         if (bg) bg.style.background = tpsGaugeGradient(zones);
+        gauge.dataset.max = String(zones.max);
         gauge.dataset.tpsZoneOrder = 'red-tan-green';
         gauge.dataset.tpsRedEnd = String(zones.redEnd);
         gauge.dataset.tpsTanEnd = String(zones.tanEnd);
+        gauge.dataset.tpsModelRecord = String(zones.max);
     }
-    updateGauge(id, value, 0, TPS_GAUGE_MAX, ' t/s', false, function(percent) {
+    if (!zones) {
+        updateGauge(id, null, 0, TPS_GAUGE_PLACEHOLDER_MAX, ' t/s', true, () => '#d94a4a');
+        return;
+    }
+    updateGauge(id, value, 0, zones.max, ' t/s', true, function(percent) {
         if (!zones) return '#d94a4a';
         const gaugeValue = (percent / 100) * zones.max;
         if (gaugeValue <= zones.redEnd) return '#d94a4a';
@@ -4361,23 +4542,27 @@ function refreshModelServing() {
             // Same wrong-box guard as the other dials: /api/status must have
             // verified this card's identity before serving stats can fill it.
             if (dialId && (!card || card.dataset.identityOk !== 'true')) {
-                updateTpsGauge(dialId, null, null, null);
+                updateTpsGauge(dialId, null, null, null, null);
                 el.innerHTML = '<span class="dim">serving stats unavailable (identity not verified)</span>';
                 continue;
             }
             if (!s.available) {
-                if (dialId) updateTpsGauge(dialId, null, null, null);
+                if (dialId) updateTpsGauge(dialId, null, null, null, null);
                 el.innerHTML = '<span class="dim">serving stats unavailable</span>';
                 continue;
             }
             if (dialId) {
-                updateTpsGauge(dialId, s.tps_now, s.tps_avg_today, s.tps_max_today);
-                updatePeakMarker(dialId + '-peak', s.tps_max_today, 0, TPS_GAUGE_MAX);
+                updateTpsGauge(dialId, s.tps_now, s.tps_avg_today, s.tps_max_today, s.tps_record);
+                const validRecord = Number(s.tps_record) > Number(s.tps_avg_today);
+                updatePeakMarker(
+                    dialId + '-peak', validRecord ? s.tps_max_today : null,
+                    0, validRecord ? s.tps_record : TPS_GAUGE_PLACEHOLDER_MAX
+                );
             }
             // Two-band strip at the top of the card: now (top) vs today's peak
             // (bottom), on one shared scale so the bars are comparable.
             const peak = s.tps_max_today || 0;
-            const scale = Math.max(TPS_GAUGE_MAX, peak);
+            const scale = Math.max(Number(s.tps_record) || 0, peak, 1);
             const nowFill = document.getElementById('tps-fill-now-' + name);
             const peakFill = document.getElementById('tps-fill-peak-' + name);
             if (nowFill) nowFill.style.width = Math.min(100, (s.tps_now / scale) * 100) + '%';
@@ -4895,7 +5080,7 @@ function refresh() {
                     html += renderGauge(info.gpu_util, 0, 100, "GPU", "%", false, 0.7, true, 'util-' + name, info.max_util_today);
                     html += renderGauge(info.cpu_percent, 0, 100, "CPU", "%", false, 0.7, false, 'cpu-' + name, pk.cpu_percent);
                     if (hasTpsDial) {
-                        html += renderGauge(null, 0, TPS_GAUGE_MAX, "TOK/S", " t/s", false, 0.7, true, TPS_DIAL_BOXES[name], null);
+                        html += renderGauge(null, 0, TPS_GAUGE_PLACEHOLDER_MAX, "TOK/S", " t/s", true, 0.7, true, TPS_DIAL_BOXES[name], null);
                     }
                     const swapPct = info.swap ? info.swap.percent : 0;
                     html += renderSwapGauge(swapPct, 100, 0.7, 'swap-' + name, pk.swap_percent);
@@ -4929,7 +5114,7 @@ function refresh() {
                     if (!hasTpsDial) html += renderGauge(info.gpu_temp, 24, 90, "TEMP", "°C", false, 0.7, false, 'temp-' + name, pk.gpu_temp);
                     html += renderGauge(info.cpu_percent, 0, 100, "CPU", "%", false, 0.7, false, 'cpu-' + name, pk.cpu_percent);
                     if (hasTpsDial) {
-                        html += renderGauge(null, 0, TPS_GAUGE_MAX, "TOK/S", " t/s", false, 0.7, true, TPS_DIAL_BOXES[name], null);
+                        html += renderGauge(null, 0, TPS_GAUGE_PLACEHOLDER_MAX, "TOK/S", " t/s", true, 0.7, true, TPS_DIAL_BOXES[name], null);
                     } else {
                         const swapPct = info.swap ? info.swap.percent : 0;
                         html += renderSwapGauge(swapPct, 100, 0.7, 'swap-' + name, pk.swap_percent);
@@ -4980,7 +5165,7 @@ function refresh() {
                     html += '<div class="dial-strip">';
                     html += renderGauge(info.cpu_percent, 0, 100, "CPU", "%", false, 0.7, false, 'cpu-' + name, pk.cpu_percent);
                     if (hasTpsDial) {
-                        html += renderGauge(null, 0, TPS_GAUGE_MAX, "TOK/S", " t/s", false, 0.7, true, TPS_DIAL_BOXES[name], null);
+                        html += renderGauge(null, 0, TPS_GAUGE_PLACEHOLDER_MAX, "TOK/S", " t/s", true, 0.7, true, TPS_DIAL_BOXES[name], null);
                     } else {
                         html += renderGauge(info.cpu_temp, 24, 90, "TEMP", "°C", false, 0.7, false, 'temp-' + name, pk.gpu_temp);
                         const swapPct = info.swap ? info.swap.percent : 0;

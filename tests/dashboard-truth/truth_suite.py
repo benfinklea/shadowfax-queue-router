@@ -481,6 +481,46 @@ def check_local_sources() -> None:
     # History/log/energy claims are independently recomputed from their SQLite source.
     try:
         con = sqlite3.connect(DB)
+        prior_records = {}
+        try:
+            prior_run = json.loads((STATE / "last-run.json").read_text())
+            for row in prior_run.get("results", []):
+                if row.get("signal", "").endswith(".tps_record_monotonic"):
+                    value = row.get("dashboard") or {}
+                    if value.get("model_name"):
+                        prior_records[(value["box"], value["model_name"])] = value.get("record")
+        except Exception:
+            pass
+        serving = api.get("model_serving", {})
+        for name in TARGETS:
+            claim = serving.get(name, {})
+            model_name = claim.get("model_name")
+            stored = con.execute(
+                "select peak_tps from model_tps_peaks where box=? and model_name=?",
+                (name, model_name),
+            ).fetchone() if model_name else None
+            stored_peak = stored[0] if stored else None
+            scale_ok = (
+                stored_peak is not None
+                and close(claim.get("tps_record"), round(stored_peak, 1), .05)
+            )
+            emit(
+                "PASS" if scale_ok else "FAIL", f"model.{name}.tps_record_scale",
+                {"model_name": model_name, "dial_max": claim.get("tps_record")},
+                {"stored_peak": round(stored_peak, 1) if stored_peak is not None else None},
+                "dial maximum equals persisted peak for the current model",
+            )
+            previous = prior_records.get((name, model_name))
+            monotonic_ok = (
+                stored_peak is not None
+                and (previous is None or stored_peak + .05 >= float(previous))
+            )
+            emit(
+                "PASS" if monotonic_ok else "FAIL", f"model.{name}.tps_record_monotonic",
+                {"box": name, "model_name": model_name,
+                 "record": round(stored_peak, 1) if stored_peak is not None else None},
+                {"previous_record": previous, "rule": "new >= previous for fixed (box,model)"},
+            )
         hist = api.get("history", {}).get("data", {})
         cutoff = (dt.datetime.now() - dt.timedelta(hours=1)).isoformat()
         for name, points in hist.items():
@@ -544,16 +584,18 @@ def check_rendering() -> None:
         # Execute the page's pure TPS zone helpers against fixed fixtures. This
         # catches both a color-order regression and accidental detachment of the
         # tan->green boundary from tps_avg_today without duplicating the formula.
-        probe_start = page.find("const TPS_GAUGE_MAX = 400;")
+        probe_start = page.find("const TPS_GAUGE_PLACEHOLDER_MAX = 1;")
         probe_end = page.find("function refreshModelServing()", probe_start)
         tps_probe = None
         if probe_start >= 0 and probe_end > probe_start:
             probe_js = page[probe_start:probe_end] + """
-const fixture = tpsDialZones(120, 300);
-const capped = tpsDialZones(20, 400);
+const fixture = tpsDialZones(120, 300, 360);
+const capped = tpsDialZones(20, 400, 500);
+const guarded = tpsDialZones(120, 300, 120);
 console.log(JSON.stringify({
   fixture: fixture,
   capped: capped,
+  guarded: guarded,
   gradient: tpsGaugeGradient(fixture),
   boxes: TPS_DIAL_BOXES
 }));
@@ -568,12 +610,15 @@ console.log(JSON.stringify({
                     pass
         fixture = (tps_probe or {}).get("fixture", {})
         capped = (tps_probe or {}).get("capped", {})
+        guarded = (tps_probe or {}).get("guarded")
         gradient = (tps_probe or {}).get("gradient", "")
         color_positions = [gradient.find(color) for color in ("#d94a4a", "#d9a54a", "#39ff14")]
         order_ok = (
             fixture.get("redEnd") == 45
+            and fixture.get("max") == 360
             and fixture.get("redEnd", 1) <= fixture.get("tanEnd", 0) <= fixture.get("max", 0)
             and capped.get("redEnd") <= capped.get("tanEnd", -1)
+            and guarded is None
             and all(pos >= 0 for pos in color_positions)
             and color_positions == sorted(color_positions)
         )
@@ -582,7 +627,7 @@ console.log(JSON.stringify({
         avg_binding_ok = (
             fixture.get("tanEnd") == 120
             and capped.get("tanEnd") == 20
-            and "updateTpsGauge(dialId, s.tps_now, s.tps_avg_today, s.tps_max_today)" in page
+            and "updateTpsGauge(dialId, s.tps_now, s.tps_avg_today, s.tps_max_today, s.tps_record)" in page
             and set((tps_probe or {}).get("boxes", {})) == {"gandalf", "frodo", "aragorn", "pippin"}
         )
         emit("PASS" if avg_binding_ok else "FAIL", "page.tps_dial.average_boundary",
