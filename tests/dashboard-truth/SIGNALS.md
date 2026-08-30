@@ -44,8 +44,9 @@ The suite treats the dashboard as a claim and reads the underlying system again 
 | Core `n/4` and Reserve `n/5` | three target cards + Shadowfax; five Shire/reserve tiles | recomputed from fresh primary-path probes |
 | Target card status | fresh SSH primary path | ping/TCP/SSH hostname comparison |
 | GPU utilization dial | `nvidia-smi` sampled by dashboard | fresh remote `nvidia-smi`, 20-point sampling tolerance |
-| GPU temperature dial | `nvidia-smi` | fresh remote `nvidia-smi`, ±5 C |
+| GPU temperature dial (all except Gandalf/Frodo/Aragorn) | `nvidia-smi` | fresh remote `nvidia-smi`, ±5 C |
 | GPU power dial/limit and GPU identity/count | `nvidia-smi` and configured ceiling | fresh `nvidia-smi`, sampling tolerance and required schema |
+| Tokens/sec dial (Gandalf/Frodo/Aragorn) | 60-second deltas of llama.cpp lifetime token/serving-second counters; Aragorn sums live :11434/:11435 instances | direct serving `/metrics` counters plus per-card DOM marker; unavailable data must stay dim |
 | VRAM used/total bar and process tooltip | `nvidia-smi` memory and compute apps | fresh `nvidia-smi`, ±5% (plus 0.2 GiB floor) |
 | CPU, RAM, swap, disk, disk I/O, network I/O | SSH `/proc`, `free`, `df`, counters | API required values/ranges and fresh host identity; history columns verify persistence |
 | Peak-hold markers and max utilization today | SQLite metrics since reset/midnight | direct history presence and typed peaks |

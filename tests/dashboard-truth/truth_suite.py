@@ -242,6 +242,20 @@ def prom_value(text: str, key: str):
 
 def serving_instrument(name: str):
     urls = {"frodo": "http://192.168.1.11:8890", "pippin": "http://192.168.1.13:8891"}
+    if name == "aragorn":
+        rows = []
+        for base in ("http://192.168.1.15:11434", "http://192.168.1.15:11435"):
+            try:
+                with urllib.request.urlopen(base + "/metrics", timeout=6) as response:
+                    metrics = response.read().decode()
+                rows.append((prom_value(metrics, "llamacpp:tokens_predicted_total") or 0,
+                             prom_value(metrics, "llamacpp:tokens_predicted_seconds_total") or 0))
+            except Exception:
+                pass
+        if not rows:
+            return None
+        return {"tokens_total": sum(x[0] for x in rows),
+                "seconds_total": sum(x[1] for x in rows), "model": "multi"}
     if name not in urls:
         return None
     base = urls[name]
@@ -261,7 +275,7 @@ def normalize_model(value: str) -> str:
 def check_models() -> None:
     serving = api.get("model_serving", {})
     status = api.get("status", {}).get("targets", {})
-    for name in ("frodo", "pippin"):
+    for name in ("frodo", "pippin", "aragorn"):
         try:
             direct = serving_instrument(name)
         except Exception as exc:
@@ -282,11 +296,12 @@ def check_models() -> None:
         emit("PASS" if sane else "FAIL", f"model.{name}.tps_now", tps,
              {"tokens_total": direct["tokens_total"], "seconds_total": direct["seconds_total"]},
              "dashboard is a 60s counter delta; direct counters prove source continuity")
-        models = (status.get(name, {}).get("loaded_models") or {}).get("models") or []
-        claims = [normalize_model(m.get("name", "")) for m in models]
-        actual = normalize_model(direct["model"])
-        exact = bool(actual) and actual in claims
-        emit("PASS" if exact else "FAIL", f"model.{name}.identity", claims, actual, "exact normalized filename match")
+        if name != "aragorn":
+            models = (status.get(name, {}).get("loaded_models") or {}).get("models") or []
+            claims = [normalize_model(m.get("name", "")) for m in models]
+            actual = normalize_model(direct["model"])
+            exact = bool(actual) and actual in claims
+            emit("PASS" if exact else "FAIL", f"model.{name}.identity", claims, actual, "exact normalized filename match")
     # Gandalf is llama-swap: /running is authoritative and avoids load-triggering upstream probes.
     try:
         running = url_json("http://127.0.0.1:8889/running", 6).get("running", [])
@@ -302,7 +317,7 @@ def check_models() -> None:
     # Gateway-derived boxes: verify each advertised value has a route/model source.
     routes = api.get("model_routes", {}).get("routes", [])
     route_boxes = {r.get("box") for r in routes if r.get("live")}
-    for name in ("aragorn", "shadowfax"):
+    for name in ("shadowfax",):
         claim = serving.get(name, {})
         level = "PASS" if (not claim.get("available") or name in route_boxes) else "FAIL"
         emit(level, f"model.{name}.gateway_source", claim.get("source"), name in route_boxes,
@@ -514,6 +529,10 @@ def check_rendering() -> None:
                     "energy-by-machine", "energy-fleet-body")
         missing = [x for x in required if not re.search(rf'id=(?:["\']{re.escape(x)}["\']|{re.escape(x)}(?:\s|>))', page)]
         emit("PASS" if code == 200 and not missing else "FAIL", "page.cards", {"http": code, "missing": missing}, list(required))
+        for name in ("gandalf", "frodo", "aragorn"):
+            marker = f"tps-dial-{name}"
+            found = marker in page
+            emit("PASS" if found else "FAIL", f"page.tps_dial.{name}", found, marker)
         scripts = re.findall(r"<script>(.*?)</script>", page, re.S)
         node_ok = False
         if scripts:

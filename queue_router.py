@@ -2203,7 +2203,7 @@ def get_fleet_stats():
 #     /upstream/<model>/metrics MUST NOT be probed - hitting an upstream path
 #     triggers a model LOAD/swap (44-72s, evicts whatever is resident).
 #     The request buffer is in-memory, so we persist rows into sqlite.
-#   frodo: bare llama-server --metrics (port 8890) exposes Prometheus counters
+#   frodo/aragorn: bare llama-server --metrics exposes Prometheus counters
 #     llamacpp:tokens_predicted_total + llamacpp:tokens_predicted_seconds_total.
 #     (Its *_tokens_seconds gauges are LIFETIME averages, not instantaneous -
 #     verified: 1.227e6 tok / 6436s = the exact 190.7 the gauge showed.)
@@ -2214,6 +2214,10 @@ def get_fleet_stats():
 MODEL_SERVING_SOURCES = {
     "gandalf": {"kind": "llamacpp", "url": "http://127.0.0.1:8889/upstream/qwen3.8-27b/metrics"},
     "frodo":   {"kind": "llamacpp",  "url": f"http://{FLEET_IPS['frodo']}:8890/metrics"},
+    "aragorn": {"kind": "llamacpp_multi", "urls": [
+        f"http://{FLEET_IPS['aragorn']}:11434/metrics",
+        f"http://{FLEET_IPS['aragorn']}:11435/metrics",
+    ]},
     "pippin":  {"kind": "llamacpp",  "url": f"http://{FLEET_IPS['pippen']}:8891/metrics"},
 }
 MODEL_SERVING_INTERVAL = 60      # sampling cadence, matches METRICS_INTERVAL
@@ -2324,10 +2328,12 @@ def collect_model_serving():
                 if _src.get("kind") == "llamacpp_multi":
                     total_tok = 0.0
                     total_sec = 0.0
+                    sampled = False
                     for u in _src.get("urls", []):
                         try:
                             resp = requests.get(u, timeout=MODEL_SERVING_HTTP_TIMEOUT)
                             if resp.ok:
+                                sampled = True
                                 for line in resp.text.splitlines():
                                     if line.startswith("llamacpp:tokens_predicted_total "):
                                         total_tok += float(line.split()[-1])
@@ -2335,7 +2341,7 @@ def collect_model_serving():
                                         total_sec += float(line.split()[-1])
                         except Exception as e:
                             logger.debug(f"model serving sample {_box} ({u}): {e}")
-                    if total_tok > 0:
+                    if sampled:
                         conn.execute(
                             "INSERT OR IGNORE INTO model_counter_samples "
                             "(box, ts, tokens_total, gen_seconds_total) VALUES (?,?,?,?)",
@@ -2464,8 +2470,9 @@ def get_model_serving_stats():
                 if d_tok < 0 or d_sec < 0:  # counter reset (llama-server restart)
                     d_tok, d_sec = tok, sec or 0.0
                 deltas.append((ts, d_tok, d_sec))
+            fresh = bool(samples) and samples[-1][0] >= (now - timedelta(seconds=3 * MODEL_SERVING_INTERVAL)).isoformat()
             tps_now = 0.0
-            if deltas and deltas[-1][0] >= (now - timedelta(seconds=3 * MODEL_SERVING_INTERVAL)).isoformat():
+            if deltas and fresh:
                 _, d_tok, d_sec = deltas[-1]
                 tps_now = round(d_tok / d_sec, 1) if d_tok > 0 and d_sec > 0 else 0.0
             box_start = stats_window_start(box)   # per-host reset window
@@ -2475,7 +2482,7 @@ def get_model_serving_stats():
             # Peak 60s-window generation speed today (bottom band of the t/s strip).
             _win_tps = [d[1] / d[2] for d in today if d[1] > 0 and d[2] > 0]
             result[box] = {
-                "available": len(samples) >= 2,
+                "available": len(samples) >= 2 and fresh,
                 "tps_now": tps_now,
                 "tps_avg_today": round(tok_today / sec_today, 1) if sec_today > 0 else 0.0,
                 "tps_max_today": round(max(_win_tps), 1) if _win_tps else 0.0,
@@ -3654,6 +3661,7 @@ text-shadow:0 0 6px var(--neon-green);white-space:nowrap;opacity:0.85}
 display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .dial-strip .gauge-value{font-size:0.78em;margin-top:0;display:block;
 white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dial-strip .gauge.unavailable{opacity:0.35}
 /* --- Tokens/sec strip (2026-07-29, Ben): the card's top accent line became a
    two-band live indicator. TOP band = tokens/sec right now, BOTTOM band =
    today's peak tokens/sec. Both on the same scale so they compare. --- */
@@ -4240,19 +4248,38 @@ function refreshRouteHealth() {
 }
 
 // Model serving dials: t/s now + today's serving-time-only average, and
-// requests served 1h/24h/7d. Containers live inside the gandalf/frodo target
+// requests served 1h/24h/7d. Containers live inside the model-serving target
 // cards (built on the initial /api/status render), so this fills them lazily
 // and just updates the gauges afterwards.
 const TPS_GAUGE_MAX = 400;
+const TPS_DIAL_BOXES = {
+    gandalf: 'tps-dial-gandalf',
+    frodo: 'tps-dial-frodo',
+    aragorn: 'tps-dial-aragorn',
+};
 function tpsColor() { return '#00fff2'; }  // throughput isn't an alarm metric - keep it cyan
 function refreshModelServing() {
     fetch('/api/model_serving').then(r => r.json()).then(data => {
         for (const [name, s] of Object.entries(data)) {
             const el = document.getElementById('serving-' + name);
             if (!el) continue;
-            if (!s.available) {
-                if (!el.dataset.init) el.innerHTML = '<span class="dim">serving stats warming up…</span>';
+            const card = document.getElementById('card-' + name);
+            const dialId = TPS_DIAL_BOXES[name];
+            // Same wrong-box guard as the other dials: /api/status must have
+            // verified this card's identity before serving stats can fill it.
+            if (dialId && (!card || card.dataset.identityOk !== 'true')) {
+                updateGauge(dialId, null, 0, TPS_GAUGE_MAX, ' t/s', false, tpsColor);
+                el.innerHTML = '<span class="dim">serving stats unavailable (identity not verified)</span>';
                 continue;
+            }
+            if (!s.available) {
+                if (dialId) updateGauge(dialId, null, 0, TPS_GAUGE_MAX, ' t/s', false, tpsColor);
+                el.innerHTML = '<span class="dim">serving stats unavailable</span>';
+                continue;
+            }
+            if (dialId) {
+                updateGauge(dialId, s.tps_now, 0, TPS_GAUGE_MAX, ' t/s', false, tpsColor);
+                updatePeakMarker(dialId + '-peak', s.tps_max_today, 0, TPS_GAUGE_MAX);
             }
             // Two-band strip at the top of the card: now (top) vs today's peak
             // (bottom), on one shared scale so the bars are comparable.
@@ -4439,6 +4466,7 @@ const HELP = {
     disk:  'DISK - how full the drive is. No high-water mark here on purpose: disk usage only climbs, so today maximum is just the current number.',
     io:    'DISK and NETWORK traffic in megabytes per second, read/write and in/out. Useful for spotting a box that is busy moving data rather than thinking.',
     tps:   'TOKENS PER SECOND - the speed the model is writing. A token is roughly three quarters of a word. NOW is this second, PEAK TODAY is the fastest it managed today, AVG is the average across everything it served today.',
+    toks:  'TOKENS PER SECOND - the speed the model is writing right now. A token is roughly three quarters of a word. The bright mark is today high point.',
     reqs:  'REQUESTS - how many times something asked this box for an answer, in the last hour, last 24 hours and last 7 days.',
     served:'SERVING TIME - total minutes this box spent actually generating today. A big request count with few minutes means lots of short answers.',
     model: 'LOADED MODEL - which AI model is sitting in memory right now, and how much memory it is using. Empty means nothing is loaded and the next request will wait for it to load.',
@@ -4517,7 +4545,7 @@ function renderGauge(value, min, max, label, unit, showLimit, size, reverseColor
     }
 
     const help = HELP[label.toLowerCase().replace(/[^a-z]/g, '')] || '';
-    return '<div class="gauge" id="' + gaugeId + '" style="width:' + w + 'px" data-min="' + min + '" data-max="' + max + '" title="' + help.replace(/"/g, '') + '">' +
+    return '<div class="gauge' + (value === null ? ' unavailable' : '') + '" id="' + gaugeId + '" style="width:' + w + 'px" data-min="' + min + '" data-max="' + max + '" title="' + help.replace(/"/g, '') + '">' +
         '<div class="gauge-dial" style="width:' + w + 'px;height:' + h + 'px">' +
         '<div class="gauge-bg" style="background:' + gradient + '"></div>' +
         '<div class="gauge-mask"></div>' +
@@ -4676,6 +4704,18 @@ function updateGauge(id, value, min, max, unit, showLimit, colorFn) {
     const gauge = document.getElementById(id);
     if (!gauge) return;
 
+    if (value === null || value === undefined) {
+        if (gauge.dataset.lastVal === 'unavailable') return;
+        gauge.dataset.lastVal = 'unavailable';
+        gauge.classList.add('unavailable');
+        const needle = gauge.querySelector('.gauge-needle');
+        const valueEl = gauge.querySelector('.gauge-value');
+        if (needle) needle.style.transform = 'rotate(-90deg)';
+        if (valueEl) valueEl.textContent = '--';
+        return;
+    }
+    gauge.classList.remove('unavailable');
+
     const clampedValue = Math.max(min, Math.min(max, value));
     const percent = ((clampedValue - min) / (max - min)) * 100;
     const angle = -90 + (percent * 1.8);
@@ -4725,7 +4765,8 @@ function refresh() {
                 const isMac = info.os === 'mac';
 
                 const isModelBox = ['gandalf', 'frodo', 'pippin', 'aragorn'].includes(name);
-                html += '<div class="gpu-card compact' + (isModelBox ? ' has-tps' : '') + '" id="card-' + name + '">';
+                const hasTpsDial = Object.prototype.hasOwnProperty.call(TPS_DIAL_BOXES, name) && !info.mismatch;
+                html += '<div class="gpu-card compact' + (isModelBox ? ' has-tps' : '') + '" id="card-' + name + '" data-identity-ok="' + (info.online && !info.mismatch) + '">';
                 // Two-band tokens/sec strip in place of the flat accent line.
                 if (isModelBox) {
                     html += '<div class="tps-strip" id="tps-strip-' + name + '">'
@@ -4784,10 +4825,14 @@ function refresh() {
                     html += '<div class="dial-strip">';
                     html += renderGauge(info.gpu_util, 0, 100, "GPU", "%", false, 0.7, true, 'util-' + name, info.max_util_today);
                     html += renderGauge(info.gpu_watts, 0, info.gpu_power_max, "POWER", "W", false, 0.7, false, 'power-' + name, pk.gpu_watts);
-                    html += renderGauge(info.gpu_temp, 24, 90, "TEMP", "°C", false, 0.7, false, 'temp-' + name, pk.gpu_temp);
+                    if (!hasTpsDial) html += renderGauge(info.gpu_temp, 24, 90, "TEMP", "°C", false, 0.7, false, 'temp-' + name, pk.gpu_temp);
                     html += renderGauge(info.cpu_percent, 0, 100, "CPU", "%", false, 0.7, false, 'cpu-' + name, pk.cpu_percent);
-                    const swapPct = info.swap ? info.swap.percent : 0;
-                    html += renderSwapGauge(swapPct, 100, 0.7, 'swap-' + name, pk.swap_percent);
+                    if (hasTpsDial) {
+                        html += renderGauge(null, 0, TPS_GAUGE_MAX, "TOK/S", " t/s", false, 0.7, false, TPS_DIAL_BOXES[name], null);
+                    } else {
+                        const swapPct = info.swap ? info.swap.percent : 0;
+                        html += renderSwapGauge(swapPct, 100, 0.7, 'swap-' + name, pk.swap_percent);
+                    }
                     html += '</div>';
 
                     html += miniRow('VRAM', info.gpu.vram_percent, 'progress-vram', 'vram-' + name,
@@ -4833,9 +4878,13 @@ function refresh() {
                     const pk = info.peaks_today || {};
                     html += '<div class="dial-strip">';
                     html += renderGauge(info.cpu_percent, 0, 100, "CPU", "%", false, 0.7, false, 'cpu-' + name, pk.cpu_percent);
-                    html += renderGauge(info.cpu_temp, 24, 90, "TEMP", "°C", false, 0.7, false, 'temp-' + name, pk.gpu_temp);
-                    const swapPct = info.swap ? info.swap.percent : 0;
-                    html += renderSwapGauge(swapPct, 100, 0.7, 'swap-' + name, pk.swap_percent);
+                    if (hasTpsDial) {
+                        html += renderGauge(null, 0, TPS_GAUGE_MAX, "TOK/S", " t/s", false, 0.7, false, TPS_DIAL_BOXES[name], null);
+                    } else {
+                        html += renderGauge(info.cpu_temp, 24, 90, "TEMP", "°C", false, 0.7, false, 'temp-' + name, pk.gpu_temp);
+                        const swapPct = info.swap ? info.swap.percent : 0;
+                        html += renderSwapGauge(swapPct, 100, 0.7, 'swap-' + name, pk.swap_percent);
+                    }
                     html += '</div>';
 
                     if (info.ram) {
@@ -4848,7 +4897,9 @@ function refresh() {
                         html += miniRow('DISK', info.disk.percent, 'progress-disk', 'disk-' + name,
                                         'disk-label-' + name, diskUsed + ' / ' + diskTotal);
                     }
-                    html += '<div class="serving-line"><span class="dim">no GPU driver installed - GPU dials appear once nvidia-smi is available</span></div>';
+                    html += '<div class="serving-line"><span class="dim">no GPU driver installed - GPU dials appear once nvidia-smi is available</span>';
+                    if (isModelBox) html += '<div id="serving-' + name + '" title="' + HELP.tps.replace(/"/g, '') + ' ' + HELP.reqs.replace(/"/g, '') + '"></div>';
+                    html += '</div>';
                     html += '<div class="card-foot">';
                     let ioTxt2 = '';
                     if (info.disk_io) {
@@ -4874,6 +4925,8 @@ function refresh() {
         } else {
             // UPDATE PATH: Just update values in place
             for (const [name, info] of Object.entries(targets)) {
+                const card = document.getElementById('card-' + name);
+                if (card) card.dataset.identityOk = String(info.online && !info.mismatch);
                 // Update max utilization today
                 updatePeakMarker('util-' + name + '-peak', info.max_util_today, 0, 100);
 
@@ -4911,16 +4964,18 @@ function refresh() {
                     // Update gauges
                     updateGauge('util-' + name, info.gpu_util, 0, 100, '%', false, getUtilColor);
                     updateGauge('power-' + name, info.gpu_watts, 0, info.gpu_power_max, 'W', false, getNormalColor);
-                    updateGauge('temp-' + name, info.gpu_temp, 24, 90, '°C', false, getNormalColor);
+                    if (!Object.prototype.hasOwnProperty.call(TPS_DIAL_BOXES, name)) updateGauge('temp-' + name, info.gpu_temp, 24, 90, '°C', false, getNormalColor);
                     updateGauge('cpu-' + name, info.cpu_percent, 0, 100, '%', false, getNormalColor);
-                    const swapPct = info.swap ? info.swap.percent : 0;
-                    updateGauge('swap-' + name, swapPct, 0, 100, '%', false, getSwapColor);
+                    if (!Object.prototype.hasOwnProperty.call(TPS_DIAL_BOXES, name)) {
+                        const swapPct = info.swap ? info.swap.percent : 0;
+                        updateGauge('swap-' + name, swapPct, 0, 100, '%', false, getSwapColor);
+                    }
                     // Peak-hold marks: today's high-water mark on every dial and bar.
                     const pk = info.peaks_today || {};
                     updatePeakMarker('power-' + name + '-peak', pk.gpu_watts, 0, info.gpu_power_max);
-                    updatePeakMarker('temp-' + name + '-peak', pk.gpu_temp, 24, 90);
+                    if (!Object.prototype.hasOwnProperty.call(TPS_DIAL_BOXES, name)) updatePeakMarker('temp-' + name + '-peak', pk.gpu_temp, 24, 90);
                     updatePeakMarker('cpu-' + name + '-peak', pk.cpu_percent, 0, 100);
-                    updatePeakMarker('swap-' + name + '-peak', pk.swap_percent, 0, 100);
+                    if (!Object.prototype.hasOwnProperty.call(TPS_DIAL_BOXES, name)) updatePeakMarker('swap-' + name + '-peak', pk.swap_percent, 0, 100);
                     updateBarPeak('vram-' + name, pk.vram_percent);
                     updateBarPeak('ram-' + name, pk.ram_percent);
 
