@@ -2162,11 +2162,22 @@ def get_runson_status():
 
             credits = (credits_data or {}).get("accountPlanRemainingCredits") or {}
             credit_amount = credits.get("amount")
-            _record_runson_credit_sample(credit_amount, now_utc)
-            credit_costs = _runson_credit_budget_data(now_utc, today_ct)
+            try:
+                _record_runson_credit_sample(credit_amount, now_utc)
+                credit_costs = _runson_credit_budget_data(now_utc, today_ct)
+            except sqlite3.Error as e:
+                logger.warning("RunsOn local credit history unavailable: %s", type(e).__name__)
+                credit_costs = {
+                    "daily_spend": [], "spent_today": None, "spent_month": None,
+                    "burn_per_day_7d": None, "projection_date": None, "samples": [],
+                }
             stack_id = ((stack or {}).get("Stacks") or [{}])[0].get("StackId") or ""
             account_match = re.match(r"^arn:aws:cloudformation:[^:]+:(\d+):", stack_id)
-            ce_costs = _runson_ce_cost_data(today_ct, account_match.group(1) if account_match else None)
+            try:
+                ce_costs = _runson_ce_cost_data(today_ct, account_match.group(1) if account_match else None)
+            except sqlite3.Error as e:
+                logger.warning("RunsOn local cost cache unavailable: %s", type(e).__name__)
+                ce_costs = None
             costs = ce_costs or credit_costs
             charge_date = datetime(2026, 9, 12).date()
             result = {
