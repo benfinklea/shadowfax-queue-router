@@ -4306,12 +4306,50 @@ function refreshRouteHealth() {
 // cards (built on the initial /api/status render), so this fills them lazily
 // and just updates the gauges afterwards.
 const TPS_GAUGE_MAX = 400;
+// TPS-only thresholds. The red band is 15% of today's observed peak, capped
+// at the average so the visible bands can never invert. The tan->green edge
+// is always the live serving-time average for this specific box.
+const TPS_RED_PEAK_FRACTION = 0.15;
 const TPS_DIAL_BOXES = {
     gandalf: 'tps-dial-gandalf',
     frodo: 'tps-dial-frodo',
     aragorn: 'tps-dial-aragorn',
 };
-function tpsColor() { return '#00fff2'; }  // throughput isn't an alarm metric - keep it cyan
+function tpsDialZones(avgToday, peakToday) {
+    const average = Math.max(0, Math.min(TPS_GAUGE_MAX, Number(avgToday) || 0));
+    const peak = Math.max(0, Number(peakToday) || 0);
+    const redEnd = Math.min(average, peak * TPS_RED_PEAK_FRACTION);
+    return {redEnd: redEnd, tanEnd: average, max: TPS_GAUGE_MAX};
+}
+function tpsGaugeGradient(zones) {
+    const redDeg = (zones.redEnd / zones.max) * 180;
+    const tanDeg = (zones.tanEnd / zones.max) * 180;
+    return 'conic-gradient(from 0.75turn, '
+        + '#d94a4a 0deg, #d94a4a ' + redDeg + 'deg, '
+        + '#d9a54a ' + redDeg + 'deg, #d9a54a ' + tanDeg + 'deg, '
+        + '#39ff14 ' + tanDeg + 'deg, #39ff14 180deg, transparent 180deg)';
+}
+function updateTpsGauge(id, value, avgToday, peakToday) {
+    const gauge = document.getElementById(id);
+    const hasZones = avgToday !== null && avgToday !== undefined
+        && peakToday !== null && peakToday !== undefined
+        && Number.isFinite(Number(avgToday)) && Number.isFinite(Number(peakToday));
+    const zones = hasZones ? tpsDialZones(avgToday, peakToday) : null;
+    if (gauge && zones) {
+        const bg = gauge.querySelector('.gauge-bg');
+        if (bg) bg.style.background = tpsGaugeGradient(zones);
+        gauge.dataset.tpsZoneOrder = 'red-tan-green';
+        gauge.dataset.tpsRedEnd = String(zones.redEnd);
+        gauge.dataset.tpsTanEnd = String(zones.tanEnd);
+    }
+    updateGauge(id, value, 0, TPS_GAUGE_MAX, ' t/s', false, function(percent) {
+        if (!zones) return '#d94a4a';
+        const gaugeValue = (percent / 100) * zones.max;
+        if (gaugeValue <= zones.redEnd) return '#d94a4a';
+        if (gaugeValue <= zones.tanEnd) return '#d9a54a';
+        return '#39ff14';
+    });
+}
 function refreshModelServing() {
     fetch('/api/model_serving').then(r => r.json()).then(data => {
         for (const [name, s] of Object.entries(data)) {
@@ -4322,17 +4360,17 @@ function refreshModelServing() {
             // Same wrong-box guard as the other dials: /api/status must have
             // verified this card's identity before serving stats can fill it.
             if (dialId && (!card || card.dataset.identityOk !== 'true')) {
-                updateGauge(dialId, null, 0, TPS_GAUGE_MAX, ' t/s', false, tpsColor);
+                updateTpsGauge(dialId, null, null, null);
                 el.innerHTML = '<span class="dim">serving stats unavailable (identity not verified)</span>';
                 continue;
             }
             if (!s.available) {
-                if (dialId) updateGauge(dialId, null, 0, TPS_GAUGE_MAX, ' t/s', false, tpsColor);
+                if (dialId) updateTpsGauge(dialId, null, null, null);
                 el.innerHTML = '<span class="dim">serving stats unavailable</span>';
                 continue;
             }
             if (dialId) {
-                updateGauge(dialId, s.tps_now, 0, TPS_GAUGE_MAX, ' t/s', false, tpsColor);
+                updateTpsGauge(dialId, s.tps_now, s.tps_avg_today, s.tps_max_today);
                 updatePeakMarker(dialId + '-peak', s.tps_max_today, 0, TPS_GAUGE_MAX);
             }
             // Two-band strip at the top of the card: now (top) vs today's peak
@@ -4887,7 +4925,7 @@ function refresh() {
                     if (!hasTpsDial) html += renderGauge(info.gpu_temp, 24, 90, "TEMP", "°C", false, 0.7, false, 'temp-' + name, pk.gpu_temp);
                     html += renderGauge(info.cpu_percent, 0, 100, "CPU", "%", false, 0.7, false, 'cpu-' + name, pk.cpu_percent);
                     if (hasTpsDial) {
-                        html += renderGauge(null, 0, TPS_GAUGE_MAX, "TOK/S", " t/s", false, 0.7, false, TPS_DIAL_BOXES[name], null);
+                        html += renderGauge(null, 0, TPS_GAUGE_MAX, "TOK/S", " t/s", false, 0.7, true, TPS_DIAL_BOXES[name], null);
                     } else {
                         const swapPct = info.swap ? info.swap.percent : 0;
                         html += renderSwapGauge(swapPct, 100, 0.7, 'swap-' + name, pk.swap_percent);
@@ -4938,7 +4976,7 @@ function refresh() {
                     html += '<div class="dial-strip">';
                     html += renderGauge(info.cpu_percent, 0, 100, "CPU", "%", false, 0.7, false, 'cpu-' + name, pk.cpu_percent);
                     if (hasTpsDial) {
-                        html += renderGauge(null, 0, TPS_GAUGE_MAX, "TOK/S", " t/s", false, 0.7, false, TPS_DIAL_BOXES[name], null);
+                        html += renderGauge(null, 0, TPS_GAUGE_MAX, "TOK/S", " t/s", false, 0.7, true, TPS_DIAL_BOXES[name], null);
                     } else {
                         html += renderGauge(info.cpu_temp, 24, 90, "TEMP", "°C", false, 0.7, false, 'temp-' + name, pk.gpu_temp);
                         const swapPct = info.swap ? info.swap.percent : 0;

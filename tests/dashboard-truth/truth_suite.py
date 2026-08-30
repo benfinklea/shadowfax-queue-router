@@ -541,6 +541,52 @@ def check_rendering() -> None:
             marker = f"tps-dial-{name}"
             found = marker in page
             emit("PASS" if found else "FAIL", f"page.tps_dial.{name}", found, marker)
+        # Execute the page's pure TPS zone helpers against fixed fixtures. This
+        # catches both a color-order regression and accidental detachment of the
+        # tan->green boundary from tps_avg_today without duplicating the formula.
+        probe_start = page.find("const TPS_GAUGE_MAX = 400;")
+        probe_end = page.find("function refreshModelServing()", probe_start)
+        tps_probe = None
+        if probe_start >= 0 and probe_end > probe_start:
+            probe_js = page[probe_start:probe_end] + """
+const fixture = tpsDialZones(120, 300);
+const capped = tpsDialZones(20, 400);
+console.log(JSON.stringify({
+  fixture: fixture,
+  capped: capped,
+  gradient: tpsGaugeGradient(fixture),
+  boxes: TPS_DIAL_BOXES
+}));
+"""
+            with tempfile.NamedTemporaryFile("w", suffix=".js") as handle:
+                handle.write(probe_js); handle.flush()
+                probe = run(["node", handle.name], timeout=10)
+            if probe.returncode == 0:
+                try:
+                    tps_probe = json.loads(probe.stdout.strip())
+                except json.JSONDecodeError:
+                    pass
+        fixture = (tps_probe or {}).get("fixture", {})
+        capped = (tps_probe or {}).get("capped", {})
+        gradient = (tps_probe or {}).get("gradient", "")
+        color_positions = [gradient.find(color) for color in ("#d94a4a", "#d9a54a", "#39ff14")]
+        order_ok = (
+            fixture.get("redEnd") == 45
+            and fixture.get("redEnd", 1) <= fixture.get("tanEnd", 0) <= fixture.get("max", 0)
+            and capped.get("redEnd") <= capped.get("tanEnd", -1)
+            and all(pos >= 0 for pos in color_positions)
+            and color_positions == sorted(color_positions)
+        )
+        emit("PASS" if order_ok else "FAIL", "page.tps_dial.zone_order",
+             {"fixture": fixture, "colors": color_positions}, "red < tan < green ascending")
+        avg_binding_ok = (
+            fixture.get("tanEnd") == 120
+            and capped.get("tanEnd") == 20
+            and "updateTpsGauge(dialId, s.tps_now, s.tps_avg_today, s.tps_max_today)" in page
+            and set((tps_probe or {}).get("boxes", {})) == {"gandalf", "frodo", "aragorn"}
+        )
+        emit("PASS" if avg_binding_ok else "FAIL", "page.tps_dial.average_boundary",
+             {"fixture": fixture, "capped": capped}, "tan->green boundary equals tps_avg_today for all TPS boxes")
         scripts = re.findall(r"<script>(.*?)</script>", page, re.S)
         node_ok = False
         if scripts:
