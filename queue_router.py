@@ -4820,10 +4820,10 @@ function updateTpsGauge(id, value, avgToday, peakToday, allTimeRecord) {
         gauge.dataset.tpsModelRecord = String(zones.max);
     }
     if (!zones) {
-        updateGauge(id, null, 0, TPS_GAUGE_PLACEHOLDER_MAX, ' t/s', true, () => '#d94a4a');
+        updateGauge(id, null, 0, TPS_GAUGE_PLACEHOLDER_MAX, '', true, () => '#d94a4a');
         return;
     }
-    updateGauge(id, value, 0, zones.max, ' t/s', true, function(percent) {
+    updateGauge(id, value, 0, zones.max, '', true, function(percent) {
         if (!zones) return '#d94a4a';
         const gaugeValue = (percent / 100) * zones.max;
         if (gaugeValue <= zones.redEnd) return '#d94a4a';
@@ -5379,7 +5379,7 @@ function refresh() {
                     html += renderGauge(info.gpu_util, 0, 100, "GPU", "%", false, 0.7, true, 'util-' + name, info.max_util_today);
                     html += renderGauge(info.cpu_percent, 0, 100, "CPU", "%", false, 0.7, false, 'cpu-' + name, pk.cpu_percent);
                     if (hasTpsDial) {
-                        html += renderGauge(null, 0, TPS_GAUGE_PLACEHOLDER_MAX, "TOK/S", " t/s", true, 0.7, true, TPS_DIAL_BOXES[name], null);
+                        html += renderGauge(null, 0, TPS_GAUGE_PLACEHOLDER_MAX, "TOK/S", "", true, 0.7, true, TPS_DIAL_BOXES[name], null);
                     }
                     const swapPct = info.swap ? info.swap.percent : 0;
                     html += renderSwapGauge(swapPct, 100, 0.7, 'swap-' + name, pk.swap_percent);
@@ -5413,7 +5413,7 @@ function refresh() {
                     if (!hasTpsDial) html += renderGauge(info.gpu_temp, 24, 90, "TEMP", "°C", false, 0.7, false, 'temp-' + name, pk.gpu_temp);
                     html += renderGauge(info.cpu_percent, 0, 100, "CPU", "%", false, 0.7, false, 'cpu-' + name, pk.cpu_percent);
                     if (hasTpsDial) {
-                        html += renderGauge(null, 0, TPS_GAUGE_PLACEHOLDER_MAX, "TOK/S", " t/s", true, 0.7, true, TPS_DIAL_BOXES[name], null);
+                        html += renderGauge(null, 0, TPS_GAUGE_PLACEHOLDER_MAX, "TOK/S", "", true, 0.7, true, TPS_DIAL_BOXES[name], null);
                     } else {
                         const swapPct = info.swap ? info.swap.percent : 0;
                         html += renderSwapGauge(swapPct, 100, 0.7, 'swap-' + name, pk.swap_percent);
@@ -5464,7 +5464,7 @@ function refresh() {
                     html += '<div class="dial-strip">';
                     html += renderGauge(info.cpu_percent, 0, 100, "CPU", "%", false, 0.7, false, 'cpu-' + name, pk.cpu_percent);
                     if (hasTpsDial) {
-                        html += renderGauge(null, 0, TPS_GAUGE_PLACEHOLDER_MAX, "TOK/S", " t/s", true, 0.7, true, TPS_DIAL_BOXES[name], null);
+                        html += renderGauge(null, 0, TPS_GAUGE_PLACEHOLDER_MAX, "TOK/S", "", true, 0.7, true, TPS_DIAL_BOXES[name], null);
                     } else {
                         html += renderGauge(info.cpu_temp, 24, 90, "TEMP", "°C", false, 0.7, false, 'temp-' + name, pk.gpu_temp);
                         const swapPct = info.swap ? info.swap.percent : 0;
