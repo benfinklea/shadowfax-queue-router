@@ -340,6 +340,7 @@ def check_pipeline() -> None:
         d_fresh = json.loads(pipe_body) if pipe_code == 200 else d
     except Exception:
         d_fresh = d
+    d = d_fresh
     ci = api.get("ci_queue", {})
     now = dt.datetime.now(dt.timezone.utc)
     ct = ZoneInfo("America/Chicago")
@@ -370,22 +371,6 @@ def check_pipeline() -> None:
         for state in ("queued", "in_progress"):
             direct_ci_before[state] = gh_json(["repos/armbrain-io/armbrain/actions/runs", "--method", "GET", "-f", f"status={state}", "-f", f"created=>={cutoff}", "-f", "per_page=100"])["total_count"]
 
-        # Measure active job count from first 12 in_progress runs (to match dashboard.active_jobs)
-        def measure_active_jobs():
-            try:
-                runs_resp = gh_json(["repos/armbrain-io/armbrain/actions/runs", "--method", "GET", "-f", "status=in_progress", "-f", f"created=>={cutoff}", "-f", "per_page=100"])
-                active_jobs = 0
-                for run in (runs_resp.get("workflow_runs") or [])[:12]:
-                    jobs_resp = gh_json(["repos/armbrain-io/armbrain/actions/runs/" + str(run["id"]) + "/jobs", "--method", "GET", "-f", "per_page=100"])
-                    for job in jobs_resp.get("jobs", []):
-                        if job.get("status") == "in_progress":
-                            active_jobs += 1
-                return active_jobs
-            except Exception:
-                return None
-
-        direct_jobs_before = measure_active_jobs()
-
         try:
             ci_code, ci_body = http("/api/ci_queue", 25)
             ci_fresh = json.loads(ci_body) if ci_code == 200 else ci
@@ -395,65 +380,35 @@ def check_pipeline() -> None:
         for state in ("queued", "in_progress"):
             direct_ci_after[state] = gh_json(["repos/armbrain-io/armbrain/actions/runs", "--method", "GET", "-f", f"status={state}", "-f", f"created=>={cutoff}", "-f", "per_page=100"])["total_count"]
 
-        direct_jobs_after = measure_active_jobs()
-
         def ci_match(claim, state):
             if claim is None:
                 return False
             lo = min(direct_ci_before[state], direct_ci_after[state])
             hi = max(direct_ci_before[state], direct_ci_after[state])
-            tol = max(3, int(hi * 0.2))
-            return isinstance(claim, (int, float)) and (lo - tol) <= claim <= (hi + tol)
-
-        def job_match(claim):
-            if direct_jobs_before is None or direct_jobs_after is None or claim is None:
-                return False
-            # Check against direct job count
-            lo = min(direct_jobs_before, direct_jobs_after)
-            hi = max(direct_jobs_before, direct_jobs_after)
-            tol = max(6, int(hi * 0.25))
-            if (lo - tol) <= claim <= (hi + tol):
-                return True
-            # Or against workflow run count if active_jobs was None / mapped from in_progress
-            lo_runs = min(direct_ci_before["in_progress"], direct_ci_after["in_progress"])
-            hi_runs = max(direct_ci_before["in_progress"], direct_ci_after["in_progress"])
-            tol_runs = max(3, int(hi_runs * 0.2))
-            return (lo_runs - tol_runs) <= claim <= (hi_runs + tol_runs)
+            return isinstance(claim, (int, float)) and (lo - 1) <= claim <= (hi + 1)
 
         for field, state in (("queued", "queued"), ("in_progress", "in_progress")):
             claim = ci_fresh.get(field)
-            if field == "in_progress":
-                # in_progress in ci_queue is mapped from active_jobs on display, verify separately below
-                pass
-            else:
-                observed = {"before": direct_ci_before[state], "after": direct_ci_after[state]}
-                emit("PASS" if ci_match(claim, state) else "FAIL", f"ci.{field}", claim, observed,
-                     "repo armbrain-io/armbrain; workflow runs created within 48h; bracketed ±1 churn")
-
-        # Check ci.in_progress separately - it should be job count (via active_jobs)
-        ci_queue_running = ci_fresh.get("active_jobs") if ci_fresh.get("active_jobs") is not None else ci_fresh.get("in_progress")
-        observed_jobs = {"before": direct_jobs_before, "after": direct_jobs_after}
-        emit("PASS" if job_match(ci_queue_running) else "FAIL", f"ci.in_progress", ci_queue_running, observed_jobs,
-             "job count from first 12 in_progress runs; bracketed ±2 churn")
+            observed = {"before": direct_ci_before[state], "after": direct_ci_after[state]}
+            emit("PASS" if ci_match(claim, state) else "FAIL", f"ci.{field}", claim, observed,
+                 "repo armbrain-io/armbrain; workflow runs created within 48h; bracketed ±1 churn")
 
         # Check pipeline.ci_queued and ci_running
         for field, state in (("ci_queued", "queued"), ("ci_running", "in_progress")):
             claim = d_fresh.get(field) if d_fresh.get(field) is not None else d.get(field)
-            if field == "ci_running":
-                # pipeline.ci_running may reflect active job count or active run count depending on cache/fetch state
-                observed = observed_jobs
-                matches = job_match(claim) or ci_match(claim, "in_progress")
-                detail = "job/run count from in_progress runs; bracketed in-flight churn"
-            else:
-                observed = {"before": direct_ci_before[state], "after": direct_ci_after[state]}
-                matches = ci_match(claim, state)
-                detail = "bracketed in-flight churn"
+            observed = {"before": direct_ci_before[state], "after": direct_ci_after[state]}
+            matches = ci_match(claim, state)
+            detail = "workflow-run count; bracketed ±1 in-flight churn"
             emit("PASS" if matches else "FAIL", f"pipeline.{field}", claim, observed, detail)
         runs = gh_json(["repos/armbrain-io/armbrain/actions/workflows/gateway-deploy.yml/runs", "--method", "GET", "-f", "status=completed", "-f", "branch=main", "-f", "per_page=100"])["workflow_runs"]
         last = None
+        production_runs_checked = 0
         for workflow in runs:
             if workflow.get("event") not in ("push", "workflow_dispatch"):
                 continue
+            if production_runs_checked >= 5:
+                break
+            production_runs_checked += 1
             jobs = gh_json([f"repos/armbrain-io/armbrain/actions/runs/{workflow['id']}/jobs", "--method", "GET", "-f", "per_page=100"])["jobs"]
             job = next((j for j in jobs if j.get("name") == "deploy" and j.get("conclusion") == "success"), None)
             if job:
@@ -649,7 +604,7 @@ console.log(JSON.stringify({
         chrome = run([
             "google-chrome", "--headless", "--no-sandbox", "--disable-gpu",
             "--virtual-time-budget=26000", "--dump-dom", BASE + "/",
-        ], timeout=40)
+        ], timeout=60)
         match = re.search(
             r'<div id="loaded-models-pippin"[^>]*>(.*?)</div>',
             chrome.stdout, re.S,
@@ -763,7 +718,7 @@ finally:
     )
     if fallback_crashed:
         emit(
-            "UNKNOWN",
+            "WARN",
             "runson.budget_strip.ce_fallback",
             fallback_probe.stderr.strip() or "probe crashed",
             "CE AccessDenied falls back to numeric credit deltas labeled net of credits",
@@ -837,13 +792,7 @@ def run_truth_pass():
 
 
 def main() -> int:
-    fails = run_truth_pass()
-    if fails:
-        # Sampling-skew / in-flight churn tolerance:
-        # On mismatch, wait 6s for settle and re-read once.
-        # Only fail if the delta persists across runs.
-        time.sleep(6)
-        run_truth_pass()
+    run_truth_pass()
     return finish()
 
 

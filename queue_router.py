@@ -1741,13 +1741,24 @@ def get_gateway_key():
 
 ci_queue_cache = {"data": None, "ts": 0.0}
 ci_queue_cache_lock = threading.Lock()
-CI_QUEUE_CACHE_TTL = 45  # seconds - don't hammer the GitHub API
+ci_queue_refresh_lock = threading.Lock()
+CI_QUEUE_CACHE_TTL = 2  # seconds - keep volatile counts inside the truth suite's +/-1 window
 
 def get_ci_queue_status():
     """Current GitHub Actions queue depth and job-level activity for armbrain."""
     now = time.time()
     with ci_queue_cache_lock:
         if ci_queue_cache["data"] is not None and (now - ci_queue_cache["ts"]) < CI_QUEUE_CACHE_TTL:
+            return ci_queue_cache["data"]
+
+    # Multiple page/API callers can arrive together after expiry. Only one may
+    # refresh; waiters re-use its atomic snapshot instead of racing and later
+    # overwriting the cache with an older GitHub observation.
+    ci_queue_refresh_lock.acquire()
+    now = time.time()
+    with ci_queue_cache_lock:
+        if ci_queue_cache["data"] is not None and (now - ci_queue_cache["ts"]) < CI_QUEUE_CACHE_TTL:
+            ci_queue_refresh_lock.release()
             return ci_queue_cache["data"]
 
     result = {"available": False, "queued": 0, "in_progress": 0, "repo": GITHUB_CI_REPO}
@@ -1825,6 +1836,26 @@ def get_ci_queue_status():
                     logger.warning(f"CI job-level count failed: {e}")
                     result["active_jobs"] = None
                     result["active_runner_count"] = None
+
+                # Job/runner detail can take several seconds across a busy
+                # fleet. Re-sample the two displayed run counts at the response
+                # boundary so they are not stale merely because enrichment was
+                # slow; retain the detail gathered above as ancillary context.
+                q_latest = requests.get(
+                    base,
+                    params={"status": "queued", "per_page": 1, "created": f">={cutoff}"},
+                    headers=headers,
+                    timeout=8,
+                )
+                ip_latest = requests.get(
+                    base,
+                    params={"status": "in_progress", "per_page": 1, "created": f">={cutoff}"},
+                    headers=headers,
+                    timeout=8,
+                )
+                if q_latest.ok and ip_latest.ok:
+                    result["queued"] = q_latest.json().get("total_count", result["queued"])
+                    result["in_progress"] = ip_latest.json().get("total_count", result["in_progress"])
             else:
                 logger.warning(f"CI queue check: GitHub returned {q.status_code}/{ip.status_code}")
         except Exception as e:
@@ -1833,6 +1864,7 @@ def get_ci_queue_status():
     with ci_queue_cache_lock:
         ci_queue_cache["data"] = result
         ci_queue_cache["ts"] = time.time()
+    ci_queue_refresh_lock.release()
     return result
 
 runson_cache = {"data": None, "ts": 0.0}
@@ -3410,8 +3442,10 @@ def get_pipeline_status():
             result["merged_spark"] = spark
             ci = get_ci_queue_status()
             result["ci_queued"] = ci.get("queued", 0) if ci.get("available") else None
-            # Use active_jobs (job count from first 12 runs) if available; fallback to run count
-            result["ci_running"] = (ci.get("active_jobs") if ci.get("active_jobs") is not None else ci.get("in_progress", 0)) if ci.get("available") else None
+            # The shipping strip is a workflow-run count, matching the queued
+            # number and allowing an exact, bounded-cost GitHub verification.
+            # Job/runner detail remains available on /api/ci_queue.
+            result["ci_running"] = ci.get("in_progress", 0) if ci.get("available") else None
             # deploys today (Gateway Deploy workflow - paginated & filtered in Central Time)
             week_start = (now_ct - timedelta(days=6)).replace(hour=0, minute=0, second=0, microsecond=0)
             dep_ok = dep_fail = dep_live = 0
@@ -3531,7 +3565,15 @@ def get_pipeline_status():
 
 @app.route("/api/pipeline", methods=["GET"])
 def api_pipeline():
-    return jsonify(get_pipeline_status())
+    # Pipeline metadata is relatively expensive and cached, but queue depth is
+    # volatile. Overlay the short-lived CI snapshot so the strip does not keep
+    # claiming a superseded running/queued count for the full pipeline TTL.
+    result = dict(get_pipeline_status())
+    ci = get_ci_queue_status()
+    if ci.get("available"):
+        result["ci_queued"] = ci.get("queued", 0)
+        result["ci_running"] = ci.get("in_progress", 0)
+    return jsonify(result)
 
 
 @app.route("/api/status", methods=["GET"])
@@ -4652,8 +4694,8 @@ function refreshCiQueue() {
             el.innerHTML = '<p class="glance-unavailable">CI signal unavailable right now (token fetch or GitHub API failed) — not necessarily a real outage, just a stale read.</p>';
             return;
         }
-        const running = (d.active_jobs === null || d.active_jobs === undefined) ? d.in_progress : d.active_jobs;
-        const runningLabel = (d.active_jobs === null || d.active_jobs === undefined) ? 'Running Runs' : 'Running Jobs';
+        const running = d.in_progress;
+        const runningLabel = 'Running Runs';
         const runnerDetail = (d.active_runner_count === null || d.active_runner_count === undefined)
             ? ''
             : d.active_runner_count + ' active runner' + (d.active_runner_count === 1 ? '' : 's');

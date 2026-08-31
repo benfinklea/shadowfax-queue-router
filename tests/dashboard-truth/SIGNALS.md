@@ -10,7 +10,7 @@ The suite treats the dashboard as a claim and reads the underlying system again 
 | `GET /api/status` (`targets`, `recent_jobs`) | fresh SSH target probes plus SQLite | HTTP/schema; TCP/SSH hostname, `nvidia-smi`, serving props, and direct SQLite |
 | `GET /api/fleet` (six named nodes) | SSH CPU/RAM/temp probe | HTTP/schema; ping, TCP/22, SSH hostname; dashboard `up` follows the primary SSH path |
 | `GET /api/pipeline` | cached GitHub reads | HTTP/schema; direct `gh api` GraphQL and Actions REST; `generated_at` younger than 10 minutes |
-| `GET /api/ci_queue` | Actions runs/jobs for `armbrain-io/armbrain`, last 48h | direct Actions REST with the identical repo/window/status scope, job count from first 12 in_progress runs, ±1 churn |
+| `GET /api/ci_queue` | Actions workflow runs for `armbrain-io/armbrain`, last 48h; runner/job detail is ancillary | direct Actions REST with the identical repo/window/status scope, ±1 churn |
 | `GET /api/runson` | read-only AWS CLI, profile `armbrain` | schema; live data fields, or explicit actionable `credentials` / `aws login` state |
 | `GET /api/model_serving` | 60-second llama.cpp counter samples plus gateway spend log | direct serving `/metrics`; route presence for gateway-derived boxes; sanity/range checks |
 | `GET /api/fleet_stats` | direct process counts and GitHub org runners | total equals per-box sum; runner fleet aggregate equals per-box aggregate |
@@ -38,7 +38,7 @@ The suite treats the dashboard as a claim and reads the underlying system again 
 | Shipping: deploy seven-day spark | successful production deploy workflow runs | seven-integer shape plus GitHub source availability |
 | Shipping: last deploy time/SHA | latest successful `deploy` job on main | direct runs and jobs REST, exact SHA/time |
 | Shipping: updated chip/degraded state | `/api/pipeline.generated_at` and auth state | timestamp must parse and be under 10 minutes old |
-| CI card: queued (runs), running (jobs from first 12 runs), active runners, orphans | scoped Actions runs (queued) and jobs (in_progress from first 12 runs) | direct Actions counts; schema distinguishes unavailable from zero; fallback to run count if jobs unavailable |
+| CI card: queued/running workflow runs, active runners, orphans | scoped Actions runs; runner names are ancillary detail from jobs on the first 12 in-progress runs | direct queued/in-progress Actions run counts, bracketed at ±1; schema distinguishes unavailable from zero |
 | Fleet tiles: per-box ONLINE/OFFLINE/MISMATCH | SSH metric probe and returned hostname | ping + TCP/22 + SSH hostname. When ping works but SSH does not, output says `primary_path=FAIL; box alive via alternate path, gandalf->box path broken` |
 | Fleet tiles: CPU, RAM, temperature | remote `/proc`, `free`, hwmon | fresh SSH instrument and schema; identity guard prevents wrong-box values |
 | Core `n/4` and Reserve `n/5` | three target cards + Shadowfax; five Shire/reserve tiles | recomputed from fresh primary-path probes |
