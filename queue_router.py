@@ -8,18 +8,18 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import uuid
 import requests
 import logging
 import threading
 import time
 import paramiko
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
-from cascade_dashboard import load_cascade_report
 
 # Pushover notification settings
 PUSHOVER_CONFIG = {
@@ -73,36 +73,128 @@ CORS(app)
 # Preserve dict insertion order in JSON responses (so targets render gandalf, frodo, pippin)
 app.json.sort_keys = False
 
+# ─── TEMPORARY post-outage IP map — 2026-07-30 ───────────────────────────────
+# THE ONE PLACE fleet IPs are written down. Change them here, nowhere else.
+#
+# WHY THIS BLOCK EXISTS: on 2026-07-30 northfarthing's DHCP server died (~2.5h
+# outage). The router took over DHCP+DNS, re-leased the whole subnet, and the
+# `.fleet` search domain went away with the old server. gandalf landed on a new
+# address and every card that addressed it by the old one went dark.
+#
+# INTENDED HOME: gandalf = 192.168.1.10, per the router's reservation table.
+# The .10 in this file was therefore CORRECT BY DESIGN, not rot.
+# WHY IT ISN'T TRUE RIGHT NOW: a GL.iNet **GL-KVM** KVM-over-IP dongle
+# (MAC 94:83:c4:cb:09:76, nginx/1.26.2 + dropbear_2025.89, web UI title
+# "GLKVM") currently squats on .10, so gandalf took a dynamic lease on .6
+# (enp5s0, MAC fc:9d:05:01:06:56).
+#
+# TO REVERT once .10 is reclaimed: set "gandalf" below back to "192.168.1.10".
+# That single line is the entire diff. Do NOT re-scatter IPs through this file.
+# Restore path is written up in
+# /workspace/planning/overnight-20260730/NETWORK-REPAIR-PLAN.md
+#
+# EVERY address below was verified by probe (`ssh <host> hostname`, or a service
+# GET) on 2026-07-30 ~02:20 CT. None is assumed.
+FLEET_IPS = {
+    "gandalf":       "192.168.1.10",  # BACK ON ITS INTENDED HOME as of 2026-07-30
+                                      # ~09:05 UTC: Ben reserved .10 for MAC
+                                      # fc:9d:05:01:06:56 and the lease renewed.
+                                      # Verified: `ip -4 addr show enp5s0` = .10,
+                                      # ssh .10 -> gandalf, and .6 is now dead
+                                      # ("No route to host"). This was the
+                                      # one-line revert the block was built for.
+    "frodo":         "192.168.1.11",  # verified ssh->frodo
+    "shadowfax":     "192.168.1.12",  # verified ssh->shadowfax
+    "pippen":        "192.168.1.13",  # verified ssh->pippen.local
+    "sam":           "192.168.1.14",  # verified ssh->sam  (mDNS still says .135: stale)
+    "aragorn":       "192.168.1.15",  # verified ssh->aragorn  (reserved, did not move)
+    "southfarthing": "192.168.1.61",  # verified ssh->southfarthing
+    "eastfarthing":  "192.168.1.62",  # verified ssh->eastfarthing
+    "westfarthing":  "192.168.1.63",  # verified ssh->westfarthing
+    # UPDATED 2026-08-11: reverted to verified LAN IP. The tailscale-IP era
+    # above (100.99.59.83) was itself the bug, not the fix: paramiko cannot
+    # complete SSH auth over Tailscale here (AuthenticationException after a
+    # 10s timeout - confirmed by direct repro), while a plain LAN connect
+    # succeeds in ~0.1s. That mismatch was silently rendering northfarthing
+    # OFFLINE on the dashboard for however long it's been live, while the box
+    # was actually up (uptime, hostname, and normal SSH all confirmed healthy
+    # via direct probe). 192.168.1.60 was verified moments before this edit:
+    # `ssh ben@192.168.1.60 hostname` -> "northfarthing" (correct box, not the
+    # old shadowfax mDNS collision this comment used to warn about), and the
+    # same paramiko client this file uses connected in 0.12s and got the same
+    # answer. If DHCP moves this box again, this will start reading OFFLINE
+    # again (wrong-box guard fails closed, not open) rather than silently
+    # showing a stale/wrong box - re-verify with the same probe before editing.
+    "northfarthing": "192.168.1.60",  # verified ssh->northfarthing 2026-08-11
+}
+# Boxes reached over tailscale rather than LAN (identity-safe, LAN IP unknown).
+# ─── end TEMPORARY post-outage IP map ────────────────────────────────────────
+
 # Configuration
 CONFIG = {
     "targets": {
         "gandalf": {
-            "url": "http://192.168.1.122:8188",
-            "ssh_host": "192.168.1.122",
+            "url": f"http://{FLEET_IPS['gandalf']}:8188",
+            "ssh_host": FLEET_IPS["gandalf"],
             "ssh_user": "ben",
             "os": "linux",
-            "net": "eth",
+            "model_status_urls": [
+                # gandalf runs llama-swap: /running is the only authoritative source
+                # for actually-loaded models. /v1/models lists all configured routes
+                # (including on-demand un-loaded ones), which falsely reports them as resident.
+                ("running", "http://127.0.0.1:8889/running"),
+            ],
             "vram_gb": 96,
             "gpu_power_limit": 450,
             "gpu_power_max": 600,
             "disk_path": "/workspace"
         },
         "frodo": {
-            "url": "http://192.168.1.105:8188",
-            "ssh_host": "192.168.1.105",
+            "url": f"http://{FLEET_IPS['frodo']}:8188",
+            "ssh_host": FLEET_IPS["frodo"],
             "ssh_user": "ben",
             "os": "linux",
-            "net": "eth",
+            "model_status_urls": [
+                # /v1/models exposes the configured alias, which can hide the
+                # quantization actually loaded. /props model_path is the exact
+                # resident GGUF identity and must drive the dashboard label.
+                ("props", f"http://{FLEET_IPS['frodo']}:8890/props"),
+            ],
             "vram_gb": 32,
             "gpu_power_limit": 575,
             "gpu_power_max": 600,
             "disk_path": "/"
         },
+        # aragorn (promoted to a full card 2026-07-29 at Ben's request; order is
+        # gandalf, frodo, aragorn, pippin and dict order IS render order).
+        # Two NVIDIA GPUs (PCI 01:00.0 = 2f04, 03:00.0 = 2c02) but the nvidia
+        # driver is NOT installed yet, so nvidia-smi is absent and the card
+        # renders its CPU/RAM/disk vitals until the driver lands.
+        "aragorn": {
+            "ssh_host": FLEET_IPS["aragorn"],
+            "ssh_user": "mac",
+            "os": "linux",
+            "gpu_power_max": 675,
+            "disk_path": "/",
+            # Three ollama instances, each pinned to specific card(s) by
+            # CUDA_VISIBLE_DEVICES in its systemd unit. CUDA_DEVICE_ORDER is
+            # PCI_BUS_ID, so device 0 = RTX 5070 (01:00.0), 1 = RTX 5080 (03:00.0).
+            # ollama.service :11434 -> devices "1"   (5080)  = route reason-oss
+            # ollama-5070    :11435 -> devices "0"   (5070)  = route fast-mini
+            # ollama-27b     :11436 -> devices "0,1" (both, OLLAMA_SCHED_SPREAD=1)
+            "ollama_instances": [
+                {"port": 11434, "where": "5080"},
+                {"port": 11435, "where": "5070"},
+                {"port": 11436, "where": "both GPUs"},
+            ],
+        },
         "pippin": {
-            "ssh_host": "pippen",
+            "ssh_host": FLEET_IPS["pippen"],
             "ssh_user": "ben",
             "os": "mac",
-            "net": "eth",
+            "model_status_urls": [
+                ("props", f"http://{FLEET_IPS['pippen']}:8891/props"),
+            ],
             "vram_gb": 64,
             "disk_path": "/"
         }
@@ -115,17 +207,36 @@ CONFIG = {
 # "local": metrics come from this box itself (no SSH). "mac" is for Wake-on-LAN
 # (all farthings have WoL enabled at NIC + BIOS level; sam/shadowfax N/A).
 FLEET_NODES = {
-    "northfarthing": {"ssh_host": "192.168.1.147", "ssh_user": "ben", "wol_mac": "84:47:09:65:43:c0", "net": "eth"},
-    "eastfarthing":  {"ssh_host": "192.168.1.145", "ssh_user": "ben", "wol_mac": "84:47:09:62:ef:69", "net": "eth"},
-    "southfarthing": {"ssh_host": "192.168.1.146", "ssh_user": "ben", "wol_mac": "84:47:09:65:42:58", "net": "eth"},
-    "westfarthing":  {"ssh_host": "192.168.1.138", "ssh_user": "ben", "wol_mac": "84:47:09:65:42:88", "net": "eth"},
-    # 2026-07-21: this dashboard now runs on GANDALF (migrated off shadowfax).
-    # shadowfax must be SSH-managed like every other node — leaving it
-    # "local: True" here would make its stats tile show gandalf's numbers and,
-    # far worse, its REBOOT button reboot gandalf. Tailscale IP because
-    # shadowfax's LAN mDNS is unreliable.
-    "shadowfax":     {"ssh_host": "100.70.76.51", "ssh_user": "ben", "net": "wifi"},
-    "sam":           {"ssh_host": "192.168.1.135", "ssh_user": "ben", "net": "wifi"},
+    # ADDRESS BY HOSTNAME, NOT IP (2026-07-28). These boxes have no DHCP
+    # reservations, so their IPs move: .147/.137/.136/.139 -> .73/.74/.76 ->
+    # .62/.61/.63 in two weeks. Every time they moved, the dashboard reported them
+    # OFFLINE and someone went looking for a sleep/power bug on a machine that was
+    # wide awake at a new address. That happened at least three times.
+    # mDNS (.local) follows the box wherever DHCP puts it, so this whole class of
+    # false "offline" report goes away without needing router access.
+    # NOTE: only the farthings are switched to names. gandalf.local resolves
+    # IPv6-only and northfarthing.local can return a secondary address, so the GPU
+    # targets above stay on explicit IPv4.
+    # aragorn (2026-07-29): static DHCP reservation, so the no-reservation IP
+    # caveat above does NOT apply - explicit IPv4 is safe here. User is "mac"
+    # (ben@gandalf's key is installed there for that user). NO wol_mac recorded
+    # yet, so no Wake button until someone captures the NIC MAC.
+    # aragorn moved OUT of this row 2026-07-29 - it is a full target card now
+    # (see CONFIG["targets"]). Listing it in both places would render it twice.
+    # 2026-07-30, post-outage: temporarily BACK to verified raw IPv4 from FLEET_IPS.
+    # The names-not-IPs rule above is still the right long-term answer, but mDNS is
+    # not trustworthy right now - northfarthing.local resolves to shadowfax's
+    # address, which silently duplicated one box's metrics onto two tiles. The
+    # farthing .local names DID each resolve correctly when probed; they are pinned
+    # only because the whole map is pinned for one night. Revert with the plan.
+    "northfarthing": {"ssh_host": FLEET_IPS["northfarthing"], "ssh_user": "ben", "wol_mac": "84:47:09:65:43:c3"},
+    "eastfarthing":  {"ssh_host": FLEET_IPS["eastfarthing"], "ssh_user": "ben", "wol_mac": "84:47:09:62:ef:60"},
+    "southfarthing": {"ssh_host": FLEET_IPS["southfarthing"], "ssh_user": "ben", "wol_mac": "84:47:09:65:42:5b"},
+    "westfarthing":  {"ssh_host": FLEET_IPS["westfarthing"], "ssh_user": "ben", "wol_mac": "84:47:09:65:42:85"},
+    # Was {"local": True} when this service ran ON shadowfax. It moved to gandalf
+    # 2026-07-21, so shadowfax is now just another remote box reached over SSH.
+    "shadowfax":     {"ssh_host": FLEET_IPS["shadowfax"], "ssh_user": "ben"},
+    "sam":           {"ssh_host": FLEET_IPS["sam"], "ssh_user": "ben"},
 }
 
 # --- Glance-view additions (2026-07-19): CI queue depth + local model-route
@@ -137,14 +248,28 @@ FLEET_NODES = {
 GITHUB_CI_REPO = "armbrain-io/armbrain"
 GH_TOKEN_ENV_PATH = "/opt/overflow-controller/gh-token.env"   # same file the Shire autoscaler mints/refreshes every 15 min
 GATEWAY_KEY_ENV_PATH = "~/.config/gandalf-gateway/fleet.env"  # canonical fleet gateway key (per infra rules)
-GATEWAY_MODELS_URL = "http://gandalf.local:4000/v1/models"
-CASCADE_REPORT_PATH = os.environ.get(
-    "FLEET_CASCADE_REPORT", "/var/lib/cascade-scraper/report.json"
-)
+# Was gandalf.local:4000. Pinned to the verified IP with the rest of the map on
+# 2026-07-30 - gandalf.local resolves IPv6-first here, and this service runs ON
+# gandalf, so there is no reason to take a DNS dependency to reach itself.
+GATEWAY_MODELS_URL = f"http://{FLEET_IPS['gandalf']}:4000/v1/models"
 # The 🔒 local-only routes from the fleet gateway table - the ones that should
 # always be up. (opus/sonnet/codex/gemini/etc. are external and expected to
 # come and go with vendor availability, so they're left off this glance tile.)
-LOCAL_GATEWAY_ROUTES = ["fast", "code", "code-glm", "reason", "coder", "big", "cheap"]
+# The chips on the dashboard. Rebuilt 2026-07-30 to match reality after the night's
+# reconfiguration. Deliberately EXCLUDES alias-only routes (code-glm and big now
+# both point at models listed here) so one model does not show up as two chips.
+# Dropped: `coder` (devstral) - retired by council vote, 3.5 tok/s.
+LOCAL_GATEWAY_ROUTES = [
+    "flagship",    # gandalf 35B-A3B + n-gram, RESIDENT, never unloads
+    "dense",       # gandalf 27B + MTP and n-gram, RESIDENT, never unloads
+    "fast",        # frodo 35B-A3B - best prefill on the fleet, 4 slots
+    "reason",      # gandalf gemma4-26b - on demand, loads alongside the pair
+    "code",        # pippen
+    "reason-oss",  # aragorn 5080
+    "fast-mini",   # aragorn 5070
+    "reason-27b",  # aragorn, 27B split across BOTH cards
+    "cheap",       # shadowfax
+]
 
 # One-shot metrics: cpu% (0.6s /proc/stat delta), ram MB, hottest sensor (milli-C)
 FLEET_METRICS_CMD = (
@@ -158,8 +283,44 @@ FLEET_METRICS_CMD = (
     "tp=; for h in /sys/class/hwmon/hwmon*; do case \"$(cat $h/name 2>/dev/null)\" in k10temp|coretemp) tp=$(cat $h/temp1_input 2>/dev/null); break;; esac; done; "
     "[ -z \"$tp\" ] && tp=$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null); "
     "[ -z \"$tp\" ] && tp=$(cat /sys/class/hwmon/hwmon*/temp1_input 2>/dev/null | sort -rn | head -1); "
-    "echo \"cpu=$cpu ram_used=$ru ram_total=$rt temp=${tp:-0}\""
+    # host: WHICH BOX ACTUALLY ANSWERED. Added 2026-07-30 so a tile can never
+    # again render a different machine's vitals under its own name - see
+    # _fleet_host_matches below for why this exists.
+    "echo \"cpu=$cpu ram_used=$ru ram_total=$rt temp=${tp:-0} host=$(hostname)\""
 )
+
+# --- Wrong-box guard (2026-07-30) -------------------------------------------
+# On 2026-07-30 `northfarthing.local` began resolving to 192.168.1.12, which is
+# SHADOWFAX. The dashboard dutifully SSHed there for both tiles and rendered one
+# box's CPU/temp/RAM under two different names, so northfarthing - which was in
+# fact dead, and was the machine whose DHCP failure had just taken the LAN down
+# for 2.5 hours - displayed as healthy. It was only caught by a human noticing
+# that two tiles showed byte-identical numbers.
+#
+# The lesson: a stale IP fails loudly, but a name another box can answer to lies
+# quietly. So every metrics reply now has to prove it came from the box we asked
+# for. If it does not, the tile shows MISMATCH and NO numbers - never a
+# neighbour's. We deliberately do NOT show the stats and add a warning badge:
+# numbers on screen get believed.
+#
+# Matching is on the short hostname, case-insensitively: boxes report things like
+# "pippen.local" or a FQDN, and that is not a mismatch. `hostname_aka` is there
+# for a box whose real hostname legitimately differs from its tile name.
+# Cards whose tile name legitimately differs from the machine's real hostname.
+# "pippin" the card vs "pippen" the box is a long-standing spelling split in this
+# file, not a wrong-box condition - without this the guard would cry wolf on it.
+TARGET_HOSTNAME_AKA = {
+    "pippin": ("pippen",),
+}
+
+
+def _fleet_host_matches(expected, reported, aka=()):
+    """True if `reported` hostname is the box we asked for. Empty reported = unknown -> treat as OK."""
+    if not reported:
+        return True          # older/odd hosts that print no host= field: don't cry wolf
+    short = reported.strip().lower().split(".")[0]
+    accepted = {expected.strip().lower()} | {a.strip().lower() for a in aka}
+    return short in accepted
 
 def get_fleet_node_metrics(name, cfg):
     """CPU/temp/RAM for one fleet node. Returns dict; online=False on any failure."""
@@ -170,22 +331,67 @@ def get_fleet_node_metrics(name, cfg):
             out = subprocess.run(["bash", "-c", FLEET_METRICS_CMD], capture_output=True,
                                  text=True, timeout=15).stdout
         else:
-            client = get_ssh_client(cfg["ssh_host"], cfg.get("ssh_user", "ben"))
-            if client is None:
-                return {"name": name, "online": False, "can_wake": bool(cfg.get("wol_mac")), "net": cfg.get("net")}
-            # no extra bash -c wrapper: the CMD contains single quotes, and sshd
-            # already hands the command line to the login shell (bash here)
-            _, stdout, _ = client.exec_command(FLEET_METRICS_CMD, timeout=15)
-            out = stdout.read().decode()
+            # Retry once on a DEAD POOLED CONNECTION (fixed 2026-07-30).
+            # get_ssh_client hands back a cached client whenever
+            # transport.is_active() is true, but a peer that dropped the
+            # connection its own side leaves is_active() true until we actually
+            # write to it. The write then fails with "Socket exception:
+            # Connection reset by peer (104)", we reported the box OFFLINE, and
+            # the next poll reconnected and reported it online again - so a live
+            # box flapped green/red on a fixed cadence for no reason. Seen every
+            # ~45s on shadowfax, which is a Pi and reaps idle sshd sessions
+            # briskly. Pre-existing bug, unrelated to the IP reshuffle; caught
+            # while verifying the cards after that fix.
+            # So: on any exec failure, evict the cached client and try once more
+            # with a genuinely fresh connection before calling the box down.
+            user = cfg.get("ssh_user", "ben")
+            last_err = None
+            for attempt in (1, 2):
+                client = get_ssh_client(cfg["ssh_host"], user)
+                if client is None:
+                    break          # circuit breaker is open - respect it
+                try:
+                    # no extra bash -c wrapper: the CMD contains single quotes,
+                    # and sshd already hands the command line to the login shell
+                    _, stdout, _ = client.exec_command(FLEET_METRICS_CMD, timeout=15)
+                    out = stdout.read().decode()
+                    last_err = None
+                    break
+                except Exception as e:
+                    last_err = e
+                    ssh_clients.pop(f"{user}@{cfg['ssh_host']}", None)
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+                    if attempt == 2:
+                        logger.debug(f"fleet metrics {name}: failed twice: {e}")
+            if last_err is not None or out is None:
+                return {"name": name, "online": False, "can_wake": bool(cfg.get("wol_mac"))}
     except Exception as e:
         logger.debug(f"fleet metrics {name}: {e}")
-        return {"name": name, "online": False, "can_wake": bool(cfg.get("wol_mac")), "net": cfg.get("net")}
+        return {"name": name, "online": False, "can_wake": bool(cfg.get("wol_mac"))}
     m = dict(kv.split("=") for kv in (out or "").split() if "=" in kv)
     if "cpu" not in m:
-        return {"name": name, "online": False, "can_wake": bool(cfg.get("wol_mac")), "net": cfg.get("net")}
+        return {"name": name, "online": False, "can_wake": bool(cfg.get("wol_mac"))}
+    # WRONG-BOX GUARD: prove the reply came from the box this tile names. A
+    # local (no-SSH) node is trivially itself, so it is exempt.
+    if not cfg.get("local"):
+        reported = m.get("host", "")
+        if not _fleet_host_matches(name, reported, cfg.get("hostname_aka", ())):
+            logger.warning(
+                f"fleet metrics {name}: WRONG BOX - asked {cfg['ssh_host']} for "
+                f"'{name}', got '{reported}'. Refusing to render its numbers. "
+                f"Check DNS/mDNS/DHCP for {name}."
+            )
+            return {
+                "name": name, "online": False, "mismatch": True,
+                "reported_host": reported.strip().split(".")[0],
+                "ssh_host": cfg["ssh_host"],
+                "can_wake": bool(cfg.get("wol_mac")),
+            }
     return {
         "name": name, "online": True,
-        "net": cfg.get("net"),
         "cpu": int(m.get("cpu", 0)),
         "ram_used_gb": round(int(m.get("ram_used", 0)) / 1024, 1),
         "ram_total_gb": round(int(m.get("ram_total", 0)) / 1024, 1),
@@ -426,6 +632,71 @@ def init_db():
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_metrics_timestamp ON metrics_history(timestamp)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_metrics_target ON metrics_history(target)")
+    # Model-serving stats (2026-07-29): per-request records from gandalf's
+    # llama-swap (its /api/metrics buffer is in-memory and lost on restart -
+    # persisting here is what makes hour/day/week windows survive) . . .
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS model_requests (
+            box TEXT NOT NULL,
+            req_id INTEGER NOT NULL,
+            ts TEXT NOT NULL,
+            model TEXT,
+            output_tokens INTEGER,
+            gen_tps REAL,
+            PRIMARY KEY (box, req_id, ts)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_model_requests_box_ts ON model_requests(box, ts)")
+    # . . . and Prometheus counter samples from bare llama-servers (including
+    # frodo and pippin)
+    # (tokens_predicted_total / tokens_predicted_seconds_total), sampled every
+    # MODEL_SERVING_INTERVAL so rates and serving-time-only averages can be
+    # derived across restarts.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS model_counter_samples (
+            box TEXT NOT NULL,
+            ts TEXT NOT NULL,
+            tokens_total REAL,
+            gen_seconds_total REAL,
+            model_name TEXT,
+            PRIMARY KEY (box, ts)
+        )
+    """)
+    # Existing databases predate per-model TPS records. Keep every historical
+    # sample and tag the legacy rows during the one-time peak seed, once the
+    # sampler has resolved the model that is currently serving on each box.
+    counter_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(model_counter_samples)")
+    }
+    if "model_name" not in counter_columns:
+        conn.execute("ALTER TABLE model_counter_samples ADD COLUMN model_name TEXT")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS model_tps_peaks (
+            box TEXT NOT NULL,
+            model_name TEXT NOT NULL,
+            peak_tps REAL NOT NULL CHECK (peak_tps >= 0),
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (box, model_name)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS runson_credit_samples (
+            ts TEXT PRIMARY KEY,
+            credits REAL NOT NULL CHECK (credits >= 0)
+        )
+    """)
+    conn.executemany(
+        "INSERT OR IGNORE INTO runson_credit_samples(ts, credits) VALUES (?, ?)",
+        RUNSON_CREDIT_ANCHORS,
+    )
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS runson_cost_cache (
+            cache_key TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            fetched_at TEXT NOT NULL,
+            payload TEXT NOT NULL
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -607,6 +878,8 @@ DISK_CACHE_TTL = 300  # 5 minutes
 fleet_cache = {"data": None, "ts": 0.0}
 FLEET_CACHE_TTL = 15  # seconds
 fleet_cache_lock = threading.Lock()
+STATUS_PROBE_TIMEOUT = 15  # Keep one unreachable SSH host from blocking /api/status
+SSH_COMMAND_TIMEOUT = 5
 
 # Historical metrics collection interval
 METRICS_INTERVAL = 60  # Collect every 60 seconds
@@ -637,7 +910,9 @@ def get_ssh_client(host, user):
     try:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(host, username=user, timeout=5)
+        client.connect(
+            host, username=user, timeout=5, banner_timeout=5, auth_timeout=5
+        )
         ssh_clients[key] = client
 
         # Success - reset circuit breaker
@@ -669,14 +944,32 @@ def get_ssh_client(host, user):
 
         raise
 
-def get_ssh_metrics(host, user):
-    """Get CPU%, GPU power, temperature, utilization, swap, disk I/O, and network I/O via SSH."""
+def get_ssh_metrics(host, user, expected_host=None, hostname_aka=()):
+    """Get CPU, GPU, swap, disk I/O, and network I/O metrics via SSH.
+
+    `expected_host` is the name of the CARD these metrics will fill. When given,
+    the box is asked who it is and the reply is checked before any number is
+    returned - same wrong-box guard as the fleet row (see _fleet_host_matches).
+    On a mismatch the result carries `mismatch`/`reported_host` and NO metrics,
+    so a card can never render a different machine's dials. gandalf is the reason
+    this matters here: it currently sits on a dynamic lease, so it is the target
+    most likely to move again.
+    """
     result = {
         "cpu_percent": None,
+        "cpu_temp": None,
+        "gpu_name": None,
+        "gpu_count": None,
         "gpu_watts": None,
         "gpu_power_limit": None,
         "gpu_temp": None,
         "gpu_util": None,
+        "vram_total_gb": None,
+        "vram_used_gb": None,
+        "vram_percent": None,
+        "ram_total_gb": None,
+        "ram_used_gb": None,
+        "ram_percent": None,
         "swap_percent": None,
         "swap_used_gb": None,
         "swap_total_gb": None,
@@ -690,32 +983,123 @@ def get_ssh_metrics(host, user):
         if client is None:
             return result  # Circuit breaker open, return empty metrics
 
-        # Get GPU power draw, current limit, temperature, and utilization
+        # WRONG-BOX GUARD: before trusting a single dial, make the box say who it
+        # is. Cheap (one `hostname`) and it runs first, so a mismatch costs us the
+        # card's numbers rather than filling them from the wrong machine.
+        if expected_host:
+            _, who_out, _ = client.exec_command("hostname", timeout=SSH_COMMAND_TIMEOUT)
+            reported = who_out.read().decode().strip()
+            if not _fleet_host_matches(expected_host, reported, hostname_aka):
+                logger.warning(
+                    f"{expected_host} metrics: WRONG BOX - asked {host} for "
+                    f"'{expected_host}', got '{reported}'. Refusing to render its "
+                    f"dials. Check DNS/mDNS/DHCP for {expected_host}."
+                )
+                result["mismatch"] = True
+                result["reported_host"] = reported.split(".")[0]
+                return result
+
+        # Include GPU identity and VRAM here so cards do not depend on ComfyUI's
+        # /system_stats endpoint to render their gauges.
         stdin, stdout, stderr = client.exec_command(
-            "nvidia-smi --query-gpu=power.draw,power.limit,temperature.gpu,utilization.gpu --format=csv,noheader,nounits"
+            "nvidia-smi --query-gpu=name,power.draw,power.limit,temperature.gpu,"
+            "utilization.gpu,memory.total,memory.used --format=csv,noheader,nounits",
+            timeout=SSH_COMMAND_TIMEOUT,
         )
         gpu_output = stdout.read().decode().strip()
         if gpu_output:
-            parts = gpu_output.split(",")
-            if len(parts) >= 2:
-                result["gpu_watts"] = float(parts[0].strip())
-                result["gpu_power_limit"] = float(parts[1].strip())
-            if len(parts) >= 3:
-                result["gpu_temp"] = float(parts[2].strip())
-            if len(parts) >= 4:
-                result["gpu_util"] = float(parts[3].strip())
+            # MULTI-GPU (2026-07-29): aragorn has two cards (RTX 5070 + 5080), so
+            # nvidia-smi returns one line PER GPU. This used to split the whole
+            # blob on commas and crash on "2\nNVIDIA GeForce RTX 5080", which
+            # took the entire SSH metrics call down with it (no CPU, RAM, temp,
+            # or I/O for that box). Now every line is parsed and the box is
+            # reported as one logical accelerator: VRAM and watts SUM, temp is
+            # the HOTTEST card, utilization is the average.
+            gpus = []
+            for line in gpu_output.splitlines():
+                parts = [part.strip() for part in line.split(",")]
+                if len(parts) < 7:
+                    continue
+                try:
+                    gpus.append({
+                        "name": parts[0],
+                        "watts": float(parts[1]),
+                        "limit": float(parts[2]),
+                        "temp": float(parts[3]),
+                        "util": float(parts[4]),
+                        "vram_total_mb": float(parts[5]),
+                        "vram_used_mb": float(parts[6]),
+                    })
+                except ValueError:
+                    continue
+            if gpus:
+                names = [g["name"] for g in gpus]
+                if len(gpus) == 1:
+                    result["gpu_name"] = names[0]
+                elif len(set(names)) == 1:
+                    result["gpu_name"] = f"{len(gpus)} x {names[0]}"
+                else:
+                    result["gpu_name"] = " + ".join(names)
+                result["gpu_count"] = len(gpus)
+                result["gpu_watts"] = round(sum(g["watts"] for g in gpus), 1)
+                result["gpu_power_limit"] = round(sum(g["limit"] for g in gpus))
+                result["gpu_temp"] = max(g["temp"] for g in gpus)
+                result["gpu_util"] = round(sum(g["util"] for g in gpus) / len(gpus), 1)
+                vram_total_mb = sum(g["vram_total_mb"] for g in gpus)
+                vram_used_mb = sum(g["vram_used_mb"] for g in gpus)
+                result["vram_total_gb"] = round(vram_total_mb / 1024, 1)
+                result["vram_used_gb"] = round(vram_used_mb / 1024, 1)
+                result["vram_percent"] = (
+                    round(vram_used_mb / vram_total_mb * 100, 1)
+                    if vram_total_mb > 0 else 0
+                )
 
         # Get CPU usage using top (parse idle and subtract from 100)
         stdin, stdout, stderr = client.exec_command(
-            "top -bn1 | grep '%Cpu' | sed 's/,/ /g' | awk '{for(i=1;i<=NF;i++) if($i==\"id\") print 100-$(i-1)}'"
+            "top -bn1 | grep '%Cpu' | sed 's/,/ /g' | awk '{for(i=1;i<=NF;i++) if($i==\"id\") print 100-$(i-1)}'",
+            timeout=SSH_COMMAND_TIMEOUT,
         )
         cpu_output = stdout.read().decode().strip()
         if cpu_output:
             result["cpu_percent"] = round(float(cpu_output), 1)
 
+        # CPU package temperature (2026-07-29): needed by boxes with no readable
+        # GPU (aragorn before its nvidia driver lands) so their card still has a
+        # TEMP dial. Same sensor preference order as FLEET_METRICS_CMD.
+        stdin, stdout, stderr = client.exec_command(
+            "tp=; for h in /sys/class/hwmon/hwmon*; do case \"$(cat $h/name 2>/dev/null)\" in "
+            "k10temp|coretemp) tp=$(cat $h/temp1_input 2>/dev/null); break;; esac; done; "
+            "[ -z \"$tp\" ] && tp=$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null); "
+            "echo ${tp:-0}",
+            timeout=SSH_COMMAND_TIMEOUT,
+        )
+        temp_output = stdout.read().decode().strip()
+        if temp_output and temp_output.isdigit() and int(temp_output) > 0:
+            result["cpu_temp"] = round(int(temp_output) / 1000)
+
+        # System RAM (2026-07-29): this used to come from ComfyUI's
+        # /system_stats endpoint; with ComfyUI disabled fleet-wide that source
+        # silently vanished and RAM dropped off the big-machine cards. Read it
+        # here over SSH like everything else ("used" from free already
+        # excludes buffers/cache, matching the fleet tiles).
+        stdin, stdout, stderr = client.exec_command(
+            "free -b | grep Mem | awk '{print $2, $3}'",
+            timeout=SSH_COMMAND_TIMEOUT,
+        )
+        ram_output = stdout.read().decode().strip()
+        if ram_output:
+            parts = ram_output.split()
+            if len(parts) >= 2:
+                total = int(parts[0])
+                used = int(parts[1])
+                result["ram_total_gb"] = round(total / (1024**3), 1)
+                result["ram_used_gb"] = round(used / (1024**3), 1)
+                result["ram_percent"] = round(used / total * 100, 1) if total > 0 else 0
+
         # Get swap usage
         stdin, stdout, stderr = client.exec_command(
-            "free -b | grep Swap | awk '{print $2, $3}'"
+            "free -b | grep Swap | awk '{print $2, $3}'",
+            timeout=SSH_COMMAND_TIMEOUT,
         )
         swap_output = stdout.read().decode().strip()
         if swap_output:
@@ -730,7 +1114,8 @@ def get_ssh_metrics(host, user):
         # Get disk I/O (using iostat if available, fallback to /proc/diskstats)
         stdin, stdout, stderr = client.exec_command(
             "iostat -d -k 1 2 2>/dev/null | tail -n +7 | head -1 | awk '{print $3, $4}' || "
-            "cat /proc/diskstats | awk '/nvme0n1 |sda /{print $6*512/1024, $10*512/1024}' | head -1"
+            "cat /proc/diskstats | awk '/nvme0n1 |sda /{print $6*512/1024, $10*512/1024}' | head -1",
+            timeout=SSH_COMMAND_TIMEOUT,
         )
         disk_io_output = stdout.read().decode().strip()
         if disk_io_output:
@@ -741,13 +1126,15 @@ def get_ssh_metrics(host, user):
 
         # Get network I/O (bytes per second on primary interface)
         stdin, stdout, stderr = client.exec_command(
-            "cat /proc/net/dev | grep -E 'eth0|eno|enp' | head -1 | awk '{print $2, $10}'"
+            "cat /proc/net/dev | grep -E 'eth0|eno|enp' | head -1 | awk '{print $2, $10}'",
+            timeout=SSH_COMMAND_TIMEOUT,
         )
         net_output1 = stdout.read().decode().strip()
         if net_output1:
             time.sleep(0.5)
             stdin, stdout, stderr = client.exec_command(
-                "cat /proc/net/dev | grep -E 'eth0|eno|enp' | head -1 | awk '{print $2, $10}'"
+                "cat /proc/net/dev | grep -E 'eth0|eno|enp' | head -1 | awk '{print $2, $10}'",
+                timeout=SSH_COMMAND_TIMEOUT,
             )
             net_output2 = stdout.read().decode().strip()
             if net_output2:
@@ -772,6 +1159,459 @@ def get_ssh_metrics(host, user):
     return result
 
 
+loaded_models_cache = {}
+loaded_models_cache_lock = threading.Lock()
+LOADED_MODELS_CACHE_TTL = 15
+
+MODEL_DISPLAY_NAMES = {
+    "devstral-small-2-24b": "Devstral-Small-2 24B",
+    "gemma4-26b": "Gemma4 26B",
+    "glm-4.5-air": "GLM-4.5-Air 106B",
+    "qwen3-235b-a22b": "Qwen3-235B-A22B",
+    "qwen3-coder-next": "Qwen3-Coder-Next 80B",
+    "qwen3.6-35b-a3b": "Qwen3.6-35B-A3B",
+}
+
+
+def _model_display_name(model_id):
+    """Turn live server IDs into stable, readable dashboard labels."""
+    if model_id.startswith("qwen-daily-"):
+        return "Qwen3.6-35B-A3B Q8_0"
+    return MODEL_DISPLAY_NAMES.get(model_id, model_id)
+
+
+def _served_model_ids(target_config):
+    """Read models that are actually running/served, never the gateway route list."""
+    model_ids = []
+    available = False
+    for source_type, url in target_config.get("model_status_urls", []):
+        try:
+            response = requests.get(url, timeout=4)
+            response.raise_for_status()
+            payload = response.json()
+            available = True
+            if source_type == "running":
+                records = payload.get("running", [])
+            elif source_type == "props":
+                # llama.cpp's /v1/models ID is caller-configurable and may be a
+                # friendly alias. The basename of /props.model_path is the exact
+                # file (including quantization) held by this process.
+                model_path = payload.get("model_path") or ""
+                records = [os.path.basename(model_path)] if model_path else []
+            else:
+                records = payload.get("data") or payload.get("models") or []
+            for record in records:
+                model_id = record if isinstance(record, str) else (
+                    record.get("id") or record.get("model") or record.get("name")
+                )
+                if model_id and model_id not in model_ids:
+                    model_ids.append(model_id)
+        except Exception as e:
+            logger.debug(f"model status unavailable at {url}: {e}")
+    return available, model_ids
+
+
+def _model_processes(target_name, target_config):
+    """Return live llama-server processes and their nvidia-smi VRAM footprints."""
+    if target_config.get("os") == "mac":
+        rows = []
+        client = get_ssh_client(
+            target_config["ssh_host"], target_config.get("ssh_user", "ben")
+        )
+        if client is None:
+            return rows
+
+        # Apple Silicon has unified memory, not dedicated VRAM. /props has no
+        # memory field, so read the resident llama-server's RSS over the same
+        # cached SSH path as the card's hardware dials. Prove the reply came
+        # from the intended box before trusting any process number.
+        _, who_out, _ = client.exec_command("hostname", timeout=SSH_COMMAND_TIMEOUT)
+        reported = who_out.read().decode().strip()
+        if not _fleet_host_matches(
+            target_name, reported, TARGET_HOSTNAME_AKA.get(target_name, ())
+        ):
+            logger.warning(
+                f"{target_name} model RSS: WRONG BOX - asked "
+                f"{target_config['ssh_host']} for '{target_name}', got '{reported}'. "
+                "Refusing to render its process memory."
+            )
+            return rows
+
+        _, stdout, _ = client.exec_command(
+            "ps -axo pid=,rss=,command=", timeout=SSH_COMMAND_TIMEOUT
+        )
+        for line in stdout.read().decode(errors="ignore").splitlines():
+            parts = line.strip().split(None, 2)
+            if len(parts) != 3 or not parts[0].isdigit():
+                continue
+            executable = parts[2].split(None, 1)[0]
+            if Path(executable).name != "llama-server":
+                continue
+            try:
+                rows.append({
+                    "pid": int(parts[0]),
+                    # macOS ps reports RSS in KiB; retain the existing internal
+                    # MiB unit so get_loaded_models' GiB conversion stays exact.
+                    "vram_mb": float(parts[1]) / 1024,
+                    "memory_label": "RSS",
+                    "cmdline": parts[2],
+                })
+            except ValueError:
+                continue
+        return rows
+
+    command = (
+        "nvidia-smi --query-compute-apps=pid,process_name,used_memory "
+        "--format=csv,noheader,nounits"
+    )
+    rows = []
+    if target_name == "gandalf":
+        import subprocess
+        output = subprocess.run(
+            command.split(), capture_output=True, text=True, timeout=5, check=False
+        ).stdout
+        read_cmdline = lambda pid: Path(f"/proc/{pid}/cmdline").read_bytes().replace(
+            b"\x00", b" "
+        ).decode(errors="ignore")
+    else:
+        client = get_ssh_client(
+            target_config["ssh_host"], target_config.get("ssh_user", "ben")
+        )
+        if client is None:
+            return rows
+        _, stdout, _ = client.exec_command(command, timeout=5)
+        output = stdout.read().decode(errors="ignore")
+
+        def read_cmdline(pid):
+            _, cmdout, _ = client.exec_command(
+                f"tr '\\0' ' ' < /proc/{pid}/cmdline 2>/dev/null", timeout=4
+            )
+            return cmdout.read().decode(errors="ignore")
+
+    for line in output.splitlines():
+        parts = [part.strip() for part in line.split(",", 2)]
+        if len(parts) != 3 or not parts[0].isdigit() or "llama-server" not in parts[1]:
+            continue
+        try:
+            rows.append({
+                "pid": int(parts[0]),
+                "vram_mb": int(parts[2]),
+                "cmdline": read_cmdline(int(parts[0])),
+            })
+        except (OSError, ValueError):
+            continue
+    return rows
+
+
+VRAM_PROCESSES_CACHE_TTL = 5.0
+vram_processes_cache = {}
+vram_processes_cache_lock = threading.Lock()
+
+
+def _parse_vram_cmdline(cmdline, process_name):
+    """Extract port and model/service name from process cmdline."""
+    port = None
+    model = None
+
+    if cmdline:
+        port_match = re.search(r'(?:--port|-p|\bport=)\s*(\d+)', cmdline)
+        if port_match:
+            port = int(port_match.group(1))
+
+        model_match = re.search(r'(?:-m|--model)\s+([^\s]+)', cmdline)
+        if model_match:
+            raw = model_match.group(1)
+            p = Path(raw)
+            stem = p.stem
+            parent = p.parent.name
+            if parent and parent.lower() not in (
+                'gguf', 'models', 'weights', 'checkpoints', 'bin', 'ggml', '.', 'gguf-models'
+            ):
+                if stem.lower() != parent.lower() and not stem.lower().startswith(parent.lower()):
+                    model = f"{parent} ({stem})"
+                else:
+                    model = f"{parent} ({stem})" if len(stem) > len(parent) else parent
+            else:
+                model = stem
+        else:
+            script_match = re.search(r'([a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+\.py)', cmdline)
+            if not script_match:
+                script_match = re.search(r'([a-zA-Z0-9_-]+\.py)', cmdline)
+            if script_match:
+                model = script_match.group(1)
+
+    short_name = Path(process_name).name if process_name else "unknown"
+    return short_name, port, model
+
+
+def _fetch_vram_processes(target_name):
+    """Fetch live processes holding VRAM on a target GPU using nvidia-smi."""
+    target_config = CONFIG["targets"].get(target_name)
+    if not target_config or target_config.get("os") == "mac":
+        return {
+            "target": target_name,
+            "available": False,
+            "processes": [],
+            "sum_vram_mb": 0,
+            "total_vram_mb": 0,
+            "used_vram_mb": 0,
+            "free_vram_mb": 0,
+            "error": "Not an NVIDIA GPU target",
+        }
+
+    cmd_apps = (
+        "nvidia-smi --query-compute-apps=pid,process_name,used_memory "
+        "--format=csv,noheader,nounits"
+    )
+    cmd_gpu = (
+        "nvidia-smi --query-gpu=memory.total,memory.used,memory.free "
+        "--format=csv,noheader,nounits"
+    )
+
+    apps_out = ""
+    gpu_out = ""
+
+    if target_name == "gandalf":
+        try:
+            r1 = subprocess.run(
+                cmd_apps.split(), capture_output=True, text=True, timeout=5, check=False
+            )
+            apps_out = r1.stdout or ""
+            r2 = subprocess.run(
+                cmd_gpu.split(), capture_output=True, text=True, timeout=5, check=False
+            )
+            gpu_out = r2.stdout or ""
+
+            def read_cmdline(pid):
+                try:
+                    return Path(f"/proc/{pid}/cmdline").read_bytes().replace(
+                        b"\x00", b" "
+                    ).decode(errors="ignore")
+                except Exception:
+                    return ""
+        except Exception as e:
+            logger.warning(f"vram-processes query failed for {target_name}: {e}")
+            return {
+                "target": target_name,
+                "available": False,
+                "processes": [],
+                "sum_vram_mb": 0,
+                "total_vram_mb": 0,
+                "used_vram_mb": 0,
+                "free_vram_mb": 0,
+                "error": str(e),
+            }
+    else:
+        client = get_ssh_client(
+            target_config["ssh_host"], target_config.get("ssh_user", "ben")
+        )
+        if client is None:
+            return {
+                "target": target_name,
+                "available": False,
+                "processes": [],
+                "sum_vram_mb": 0,
+                "total_vram_mb": 0,
+                "used_vram_mb": 0,
+                "free_vram_mb": 0,
+                "error": "SSH client unavailable",
+            }
+        try:
+            _, stdout1, _ = client.exec_command(cmd_apps, timeout=5)
+            apps_out = stdout1.read().decode(errors="ignore")
+            _, stdout2, _ = client.exec_command(cmd_gpu, timeout=5)
+            gpu_out = stdout2.read().decode(errors="ignore")
+
+            def read_cmdline(pid):
+                try:
+                    _, cmdout, _ = client.exec_command(
+                        f"tr '\\0' ' ' < /proc/{pid}/cmdline 2>/dev/null", timeout=4
+                    )
+                    return cmdout.read().decode(errors="ignore")
+                except Exception:
+                    return ""
+        except Exception as e:
+            logger.warning(f"vram-processes SSH query failed for {target_name}: {e}")
+            return {
+                "target": target_name,
+                "available": False,
+                "processes": [],
+                "sum_vram_mb": 0,
+                "total_vram_mb": 0,
+                "used_vram_mb": 0,
+                "free_vram_mb": 0,
+                "error": str(e),
+            }
+
+    total_vram_mb = 0
+    used_vram_mb = 0
+    free_vram_mb = 0
+    for line in gpu_out.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) >= 3:
+            try:
+                total_vram_mb += int(float(parts[0]))
+                used_vram_mb += int(float(parts[1]))
+                free_vram_mb += int(float(parts[2]))
+            except ValueError:
+                pass
+
+    processes = []
+    for line in apps_out.strip().splitlines():
+        parts = [p.strip() for p in line.split(",", 2)]
+        if len(parts) != 3 or not parts[0].isdigit():
+            continue
+        try:
+            pid = int(parts[0])
+            process_name = parts[1]
+            vram_mb = int(float(parts[2]))
+            cmdline = read_cmdline(pid)
+            short_name, port, model = _parse_vram_cmdline(cmdline, process_name)
+            processes.append({
+                "pid": pid,
+                "process_name": short_name,
+                "full_process_name": process_name,
+                "vram_mb": vram_mb,
+                "port": port,
+                "model": model,
+                "cmdline": cmdline[:200],
+            })
+        except Exception as e:
+            logger.debug(f"error parsing process line '{line}': {e}")
+            continue
+
+    sum_vram_mb = sum(p["vram_mb"] for p in processes)
+
+    return {
+        "target": target_name,
+        "available": True,
+        "processes": processes,
+        "sum_vram_mb": sum_vram_mb,
+        "total_vram_mb": total_vram_mb,
+        "used_vram_mb": used_vram_mb,
+        "free_vram_mb": free_vram_mb,
+    }
+
+
+def get_vram_processes(target_name):
+    """Cached wrapper around _fetch_vram_processes (5s TTL)."""
+    now = time.time()
+    with vram_processes_cache_lock:
+        cached = vram_processes_cache.get(target_name)
+        if cached and (now - cached["ts"] < VRAM_PROCESSES_CACHE_TTL):
+            return cached["data"]
+
+    data = _fetch_vram_processes(target_name)
+    with vram_processes_cache_lock:
+        vram_processes_cache[target_name] = {"data": data, "ts": time.time()}
+    return data
+
+
+def get_ollama_loaded_models(target_config):
+    """What each instance on a box has RESIDENT, and on which card.
+
+    Handles BOTH engines, because aragorn is mid-migration from ollama to
+    llama.cpp (2026-07-30) and a per-port engine can change under us:
+      - ollama: /api/ps is the honest signal. Its /v1/models lists everything
+        PULLED, which would show models that are not loaded at all.
+      - llama.cpp: /api/ps 404s. Its /v1/models IS the resident set, because a
+        llama-server process holds exactly one model.
+    Trying ollama first and falling back means a port can flip engines without
+    the dashboard going blank - which is exactly what it just did.
+    """
+    host = target_config.get("ssh_host")
+    models = []
+    reachable = False
+    for inst in target_config.get("ollama_instances", []):
+        port = inst["port"]
+        got = False
+        # --- ollama path
+        try:
+            r = requests.get(f"http://{host}:{port}/api/ps", timeout=4)
+            if r.ok:
+                for m in r.json().get("models", []):
+                    name = (m.get("model") or m.get("name") or "").replace(":latest", "")
+                    if not name:
+                        continue
+                    reachable = True
+                    got = True
+                    models.append({
+                        "name": name,
+                        "vram_gb": round(m["size_vram"] / (1024 ** 3), 1) if m.get("size_vram") else None,
+                        "where": inst.get("where"),
+                    })
+        except Exception as e:
+            logger.debug(f"ollama :{port} /api/ps unavailable: {e}")
+        if got:
+            continue
+        # --- llama.cpp path (a llama-server holds exactly one model, so its
+        #     model list IS what is resident)
+        try:
+            r = requests.get(f"http://{host}:{port}/v1/models", timeout=4)
+            if r.ok:
+                for m in r.json().get("data", []):
+                    mid = m.get("id")
+                    if not mid:
+                        continue
+                    reachable = True
+                    meta = m.get("meta") or {}
+                    size = meta.get("size")
+                    models.append({
+                        "name": mid,
+                        "vram_gb": round(size / (1024 ** 3), 1) if size else None,
+                        "where": inst.get("where"),
+                    })
+        except Exception as e:
+            logger.debug(f"llama.cpp :{port} /v1/models unavailable: {e}")
+    return {"available": reachable, "models": models}
+
+
+def get_loaded_models(target_name, target_config):
+    """Live served-model names paired with their real per-process VRAM use."""
+    now = time.time()
+    with loaded_models_cache_lock:
+        cached = loaded_models_cache.get(target_name)
+        if cached and now - cached["ts"] < LOADED_MODELS_CACHE_TTL:
+            return cached["data"]
+
+    result = {"available": False, "models": []}
+    try:
+        result["available"], model_ids = _served_model_ids(target_config)
+        processes = _model_processes(target_name, target_config) if result["available"] else []
+        unused = list(processes)
+        for model_id in model_ids:
+            normalized_id = re.sub(r"[^a-z0-9]", "", model_id.lower())
+            match = next(
+                (
+                    proc for proc in unused
+                    if model_id.lower() in proc["cmdline"].lower()
+                    or normalized_id in re.sub(r"[^a-z0-9]", "", proc["cmdline"].lower())
+                ),
+                None,
+            )
+            if match is None and len(model_ids) == 1 and len(unused) == 1:
+                match = unused[0]
+            if match is not None:
+                unused.remove(match)
+            result["models"].append({
+                "name": _model_display_name(model_id),
+                "vram_gb": round(match["vram_mb"] / 1024, 1) if match else None,
+                # On Apple Silicon this number is process RSS in unified
+                # memory. Keep the existing numeric key for API compatibility,
+                # but tell the renderer the honest label.
+                "memory_label": (
+                    match.get("memory_label") if match
+                    else ("RSS" if target_config.get("os") == "mac" else None)
+                ),
+            })
+    except Exception as e:
+        logger.debug(f"loaded-model check failed for {target_name}: {e}")
+
+    with loaded_models_cache_lock:
+        loaded_models_cache[target_name] = {"data": result, "ts": time.time()}
+    return result
+
+
 def get_disk_usage(host, user, path="/"):
     """Get disk usage via SSH with caching (updates every 5 minutes)."""
     cache_key = f"{user}@{host}:{path}"
@@ -792,7 +1632,8 @@ def get_disk_usage(host, user, path="/"):
 
         # Get disk usage for specified path
         stdin, stdout, stderr = client.exec_command(
-            f"df -B1 {path} | tail -1 | awk '{{print $2, $3, $5}}'"
+            f"df -B1 {path} | tail -1 | awk '{{print $2, $3, $5}}'",
+            timeout=SSH_COMMAND_TIMEOUT,
         )
         disk_output = stdout.read().decode().strip()
         if disk_output:
@@ -900,15 +1741,24 @@ def get_gateway_key():
 
 ci_queue_cache = {"data": None, "ts": 0.0}
 ci_queue_cache_lock = threading.Lock()
-CI_QUEUE_CACHE_TTL = 45  # seconds - don't hammer the GitHub API
+ci_queue_refresh_lock = threading.Lock()
+CI_QUEUE_CACHE_TTL = 2  # seconds - keep volatile counts inside the truth suite's +/-1 window
 
 def get_ci_queue_status():
-    """Queued + in-progress GitHub Actions run counts for armbrain-io/armbrain -
-    the same queue-depth signal the Shire autoscaler watches to decide whether
-    to wake reserve boxes."""
+    """Current GitHub Actions queue depth and job-level activity for armbrain."""
     now = time.time()
     with ci_queue_cache_lock:
         if ci_queue_cache["data"] is not None and (now - ci_queue_cache["ts"]) < CI_QUEUE_CACHE_TTL:
+            return ci_queue_cache["data"]
+
+    # Multiple page/API callers can arrive together after expiry. Only one may
+    # refresh; waiters re-use its atomic snapshot instead of racing and later
+    # overwriting the cache with an older GitHub observation.
+    ci_queue_refresh_lock.acquire()
+    now = time.time()
+    with ci_queue_cache_lock:
+        if ci_queue_cache["data"] is not None and (now - ci_queue_cache["ts"]) < CI_QUEUE_CACHE_TTL:
+            ci_queue_refresh_lock.release()
             return ci_queue_cache["data"]
 
     result = {"available": False, "queued": 0, "in_progress": 0, "repo": GITHUB_CI_REPO}
@@ -917,18 +1767,95 @@ def get_ci_queue_status():
         try:
             headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
             base = f"https://api.github.com/repos/{GITHUB_CI_REPO}/actions/runs"
-            # Only count runs from the last 48h: GitHub sometimes strands
-            # "queued" runs forever when a PR branch is deleted mid-queue
-            # (uncancellable via API — cancel/force-cancel 500). Counting them
-            # would permanently inflate the autoscaler's queue-depth signal.
-            from datetime import datetime, timedelta, timezone
-            cutoff = (datetime.now(timezone.utc) - timedelta(hours=48)).strftime("%Y-%m-%dT%H:%M:%SZ")
-            q = requests.get(base, params={"status": "queued", "per_page": 100, "created": f">={cutoff}"}, headers=headers, timeout=8)
-            ip = requests.get(base, params={"status": "in_progress", "per_page": 100, "created": f">={cutoff}"}, headers=headers, timeout=8)
+            # GitHub can strand queued runs when a branch disappears. Keep those
+            # visible as orphans, but exclude them from the live queue-depth signal.
+            from datetime import timezone
+            stale_cut = datetime.now(timezone.utc) - timedelta(hours=48)
+            cutoff = stale_cut.strftime("%Y-%m-%dT%H:%M:%SZ")
+            q = requests.get(
+                base,
+                params={"status": "queued", "per_page": 100, "created": f">={cutoff}"},
+                headers=headers,
+                timeout=8,
+            )
+            ip = requests.get(
+                base,
+                params={"status": "in_progress", "per_page": 100, "created": f">={cutoff}"},
+                headers=headers,
+                timeout=8,
+            )
             if q.ok and ip.ok:
                 result["available"] = True
                 result["queued"] = q.json().get("total_count", 0)
                 result["in_progress"] = ip.json().get("total_count", 0)
+
+                # A workflow run may contain many concurrent jobs. Count the jobs
+                # actually running so the dashboard reflects fleet workload.
+                try:
+                    active_jobs = 0
+                    active_runners = set()
+                    for run in (ip.json().get("workflow_runs") or [])[:12]:
+                        jobs = requests.get(
+                            f"{base}/{run['id']}/jobs",
+                            params={"per_page": 100},
+                            headers=headers,
+                            timeout=8,
+                        )
+                        if not jobs.ok:
+                            continue
+                        for job in jobs.json().get("jobs", []):
+                            if job.get("status") == "in_progress":
+                                active_jobs += 1
+                                if job.get("runner_name"):
+                                    active_runners.add(job["runner_name"])
+
+                    orphaned = 0
+                    all_queued = requests.get(
+                        base,
+                        params={"status": "queued", "per_page": 100},
+                        headers=headers,
+                        timeout=8,
+                    )
+                    if all_queued.ok:
+                        for run in all_queued.json().get("workflow_runs", []):
+                            try:
+                                created = datetime.strptime(
+                                    run.get("created_at") or "", "%Y-%m-%dT%H:%M:%SZ"
+                                ).replace(tzinfo=timezone.utc)
+                            except ValueError:
+                                continue
+                            if created < stale_cut:
+                                orphaned += 1
+
+                    result["active_jobs"] = active_jobs
+                    result["active_runners"] = sorted(active_runners)
+                    result["active_runner_count"] = len(active_runners)
+                    result["orphaned_queued"] = orphaned
+                except Exception as e:
+                    # An unreadable jobs API must not silently look like zero work.
+                    logger.warning(f"CI job-level count failed: {e}")
+                    result["active_jobs"] = None
+                    result["active_runner_count"] = None
+
+                # Job/runner detail can take several seconds across a busy
+                # fleet. Re-sample the two displayed run counts at the response
+                # boundary so they are not stale merely because enrichment was
+                # slow; retain the detail gathered above as ancillary context.
+                q_latest = requests.get(
+                    base,
+                    params={"status": "queued", "per_page": 1, "created": f">={cutoff}"},
+                    headers=headers,
+                    timeout=8,
+                )
+                ip_latest = requests.get(
+                    base,
+                    params={"status": "in_progress", "per_page": 1, "created": f">={cutoff}"},
+                    headers=headers,
+                    timeout=8,
+                )
+                if q_latest.ok and ip_latest.ok:
+                    result["queued"] = q_latest.json().get("total_count", result["queued"])
+                    result["in_progress"] = ip_latest.json().get("total_count", result["in_progress"])
             else:
                 logger.warning(f"CI queue check: GitHub returned {q.status_code}/{ip.status_code}")
         except Exception as e:
@@ -937,11 +1864,512 @@ def get_ci_queue_status():
     with ci_queue_cache_lock:
         ci_queue_cache["data"] = result
         ci_queue_cache["ts"] = time.time()
+    ci_queue_refresh_lock.release()
+    return result
+
+runson_cache = {"data": None, "ts": 0.0}
+runson_cache_lock = threading.Lock()
+runson_cost_cache_lock = threading.Lock()
+RUNSON_CACHE_TTL = 120  # seconds - AWS reads are slower and credentials are short-lived
+RUNSON_AWS_PROFILE = "armbrain-dashboard"  # permanent scoped read-only key (council 2026-08-30); "armbrain" login sessions expire ~12h
+RUNSON_AWS_TIMEOUT = 12
+RUNSON_STACK_NAME = "runs-on"
+RUNSON_WORKFLOW_JOBS_TABLE = "runs-on-workflow-jobs"
+RUNSON_COST_CACHE_TTL = 6 * 60 * 60  # CE calls cost money; never fetch more than four times/day.
+RUNSON_DAILY_BUDGET_USD = 10.0
+RUNSON_MONTHLY_GUARD_USD = 25.0
+RUNSON_CREDIT_BURN_BUDGET_USD = 60.0
+RUNSON_CREDIT_ANCHORS = (
+    ("2026-08-30T02:00:00+00:00", 139.75),  # Aug 29 evening CT
+    ("2026-08-30T19:00:00+00:00", 139.39),  # Aug 30 ~14:00 CT
+    ("2026-08-30T21:00:00+00:00", 139.13),  # Aug 30 ~16:00 CT
+)
+
+def _runson_aws_json(args, region):
+    """Run one read-only AWS CLI call with a hard timeout and sanitized errors."""
+    cmd = [
+        "/snap/bin/aws", "--profile", RUNSON_AWS_PROFILE, "--region", region,
+        *args, "--output", "json", "--no-cli-pager",
+    ]
+    try:
+        completed = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=RUNSON_AWS_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning("RunsOn AWS %s call timed out", args[0])
+        return None, "timeout"
+    except Exception as e:
+        logger.warning("RunsOn AWS %s call failed to start: %s", args[0], type(e).__name__)
+        return None, "aws"
+
+    if completed.returncode != 0:
+        error_text = (completed.stderr or "").lower()
+        if "does not exist" in error_text and args[:2] == ["cloudformation", "describe-stacks"]:
+            return None, "not_found"
+        credential_markers = (
+            "session has expired", "expiredtoken", "unable to locate credentials",
+            "config profile", "credential process", "could not be found",
+        )
+        if any(marker in error_text for marker in credential_markers):
+            return None, "credentials"
+        if "accessdenied" in error_text or "not authorized" in error_text:
+            return None, "access_denied"
+        logger.warning("RunsOn AWS %s read failed (exit %s)", args[0], completed.returncode)
+        return None, "aws"
+
+    try:
+        return json.loads(completed.stdout or "{}"), None
+    except json.JSONDecodeError:
+        logger.warning("RunsOn AWS %s returned invalid JSON", args[0])
+        return None, "aws"
+
+def _record_runson_credit_sample(credits, sampled_at):
+    """Persist a real Free Tier credit observation; anchors are inserted by init_db."""
+    if credits is None:
+        return
+    try:
+        amount = float(credits)
+    except (TypeError, ValueError):
+        return
+    with sqlite3.connect(CONFIG["db_path"]) as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO runson_credit_samples(ts, credits) VALUES (?, ?)",
+            (sampled_at.astimezone(timezone.utc).isoformat(), amount),
+        )
+
+def _runson_credit_budget_data(now_utc, today_ct):
+    """Derive observed net credit burn without inventing zero-spend days."""
+    from zoneinfo import ZoneInfo
+
+    chicago = ZoneInfo("America/Chicago")
+    window_start = today_ct - timedelta(days=29)
+    with sqlite3.connect(CONFIG["db_path"]) as conn:
+        rows = conn.execute(
+            "SELECT ts, credits FROM runson_credit_samples ORDER BY ts"
+        ).fetchall()
+    samples = []
+    for ts, credits in rows:
+        try:
+            moment = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(timezone.utc)
+            samples.append((moment, float(credits)))
+        except (TypeError, ValueError):
+            continue
+
+    daily = []
+    for offset in range(30):
+        day = window_start + timedelta(days=offset)
+        day_rows = [(ts, value) for ts, value in samples if ts.astimezone(chicago).date() == day]
+        before = [(ts, value) for ts, value in samples if ts.astimezone(chicago).date() < day]
+        spend = None
+        if day_rows and before:
+            spend = round(max(0.0, before[-1][1] - day_rows[-1][1]), 4)
+        elif len(day_rows) >= 2:
+            spend = round(max(0.0, day_rows[0][1] - day_rows[-1][1]), 4)
+        daily.append({"date": day.isoformat(), "spend": spend})
+
+    today_spend = daily[-1]["spend"]
+    month_rows = [
+        row for row in samples
+        if row[0].astimezone(chicago).date().replace(day=1) == today_ct.replace(day=1)
+    ]
+    month_spend = None
+    if len(month_rows) >= 2:
+        month_spend = round(max(0.0, month_rows[0][1] - month_rows[-1][1]), 4)
+
+    recent_cutoff = now_utc - timedelta(days=7)
+    recent = [row for row in samples if row[0] >= recent_cutoff]
+    burn_per_day = None
+    projection_date = None
+    if len(recent) >= 2:
+        elapsed_days = (recent[-1][0] - recent[0][0]).total_seconds() / 86400
+        burned = recent[0][1] - recent[-1][1]
+        if elapsed_days > 0 and burned > 0:
+            burn_per_day = round(burned / elapsed_days, 4)
+            days_left = recent[-1][1] / burn_per_day
+            projection_date = (now_utc + timedelta(days=days_left)).date().isoformat()
+    return {
+        "daily_spend": daily,
+        "spent_today": today_spend,
+        "spent_month": month_spend,
+        "burn_per_day_7d": burn_per_day,
+        "projection_date": projection_date,
+        "samples": [
+            {"ts": ts.isoformat(), "credits": round(value, 4)}
+            for ts, value in samples[-120:]
+        ],
+        "observed_since": samples[0][0].isoformat() if samples else None,
+    }
+
+def _runson_ce_cost_data_unlocked(today_ct, account_id):
+    """Probe CE once per six-hour cache window, then optionally read budget actuals."""
+    cache_key = "ce_daily_unblended"
+    now_utc = datetime.now(timezone.utc)
+    with sqlite3.connect(CONFIG["db_path"]) as conn:
+        cached = conn.execute(
+            "SELECT status, fetched_at, payload FROM runson_cost_cache WHERE cache_key = ?",
+            (cache_key,),
+        ).fetchone()
+    if cached:
+        try:
+            fetched = datetime.fromisoformat(cached[1].replace("Z", "+00:00"))
+            if (now_utc - fetched).total_seconds() < RUNSON_COST_CACHE_TTL:
+                return json.loads(cached[2]) if cached[0] == "available" else None
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+
+    month_start = today_ct.replace(day=1).isoformat()
+    tomorrow = (today_ct + timedelta(days=1)).isoformat()
+    cost_filter = json.dumps({
+        "Not": {"Dimensions": {"Key": "RECORD_TYPE", "Values": ["Credit", "Refund"]}}
+    }, separators=(",", ":"))
+    ce_data, ce_error = _runson_aws_json(
+        [
+            "ce", "get-cost-and-usage",
+            "--time-period", f"Start={month_start},End={tomorrow}",
+            "--granularity", "DAILY", "--metrics", "UnblendedCost",
+            "--filter", cost_filter,
+        ],
+        "us-east-1",
+    )
+    if ce_error:
+        with sqlite3.connect(CONFIG["db_path"]) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO runson_cost_cache(cache_key,status,fetched_at,payload) VALUES (?,?,?,?)",
+                (cache_key, "unavailable", now_utc.isoformat(), "{}"),
+            )
+        return None
+
+    daily_map = {}
+    for period in (ce_data or {}).get("ResultsByTime", []):
+        day = ((period.get("TimePeriod") or {}).get("Start"))
+        amount = (((period.get("Total") or {}).get("UnblendedCost") or {}).get("Amount"))
+        try:
+            daily_map[day] = round(float(amount), 4)
+        except (TypeError, ValueError):
+            continue
+    window_start = today_ct - timedelta(days=29)
+    daily = [
+        {"date": (window_start + timedelta(days=i)).isoformat(),
+         "spend": daily_map.get((window_start + timedelta(days=i)).isoformat())}
+        for i in range(30)
+    ]
+    result = {
+        "daily_spend": daily,
+        "spent_today": daily_map.get(today_ct.isoformat()),
+        "spent_month": round(sum(daily_map.values()), 4) if daily_map else None,
+        "budget_actuals": {},
+    }
+
+    if account_id:
+        budget_names = (
+            "runs-on-app-daily-budget", "armbrain-monthly-guard", "armbrain-credit-burn",
+        )
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {
+                name: executor.submit(
+                    _runson_aws_json,
+                    ["budgets", "describe-budget", "--account-id", account_id, "--budget-name", name],
+                    "us-east-1",
+                )
+                for name in budget_names
+            }
+            for name, future in futures.items():
+                budget_data, budget_error = future.result()
+                if budget_error:
+                    continue
+                actual = (((budget_data or {}).get("Budget") or {}).get("CalculatedSpend") or {}).get("ActualSpend") or {}
+                try:
+                    result["budget_actuals"][name] = round(float(actual.get("Amount")), 4)
+                except (TypeError, ValueError):
+                    pass
+
+    with sqlite3.connect(CONFIG["db_path"]) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO runson_cost_cache(cache_key,status,fetched_at,payload) VALUES (?,?,?,?)",
+            (cache_key, "available", now_utc.isoformat(), json.dumps(result, separators=(",", ":"))),
+        )
+    return result
+
+def _runson_ce_cost_data(today_ct, account_id):
+    # Serialize the persistent-cache probe so concurrent browsers cannot turn
+    # one expired window into duplicate paid Cost Explorer calls.
+    with runson_cost_cache_lock:
+        return _runson_ce_cost_data_unlocked(today_ct, account_id)
+
+def _runson_error_result(error):
+    if error == "credentials":
+        return {
+            "available": False,
+            "deployed": None,
+            "error": "credentials",
+            "message": "AWS creds expired - run: aws login --remote --profile armbrain --region us-east-2",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+    return {
+        "available": False,
+        "deployed": None,
+        "error": error or "aws",
+        "message": "RunsOn AWS data unavailable",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+def get_runson_status():
+    """RunsOn runners, daily jobs, trial fuse, and credits; cached and read-only."""
+    now = time.time()
+    with runson_cache_lock:
+        if runson_cache["data"] is not None and (now - runson_cache["ts"]) < RUNSON_CACHE_TTL:
+            return runson_cache["data"]
+
+    stack, stack_error = _runson_aws_json(
+        ["cloudformation", "describe-stacks", "--stack-name", RUNSON_STACK_NAME],
+        "us-east-2",
+    )
+    if stack_error == "not_found":
+        result = {
+            "available": True,
+            "deployed": False,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+    elif stack_error:
+        result = _runson_error_result(stack_error)
+    elif not (stack or {}).get("Stacks"):
+        result = _runson_error_result("aws")
+    else:
+        from zoneinfo import ZoneInfo
+        today_ct = datetime.now(ZoneInfo("America/Chicago")).date()
+        date_key = today_ct.isoformat()
+        jobs_values = json.dumps({":date": {"S": date_key}})
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            runners_future = executor.submit(
+                _runson_aws_json,
+                [
+                    "ec2", "describe-instances", "--filters",
+                    "Name=instance-state-name,Values=running,pending",
+                    f"Name=tag:runs-on-stack-name,Values={RUNSON_STACK_NAME}",
+                ],
+                "us-east-2",
+            )
+            jobs_future = executor.submit(
+                _runson_aws_json,
+                [
+                    "dynamodb", "query", "--table-name", RUNSON_WORKFLOW_JOBS_TABLE,
+                    "--index-name", "daily-activity-index",
+                    "--key-condition-expression", "created_at_date = :date",
+                    "--expression-attribute-values", jobs_values,
+                    "--select", "COUNT",
+                ],
+                "us-east-2",
+            )
+            credits_future = executor.submit(
+                _runson_aws_json,
+                ["freetier", "get-account-plan-state"],
+                "us-east-1",
+            )
+            runners_data, runners_error = runners_future.result()
+            jobs_data, jobs_error = jobs_future.result()
+            credits_data, credits_error = credits_future.result()
+
+        read_error = runners_error or jobs_error or credits_error
+        if read_error:
+            result = _runson_error_result(read_error)
+        else:
+            runner_rows = []
+            now_utc = datetime.now(timezone.utc)
+            for reservation in (runners_data or {}).get("Reservations", []):
+                for instance in reservation.get("Instances", []):
+                    launch_text = instance.get("LaunchTime")
+                    age_minutes = None
+                    if launch_text:
+                        try:
+                            launched = datetime.fromisoformat(launch_text.replace("Z", "+00:00"))
+                            age_minutes = max(0, int((now_utc - launched).total_seconds() // 60))
+                        except (TypeError, ValueError):
+                            pass
+                    runner_rows.append({
+                        "instance_type": instance.get("InstanceType") or "unknown",
+                        "state": (instance.get("State") or {}).get("Name") or "unknown",
+                        "age_minutes": age_minutes,
+                    })
+
+            credits = (credits_data or {}).get("accountPlanRemainingCredits") or {}
+            credit_amount = credits.get("amount")
+            try:
+                _record_runson_credit_sample(credit_amount, now_utc)
+                credit_costs = _runson_credit_budget_data(now_utc, today_ct)
+            except sqlite3.Error as e:
+                logger.warning("RunsOn local credit history unavailable: %s", type(e).__name__)
+                credit_costs = {
+                    "daily_spend": [], "spent_today": None, "spent_month": None,
+                    "burn_per_day_7d": None, "projection_date": None, "samples": [],
+                }
+            stack_id = ((stack or {}).get("Stacks") or [{}])[0].get("StackId") or ""
+            account_match = re.match(r"^arn:aws:cloudformation:[^:]+:(\d+):", stack_id)
+            try:
+                ce_costs = _runson_ce_cost_data(today_ct, account_match.group(1) if account_match else None)
+            except sqlite3.Error as e:
+                logger.warning("RunsOn local cost cache unavailable: %s", type(e).__name__)
+                ce_costs = None
+            costs = ce_costs or credit_costs
+            charge_date = datetime(2026, 9, 12).date()
+            result = {
+                "available": True,
+                "deployed": True,
+                "live_runners": len(runner_rows),
+                "runners": runner_rows,
+                "jobs_today": int((jobs_data or {}).get("Count", 0)),
+                "trial_days_remaining": max(0, (charge_date - today_ct).days),
+                "trial_charge_date": charge_date.isoformat(),
+                "subscription_usd_per_year": 350,
+                "credits_remaining": credit_amount,
+                "credits_unit": credits.get("unit") or "USD",
+                "cost_source": "cost_explorer" if ce_costs else "credits",
+                "cost_source_label": "AWS Cost Explorer" if ce_costs else "net of credits",
+                "spent_today": costs.get("spent_today"),
+                "spent_month": costs.get("spent_month"),
+                "daily_spend": costs.get("daily_spend", []),
+                "credits_runway": {
+                    "burn_per_day_7d": credit_costs.get("burn_per_day_7d"),
+                    "projection_date": credit_costs.get("projection_date"),
+                    "samples": credit_costs.get("samples", []),
+                },
+                "budget_limits": {
+                    "daily": RUNSON_DAILY_BUDGET_USD,
+                    "monthly_guard": RUNSON_MONTHLY_GUARD_USD,
+                    "credit_burn_monthly": RUNSON_CREDIT_BURN_BUDGET_USD,
+                },
+                "budget_actuals": (ce_costs or {}).get("budget_actuals", {}),
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+    with runson_cache_lock:
+        runson_cache["data"] = result
+        runson_cache["ts"] = time.time()
     return result
 
 route_health_cache = {"data": None, "ts": 0.0}
 route_health_cache_lock = threading.Lock()
 ROUTE_HEALTH_CACHE_TTL = 30  # seconds
+
+# --- Route topology (2026-07-29, Ben: "move the coding pathways down to the
+# machine they are running on"). Each route badge renders on ITS box's card, so
+# the dashboard has to know which box serves which route. Parsed from the LIVE
+# gateway config rather than hardcoded, so a route moving boxes can't silently
+# leave the dashboard lying. Falls back to the known map if the file is gone.
+GATEWAY_CONFIG_PATH = "/workspace/gandalf-gateway/fleet-litellm-config.yaml"
+ROUTE_TOPOLOGY_TTL = 300  # seconds - config changes are rare
+# host in api_base -> the box name this dashboard uses ("pippen" is the
+# hostname, "pippin" is the card name).
+_ROUTE_HOST_TO_BOX = {
+    "gandalf": "gandalf", "frodo": "frodo", "pippen": "pippin",
+    "pippin": "pippin", "shadowfax": "shadowfax", "sam": "sam",
+    "aragorn": "aragorn", "127.0.0.1": "gandalf", "localhost": "gandalf",
+    # Derived from FLEET_IPS so the temporary post-outage map (2026-07-30) can't
+    # drift from the target definitions above. NOTE 192.168.1.10 is deliberately
+    # NOT mapped to gandalf any more: a GL-KVM dongle holds that address tonight,
+    # so claiming it is gandalf would attribute another device's routes to gandalf.
+    FLEET_IPS["aragorn"]: "aragorn",
+    FLEET_IPS["gandalf"]: "gandalf",
+    FLEET_IPS["frodo"]: "frodo",
+    FLEET_IPS["pippen"]: "pippin",
+    FLEET_IPS["shadowfax"]: "shadowfax",
+}
+_ROUTE_TOPOLOGY_FALLBACK = {
+    "flagship": {"box": "gandalf", "model": "qwen3.6-35b-a3b-q8-256k", "port": 8889},
+    "dense": {"box": "gandalf", "model": "qwen3.6-27b", "port": 8889},
+    "reason-27b": {"box": "aragorn", "model": "qwen3.6-27b-q5km", "port": 11436},
+    "fast": {"box": "frodo", "model": "qwen3.6-35b-a3b", "port": 8890},
+    "code": {"box": "pippin", "model": "qwen3-coder-next", "port": 8891},
+    "code-glm": {"box": "gandalf", "model": "glm-4.5-air", "port": 8889},
+    "reason": {"box": "gandalf", "model": "gemma4-26b", "port": 8889},
+    "coder": {"box": "gandalf", "model": "devstral-small-2-24b", "port": 8889},
+    "big": {"box": "gandalf", "model": "qwen3-235b-a22b", "port": 8889},
+    "cheap": {"box": "shadowfax", "model": "glm-edge", "port": 8081},
+    "reason-oss": {"box": "aragorn", "model": "gpt-oss:20b", "port": 11434},
+    "fast-mini": {"box": "aragorn", "model": "qwen3:8b", "port": 11435},
+}
+route_topology_cache = {"data": None, "ts": 0.0}
+route_topology_lock = threading.Lock()
+
+
+def get_route_topology():
+    """route name -> {box, model, port}, read from the live gateway config."""
+    now = time.time()
+    with route_topology_lock:
+        if route_topology_cache["data"] is not None and (now - route_topology_cache["ts"]) < ROUTE_TOPOLOGY_TTL:
+            return route_topology_cache["data"]
+
+    topo = {}
+    try:
+        text = open(GATEWAY_CONFIG_PATH).read()
+        for block in re.split(r"\n\s*-\s+model_name:\s*", text)[1:]:
+            name = block.split("\n")[0].split("#")[0].strip().strip("\"'")
+            if name not in LOCAL_GATEWAY_ROUTES:
+                continue
+            base = re.search(r"api_base:\s*[\"']?(\S+?)[\"']?\s*(?:$|,|\})", block, re.M)
+            model = re.search(r"model:\s*[\"']?([^\"'\s,}]+)", block)
+            if not (base and model):
+                continue
+            host_port = re.sub(r"^https?://", "", base.group(1)).split("/")[0]
+            host, _, port = host_port.partition(":")
+            topo[name] = {
+                "box": _ROUTE_HOST_TO_BOX.get(host.replace(".local", ""), host),
+                "model": model.group(1).split("/")[-1],
+                "port": int(port) if port.isdigit() else None,
+            }
+    except Exception as e:
+        logger.warning(f"gateway config unreadable ({e}); using fallback route map")
+
+    for name, info in _ROUTE_TOPOLOGY_FALLBACK.items():
+        topo.setdefault(name, dict(info))
+
+    with route_topology_lock:
+        route_topology_cache["data"] = topo
+        route_topology_cache["ts"] = time.time()
+    return topo
+
+
+def get_loaded_route_models():
+    """Model ids currently RESIDENT in memory, per box.
+
+    gandalf runs llama-swap, so only one of its four models is loaded at a
+    time - /running is the authority. frodo/pippin/shadowfax run a single
+    llama-server each, so anything their /v1/models lists IS loaded.
+    """
+    loaded = {}
+    try:
+        r = requests.get("http://127.0.0.1:8889/running", timeout=4)
+        if r.ok:
+            running = r.json().get("running", [])
+            ids = set()
+            for entry in running:
+                if isinstance(entry, str):
+                    ids.add(entry)
+                elif isinstance(entry, dict):
+                    ids.add(entry.get("model") or entry.get("id") or entry.get("name"))
+            loaded["gandalf"] = {i for i in ids if i}
+    except Exception as e:
+        logger.debug(f"gandalf /running unavailable: {e}")
+
+    for port in (11434, 11435):
+        try:
+            r = requests.get(f"http://{FLEET_IPS['aragorn']}:{port}/api/ps", timeout=4)
+            if r.ok:
+                ids = {m.get("model") or m.get("name") for m in r.json().get("models", [])}
+                loaded.setdefault("aragorn", set()).update(i for i in ids if i)
+        except Exception as e:
+            logger.debug(f"aragorn ollama :{port} /api/ps unavailable: {e}")
+
+    for box, url in (("frodo", f"http://{FLEET_IPS['frodo']}:8890/v1/models"),
+                     ("pippin", f"http://{FLEET_IPS['pippen']}:8891/v1/models"),
+                     ("shadowfax", f"http://{FLEET_IPS['shadowfax']}:8081/v1/models")):
+        try:
+            r = requests.get(url, timeout=4)
+            if r.ok:
+                loaded[box] = {m.get("id") for m in r.json().get("data", []) if m.get("id")}
+        except Exception as e:
+            logger.debug(f"{box} model list unavailable: {e}")
+    return loaded
 
 def get_model_route_health():
     """Which 🔒 local fleet-gateway routes are live right now vs missing -
@@ -967,13 +2395,658 @@ def get_model_route_health():
         except Exception as e:
             logger.warning(f"Model route check failed: {e}")
 
-    result = {
-        "available": available,
-        "routes": [{"name": name, "live": routes_live[name]} for name in LOCAL_GATEWAY_ROUTES],
-    }
+    topo = get_route_topology()
+    loaded_by_box = get_loaded_route_models()
+    routes = []
+    for name in LOCAL_GATEWAY_ROUTES:
+        info = topo.get(name, {})
+        box = info.get("box")
+        model = info.get("model")
+        # Three states, not two: live+resident = green, live but nothing loaded
+        # in memory = grey (llama-swap unloads after idle - that is normal, not
+        # an alarm), absent from the gateway = red.
+        resident = bool(model and box and model in loaded_by_box.get(box, set()))
+        routes.append({
+            "name": name,
+            "live": routes_live[name],
+            "loaded": resident,
+            "box": box,
+            "model": model,
+        })
+    result = {"available": available, "routes": routes}
     with route_health_cache_lock:
         route_health_cache["data"] = result
         route_health_cache["ts"] = time.time()
+    return result
+
+# --- Fleet stats bar (2026-07-29): CLI agent sessions + CI runner busy/total ---
+# (a) CLI agent sessions: count of claude/codex/agy MAIN processes per box.
+#     A pid whose parent also matches is collapsed into it (codex's node wrapper
+#     spawns the vendor binary - counting both would double every session).
+#     gandalf is measured locally (this service runs there); the others go over
+#     the same cached SSH channel + circuit breaker as the rest of the file.
+#     No session limits are configured anywhere, so these are plain counts.
+# (b) CI runners: busy/total per box from the GitHub org runner list, fetched
+#     server-side via the gh CLI (authed for ben on gandalf) and cached 60s so
+#     the dashboard can't hammer the GitHub API.
+AGENT_STAT_BOXES = {
+    "gandalf": {"local": True},
+    "aragorn": {"ssh_host": FLEET_IPS["aragorn"], "ssh_user": "mac"},
+    "frodo":   {"ssh_host": FLEET_IPS["frodo"], "ssh_user": "ben"},
+    "pippen":  {"ssh_host": FLEET_IPS["pippen"], "ssh_user": "ben"},
+}
+# Portable across linux + mac: pgrep the main CLIs by full cmdline, then drop
+# any pid whose parent is also in the match set. The regex text itself never
+# self-matches (in our own cmdline "claude" is preceded by "(", not "/" or ^).
+AGENT_COUNT_CMD = (
+    "pids=$(pgrep -f '(^|/)(claude|codex|agy)( |$)' | tr '\\n' ' '); n=0; "
+    "for p in $pids; do pp=$(ps -o ppid= -p $p 2>/dev/null | tr -d ' '); "
+    "case \" $pids \" in *\" $pp \"*) ;; *) n=$((n+1));; esac; done; "
+    "echo agents=$n"
+)
+GITHUB_RUNNER_ORG = "armbrain-io"
+
+fleet_stats_cache = {"data": None, "ts": 0.0}
+fleet_stats_cache_lock = threading.Lock()
+FLEET_STATS_CACHE_TTL = 60  # seconds - matches the dashboard poll cadence
+
+def _count_cli_agents(name, cfg):
+    """claude/codex/agy main-process count for one box. None = unreadable
+    right now (box down / SSH circuit open) - callers must NOT show it as 0."""
+    out = None
+    try:
+        if cfg.get("local"):
+            import subprocess
+            out = subprocess.run(["bash", "-c", AGENT_COUNT_CMD], capture_output=True,
+                                 text=True, timeout=15).stdout
+        else:
+            client = get_ssh_client(cfg["ssh_host"], cfg.get("ssh_user", "ben"))
+            if client is None:
+                return None
+            _, stdout, _ = client.exec_command(AGENT_COUNT_CMD, timeout=15)
+            out = stdout.read().decode()
+        for kv in (out or "").split():
+            if kv.startswith("agents="):
+                return int(kv.split("=", 1)[1])
+    except Exception as e:
+        logger.debug(f"agent count {name}: {e}")
+    return None
+
+def _get_runner_stats():
+    """CI runner busy/total per box from GitHub (gh api, run on gandalf)."""
+    result = {"available": False, "boxes": {}, "fleet": {"busy": 0, "total": 0, "online": 0}}
+    try:
+        import subprocess, pwd
+        env = dict(os.environ)
+        # systemd system services don't set HOME; gh refuses to find its auth without it
+        env.setdefault("HOME", pwd.getpwuid(os.getuid()).pw_dir)
+        out = subprocess.run(
+            ["gh", "api", f"orgs/{GITHUB_RUNNER_ORG}/actions/runners", "--paginate",
+             "--jq", '.runners[] | [.name, .status, (.busy|tostring)] | @tsv'],
+            capture_output=True, text=True, timeout=25, env=env,
+        )
+        if out.returncode != 0:
+            logger.warning(f"runner stats: gh api failed: {out.stderr.strip()[:200]}")
+            return result
+        boxes = {}
+        for line in out.stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) != 3:
+                continue
+            name, status, busy = parts
+            box = re.sub(r"-\d+$", "", name) or name  # aragorn-12 -> aragorn
+            b = boxes.setdefault(box, {"busy": 0, "total": 0, "online": 0})
+            b["total"] += 1
+            if status == "online":
+                b["online"] += 1
+                if busy == "true":
+                    b["busy"] += 1
+        result["available"] = True
+        result["boxes"] = {k: boxes[k] for k in sorted(boxes)}
+        result["fleet"] = {
+            "busy": sum(b["busy"] for b in boxes.values()),
+            "total": sum(b["total"] for b in boxes.values()),
+            "online": sum(b["online"] for b in boxes.values()),
+        }
+    except Exception as e:
+        logger.warning(f"runner stats failed: {e}")
+    return result
+
+def get_fleet_stats():
+    """Cached agents-per-box + runner busy/total. One cache for both halves so
+    a dashboard refresh costs at most one SSH sweep + one gh call per minute."""
+    now = time.time()
+    with fleet_stats_cache_lock:
+        if fleet_stats_cache["data"] is not None and (now - fleet_stats_cache["ts"]) < FLEET_STATS_CACHE_TTL:
+            return fleet_stats_cache["data"]
+    agents = {}
+    with ThreadPoolExecutor(max_workers=len(AGENT_STAT_BOXES)) as ex:
+        futs = {ex.submit(_count_cli_agents, n, c): n for n, c in AGENT_STAT_BOXES.items()}
+        for fut in as_completed(futs):
+            agents[futs[fut]] = fut.result()
+    counts = {n: agents.get(n) for n in AGENT_STAT_BOXES}  # keep display order
+    result = {
+        "agents": {
+            "boxes": counts,
+            "total": sum(v for v in counts.values() if v is not None),
+        },
+        "runners": _get_runner_stats(),
+    }
+    with fleet_stats_cache_lock:
+        fleet_stats_cache["data"] = result
+        fleet_stats_cache["ts"] = time.time()
+    return result
+
+# --- Model serving stats (2026-07-29): tokens/sec dials + requests served ---
+# Two very different sources, one shape out:
+#   gandalf: llama-swap (port 8889) keeps a per-request JSON buffer at
+#     /api/metrics (id, model, output_tokens, tokens_per_second, timestamp).
+#     Its own /metrics is system-level only, and the per-model llama-server
+#     /upstream/<model>/metrics MUST NOT be probed - hitting an upstream path
+#     triggers a model LOAD/swap (44-72s, evicts whatever is resident).
+#     The request buffer is in-memory, so we persist rows into sqlite.
+#   frodo/aragorn/pippin: bare llama-server --metrics exposes Prometheus counters
+#     llamacpp:tokens_predicted_total + llamacpp:tokens_predicted_seconds_total.
+#     (Its *_tokens_seconds gauges are LIFETIME averages, not instantaneous -
+#     verified: 1.227e6 tok / 6436s = the exact 190.7 the gauge showed.)
+#     We sample the counters every 60s; deltas give rates, and the
+#     seconds_total counter only advances WHILE GENERATING, so
+#     sum(d_tokens)/sum(d_seconds) is exactly the serving-time-only average.
+MODEL_SERVING_SOURCES = {
+    "gandalf": {"kind": "llamacpp", "url": "http://127.0.0.1:8889/upstream/qwen3.8-27b/metrics",
+                "identity_url": "http://127.0.0.1:8889/running"},
+    "frodo":   {"kind": "llamacpp", "url": f"http://{FLEET_IPS['frodo']}:8890/metrics",
+                "identity_url": f"http://{FLEET_IPS['frodo']}:8890/v1/models"},
+    "aragorn": {"kind": "llamacpp_multi", "urls": [
+        f"http://{FLEET_IPS['aragorn']}:11434/metrics",
+        f"http://{FLEET_IPS['aragorn']}:11435/metrics",
+    ], "identity_urls": [
+        f"http://{FLEET_IPS['aragorn']}:11434/v1/models",
+        f"http://{FLEET_IPS['aragorn']}:11435/v1/models",
+    ]},
+    "pippin":  {"kind": "llamacpp", "url": f"http://{FLEET_IPS['pippen']}:8891/metrics",
+                "identity_url": f"http://{FLEET_IPS['pippen']}:8891/v1/models"},
+}
+MODEL_SERVING_INTERVAL = 60      # sampling cadence, matches METRICS_INTERVAL
+MODEL_SERVING_RETENTION_DAYS = 8  # a hair over the 7d display window
+MODEL_SERVING_HTTP_TIMEOUT = 6
+
+model_identity_cache = {}
+
+
+def _current_counter_model(box, source):
+    """Return a stable identity for exactly the counter set sampled on a box."""
+    urls = source.get("identity_urls") or [source.get("identity_url")]
+    model_ids = set()
+    try:
+        for url in (u for u in urls if u):
+            response = requests.get(url, timeout=MODEL_SERVING_HTTP_TIMEOUT)
+            if not response.ok:
+                continue
+            payload = response.json()
+            rows = payload.get("running") if "running" in payload else payload.get("data", [])
+            for row in rows or []:
+                if isinstance(row, str):
+                    model_id = row
+                else:
+                    model_id = row.get("model") or row.get("id") or row.get("name")
+                if model_id:
+                    model_ids.add(str(model_id).strip())
+    except Exception as e:
+        logger.debug(f"model identity {box}: {e}")
+    if model_ids:
+        # A multi-server box has one aggregate counter and therefore one
+        # canonical composite model identity for that aggregate rate.
+        model_identity_cache[box] = " + ".join(sorted(model_ids))
+    return model_identity_cache.get(box)
+
+
+def _upsert_model_tps_peak(conn, box, model_name, rate, observed_at):
+    """Persist a monotonic all-time peak for one exact (box, model) pair."""
+    if not model_name or rate is None or rate <= 0:
+        return
+    conn.execute("""
+        INSERT INTO model_tps_peaks (box, model_name, peak_tps, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(box, model_name) DO UPDATE SET
+            peak_tps = MAX(model_tps_peaks.peak_tps, excluded.peak_tps),
+            updated_at = CASE
+                WHEN excluded.peak_tps > model_tps_peaks.peak_tps
+                THEN excluded.updated_at ELSE model_tps_peaks.updated_at END
+    """, (box, model_name, float(rate), observed_at))
+
+
+def _counter_sample_deltas(samples):
+    """Yield model-aware counter deltas without crossing a model switch."""
+    deltas = []
+    for i in range(1, len(samples)):
+        ts, tok, sec, model_name = samples[i]
+        _pts, ptok, psec, previous_model = samples[i - 1]
+        if not model_name or model_name != previous_model:
+            continue
+        d_tok = tok - ptok
+        d_sec = (sec - psec) if sec is not None and psec is not None else 0.0
+        if d_tok < 0 or d_sec < 0:  # counter reset (llama-server restart)
+            d_tok, d_sec = tok, sec or 0.0
+        deltas.append((ts, d_tok, d_sec, model_name))
+    return deltas
+
+
+model_peaks_seed_lock = threading.Lock()
+model_peaks_seeded = False
+
+
+def _seed_model_tps_peaks(conn, current_models):
+    """Seed records from every history row present at migration/restart."""
+    global model_peaks_seeded
+    with model_peaks_seed_lock:
+        if model_peaks_seeded:
+            return
+        for box, model_name in current_models.items():
+            if model_name:
+                conn.execute(
+                    "UPDATE model_counter_samples SET model_name=? "
+                    "WHERE box=? AND (model_name IS NULL OR model_name='')",
+                    (model_name, box),
+                )
+        rows = conn.execute(
+            "SELECT box, ts, tokens_total, gen_seconds_total, model_name "
+            "FROM model_counter_samples ORDER BY box, ts"
+        ).fetchall()
+        by_box = {}
+        for box, ts, tok, sec, model_name in rows:
+            by_box.setdefault(box, []).append((ts, tok, sec, model_name))
+        for box, samples in by_box.items():
+            for ts, d_tok, d_sec, model_name in _counter_sample_deltas(samples):
+                if d_tok > 0 and d_sec > 0:
+                    _upsert_model_tps_peak(conn, box, model_name, d_tok / d_sec, ts)
+        for box, model_name, peak, observed_at in conn.execute(
+            "SELECT box, model, MAX(gen_tps), MAX(ts) FROM model_requests "
+            "WHERE model IS NOT NULL AND model != '' AND gen_tps > 0 "
+            "GROUP BY box, model"
+        ):
+            _upsert_model_tps_peak(conn, box, model_name, peak, observed_at)
+        conn.commit()
+        model_peaks_seeded = True
+
+def _parse_llamaswap_ts(ts):
+    """llama-swap timestamps are UTC RFC3339 with nanoseconds - normalize to
+    the local naive ISO format the rest of this file stores."""
+    try:
+        ts = re.sub(r"\.(\d{6})\d*", r".\1", ts).replace("Z", "+00:00")
+        return datetime.fromisoformat(ts).astimezone().replace(tzinfo=None).isoformat()
+    except Exception:
+        return None
+
+# --- Gateway-derived token stats (2026-07-29). aragorn serves via ollama, which
+# has NO token-counter endpoint, so its tokens/sec cannot come from the box.
+# LiteLLM already logs completion_tokens + start/end time for every request it
+# routes, which yields real measured tokens/sec for ANY route. Read over
+# `docker exec` (peer auth inside the container - no password in this file).
+GATEWAY_TOKENS_TTL = 45  # seconds
+gateway_tokens_cache = {"data": None, "ts": 0.0}
+gateway_tokens_lock = threading.Lock()
+
+# NOTE (2026-07-31): the day boundary below is now a {DAY_START} placeholder
+# rather than a hardcoded date_trunc, so /api/reset_stats?host=... can move it.
+# It was hardcoded, which is why clearing aragorn's numbers appeared to do
+# nothing - this path never consulted the reset marker at all.
+#
+# SEPARATE, AND WORSE: tps here is MAX(completion_tokens / request_wall_seconds).
+# For a short request that ratio is not a generation rate - a 200-token reply
+# that returns in 0.23s reads as 870 t/s. That is the origin of aragorn's
+# "877 peak", and it is a bad metric, not a fast machine. Fixing the metric is
+# a separate change; this one only makes the reset work.
+_GATEWAY_TOKENS_SQL = """
+WITH d AS (
+  SELECT model,
+         completion_tokens AS tok,
+         GREATEST(EXTRACT(epoch FROM ("endTime"-"startTime")), 0.001) AS secs,
+         "startTime" AS ts
+  FROM "LiteLLM_SpendLogs"
+  WHERE completion_tokens > 0
+    AND "startTime" >= now() - interval '7 days'
+)
+SELECT model,
+       COALESCE(SUM(tok)  FILTER (WHERE ts >= {DAY_START}), 0),
+       COALESCE(SUM(secs) FILTER (WHERE ts >= {DAY_START}), 0),
+       COALESCE(MAX(tok/secs) FILTER (WHERE ts >= {DAY_START}), 0),
+       COALESCE(MAX(tok/secs) FILTER (WHERE ts >= now() - interval '150 seconds'), 0),
+       COUNT(*) FILTER (WHERE ts >= now() - interval '1 hour'),
+       COUNT(*) FILTER (WHERE ts >= now() - interval '1 day'),
+       COUNT(*)
+FROM d GROUP BY model;
+"""
+
+
+def get_gateway_token_stats():
+    """model id -> measured token throughput, straight from the gateway's log."""
+    now_t = time.time()
+    with gateway_tokens_lock:
+        if gateway_tokens_cache["data"] is not None and (now_t - gateway_tokens_cache["ts"]) < GATEWAY_TOKENS_TTL:
+            return gateway_tokens_cache["data"]
+
+    stats = {}
+    try:
+        # Resolve the day boundary, honouring a fleet-wide ("*") reset. Per-host
+        # markers are applied after the fetch, below, because this query groups
+        # by MODEL and the model->host mapping lives in Python.
+        _fleet_start = stats_window_start()
+        _sql = _GATEWAY_TOKENS_SQL.replace(
+            "{DAY_START}", "TIMESTAMP '" + _fleet_start.replace("'", "") + "'")
+        out = subprocess.run(
+            ["docker", "exec", "litellm-db", "psql", "-U", "litellm", "-d", "litellm",
+             "-t", "-A", "-F", "|", "-c", _sql],
+            capture_output=True, text=True, timeout=15,
+        )
+        for line in out.stdout.strip().splitlines():
+            parts = line.split("|")
+            if len(parts) < 8:
+                continue
+            model = parts[0].split("/")[-1].strip()
+            tok, secs, peak, nowtps, h, d, w = (float(x) for x in parts[1:8])
+            stats[model] = {
+                "tokens_today": tok,
+                "seconds_today": secs,
+                "tps_max_today": round(peak, 1),
+                "tps_now": round(nowtps, 1),
+                "requests": {"hour": int(h), "day": int(d), "week": int(w)},
+            }
+    except Exception as e:
+        logger.debug(f"gateway token stats unavailable: {e}")
+
+    with gateway_tokens_lock:
+        gateway_tokens_cache["data"] = stats
+        gateway_tokens_cache["ts"] = time.time()
+    return stats
+
+
+def collect_model_serving():
+    """Background sampler: persist llama-swap request records + llama-server
+    counter samples into sqlite so windows survive restarts (both ours and
+    the model servers')."""
+    while True:
+        try:
+            conn = sqlite3.connect(CONFIG["db_path"])
+            # every plain llama-server box or multi-port server: one counter sample per cycle
+            for _box, _src in MODEL_SERVING_SOURCES.items():
+                model_name = _current_counter_model(_box, _src)
+                if _src.get("kind") == "llamacpp_multi":
+                    total_tok = 0.0
+                    total_sec = 0.0
+                    sampled = False
+                    for u in _src.get("urls", []):
+                        try:
+                            resp = requests.get(u, timeout=MODEL_SERVING_HTTP_TIMEOUT)
+                            if resp.ok:
+                                sampled = True
+                                for line in resp.text.splitlines():
+                                    if line.startswith("llamacpp:tokens_predicted_total "):
+                                        total_tok += float(line.split()[-1])
+                                    elif line.startswith("llamacpp:tokens_predicted_seconds_total "):
+                                        total_sec += float(line.split()[-1])
+                        except Exception as e:
+                            logger.debug(f"model serving sample {_box} ({u}): {e}")
+                    if sampled:
+                        sampled_at = datetime.now().isoformat()
+                        conn.execute(
+                            "INSERT OR IGNORE INTO model_counter_samples "
+                            "(box, ts, tokens_total, gen_seconds_total, model_name) VALUES (?,?,?,?,?)",
+                            (_box, sampled_at, total_tok, total_sec, model_name))
+                        previous = conn.execute(
+                            "SELECT ts, tokens_total, gen_seconds_total, model_name "
+                            "FROM model_counter_samples WHERE box=? AND ts<? ORDER BY ts DESC LIMIT 1",
+                            (_box, sampled_at),
+                        ).fetchone() if model_name else None
+                        if previous and previous[3] == model_name:
+                            d_tok = total_tok - previous[1]
+                            d_sec = total_sec - previous[2]
+                            if d_tok < 0 or d_sec < 0:
+                                d_tok, d_sec = total_tok, total_sec
+                            if d_tok > 0 and d_sec > 0:
+                                _upsert_model_tps_peak(
+                                    conn, _box, model_name, d_tok / d_sec, sampled_at)
+                elif _src.get("kind") == "llamacpp":
+                    try:
+                        resp = requests.get(_src["url"], timeout=MODEL_SERVING_HTTP_TIMEOUT)
+                        if resp.ok:
+                            vals = {}
+                            for line in resp.text.splitlines():
+                                for key in ("llamacpp:tokens_predicted_total ",
+                                            "llamacpp:tokens_predicted_seconds_total "):
+                                    if line.startswith(key):
+                                        vals[key.strip()] = float(line.split()[-1])
+                            if "llamacpp:tokens_predicted_total" in vals:
+                                sampled_at = datetime.now().isoformat()
+                                total_tok = vals.get("llamacpp:tokens_predicted_total")
+                                total_sec = vals.get("llamacpp:tokens_predicted_seconds_total")
+                                conn.execute(
+                                    "INSERT OR IGNORE INTO model_counter_samples "
+                                    "(box, ts, tokens_total, gen_seconds_total, model_name) VALUES (?,?,?,?,?)",
+                                    (_box, sampled_at, total_tok, total_sec, model_name))
+                                previous = conn.execute(
+                                    "SELECT ts, tokens_total, gen_seconds_total, model_name "
+                                    "FROM model_counter_samples WHERE box=? AND ts<? ORDER BY ts DESC LIMIT 1",
+                                    (_box, sampled_at),
+                                ).fetchone() if model_name else None
+                                if (previous and previous[3] == model_name
+                                        and total_sec is not None and previous[2] is not None):
+                                    d_tok = total_tok - previous[1]
+                                    d_sec = total_sec - previous[2]
+                                    if d_tok < 0 or d_sec < 0:
+                                        d_tok, d_sec = total_tok, total_sec
+                                    if d_tok > 0 and d_sec > 0:
+                                        _upsert_model_tps_peak(
+                                            conn, _box, model_name, d_tok / d_sec, sampled_at)
+                    except Exception as e:
+                        logger.debug(f"model serving sample {_box}: {e}")
+            cutoff = (datetime.now() - timedelta(days=MODEL_SERVING_RETENTION_DAYS)).isoformat()
+            conn.execute("DELETE FROM model_requests WHERE ts < ?", (cutoff,))
+            conn.execute("DELETE FROM model_counter_samples WHERE ts < ?", (cutoff,))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.warning(f"Model serving collection error: {e}")
+        time.sleep(MODEL_SERVING_INTERVAL)
+
+model_serving_cache = {"data": None, "ts": 0.0}
+model_serving_cache_lock = threading.Lock()
+MODEL_SERVING_CACHE_TTL = 30  # seconds
+
+# --- Stats reset marker (2026-07-30, Ben: "reset all the averages on the fleet
+# monitor"). After a config change - new models, speculation switched on - the
+# day's peaks and averages describe a machine that no longer exists, so they
+# mislead rather than inform. This does NOT delete history (the historical charts
+# still want it); it just moves the start of the "today" window forward.
+# Reset:  POST /api/reset_stats     Clear:  DELETE /api/reset_stats
+STATS_RESET_FILE = "/var/lib/queue-router/stats_reset_at"
+
+
+def stats_window_start(host=None):
+    """Start of the 'today' window: midnight, or a later reset if one is set.
+
+    PER-HOST since 2026-07-31 (Ben: "clear aragorn's peak and averages, they're
+    askew"). A fleet-wide reset would also throw away frodo's and gandalf's
+    legitimate numbers, so the marker file now holds a JSON map of
+    {host: iso-timestamp} plus an optional "*" entry meaning all hosts.
+    A bare timestamp (the pre-2026-07-31 format) is still read and treated as
+    "*", so an existing marker keeps working untouched.
+    """
+    midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    try:
+        with open(STATS_RESET_FILE) as fh:
+            raw = fh.read().strip()
+    except OSError:
+        return midnight
+    if not raw:
+        return midnight
+    try:
+        marks = json.loads(raw)
+        if not isinstance(marks, dict):
+            marks = {"*": str(marks)}
+    except (ValueError, TypeError):
+        marks = {"*": raw}          # legacy bare-timestamp file
+    candidates = [marks.get("*"), marks.get(host) if host else None]
+    best = midnight
+    for c in candidates:
+        # A marker from a previous day must not pin the window in the past.
+        if isinstance(c, str) and c > best:
+            best = c
+    return best
+
+
+def get_model_serving_stats():
+    """Per-box: tps_now, serving-time-only tps average today, requests served
+    in the last hour/day/week. Read from sqlite, cached 30s."""
+    now_t = time.time()
+    with model_serving_cache_lock:
+        if model_serving_cache["data"] is not None and (now_t - model_serving_cache["ts"]) < MODEL_SERVING_CACHE_TTL:
+            return model_serving_cache["data"]
+
+    now = datetime.now()
+    # Per-host reset windows; resolved per box below.
+    midnight = stats_window_start()   # fleet-wide floor (honours a "*" reset)
+    hour_ago = (now - timedelta(hours=1)).isoformat()
+    day_ago = (now - timedelta(days=1)).isoformat()
+    week_ago = (now - timedelta(days=7)).isoformat()
+    result = {}
+    try:
+        conn = sqlite3.connect(CONFIG["db_path"])
+        current_models = {
+            box: _current_counter_model(box, source)
+            for box, source in MODEL_SERVING_SOURCES.items()
+        }
+        _seed_model_tps_peaks(conn, current_models)
+
+        # (Gandalf is now sampled as llamacpp_multi via model_counter_samples below)
+
+        # every counter-sampled box (frodo, pippin) -> reset-aware deltas.
+        # Generalised 2026-07-29: pippin serves the `code` route, so Ben wants
+        # its tokens/sec on the card like the other model boxes.
+        def _bursts(ds):
+            """Requests can't be counted exactly from counters (llama-server
+            exposes no requests_total) - count busy-after-idle transitions in
+            the 60s samples as a lower-bound estimate."""
+            n = 0
+            prev_busy = False
+            for _, d_tok, _ in ds:
+                busy = d_tok > 0
+                if busy and not prev_busy:
+                    n += 1
+                prev_busy = busy
+            return n
+
+        for box, src in MODEL_SERVING_SOURCES.items():
+            if src.get("kind") not in ("llamacpp", "llamacpp_multi"):
+                continue
+            samples = conn.execute(
+                "SELECT ts, tokens_total, gen_seconds_total, model_name FROM model_counter_samples "
+                "WHERE box=? AND ts >= ? ORDER BY ts", (box, week_ago)).fetchall()
+            model_name = current_models.get(box)
+            if not model_name and samples:
+                model_name = samples[-1][3]
+            deltas = [
+                (ts, d_tok, d_sec)
+                for ts, d_tok, d_sec, delta_model in _counter_sample_deltas(samples)
+                if delta_model == model_name
+            ]
+            fresh = (
+                bool(samples)
+                and samples[-1][3] == model_name
+                and samples[-1][0] >= (now - timedelta(seconds=3 * MODEL_SERVING_INTERVAL)).isoformat()
+            )
+            tps_now = 0.0
+            if deltas and fresh:
+                _, d_tok, d_sec = deltas[-1]
+                tps_now = round(d_tok / d_sec, 1) if d_tok > 0 and d_sec > 0 else 0.0
+            box_start = stats_window_start(box)   # per-host reset window
+            today = [d for d in deltas if d[0] >= box_start]
+            tok_today = sum(d[1] for d in today if d[1] > 0)
+            sec_today = sum(d[2] for d in today if d[1] > 0)
+            # Peak 60s-window generation speed today (bottom band of the t/s strip).
+            _win_tps = [d[1] / d[2] for d in today if d[1] > 0 and d[2] > 0]
+            record_row = conn.execute(
+                "SELECT peak_tps FROM model_tps_peaks WHERE box=? AND model_name=?",
+                (box, model_name),
+            ).fetchone() if model_name else None
+            result[box] = {
+                "available": len(samples) >= 2 and fresh,
+                "model_name": model_name,
+                "tps_now": tps_now,
+                "tps_avg_today": round(tok_today / sec_today, 1) if sec_today > 0 else 0.0,
+                "tps_max_today": round(max(_win_tps), 1) if _win_tps else 0.0,
+                "tps_record": round(record_row[0], 1) if record_row else 0.0,
+                "serving_minutes_today": round(sec_today / 60),
+                "requests": {
+                    "hour": _bursts([d for d in deltas if d[0] >= hour_ago]),
+                    "day": _bursts([d for d in deltas if d[0] >= day_ago]),
+                    "week": _bursts(deltas),
+                },
+                "approx_requests": True,
+            }
+        conn.close()
+    except Exception as e:
+        logger.warning(f"model serving stats failed: {e}")
+        for box in MODEL_SERVING_SOURCES:
+            result.setdefault(box, {"available": False})
+
+    # Boxes with no native token counters (ollama) get their numbers from the
+    # gateway's request log instead - measured, not estimated.
+    try:
+        gw = get_gateway_token_stats()
+        topo = get_route_topology()
+        by_box = {}
+        for route, info in topo.items():
+            if info.get("box") in MODEL_SERVING_SOURCES:
+                continue  # native counters win
+            by_box.setdefault(info["box"], set()).add(info.get("model"))
+        for box, models in by_box.items():
+            # Per-host reset (2026-07-31). This gateway-derived path groups by
+            # MODEL, so a per-host marker can only be applied here, where the
+            # model->box mapping exists. If this box was reset after the fleet
+            # window began, its today-figures are zeroed rather than shown
+            # stale: the underlying spend-log query cannot be re-cut per box
+            # without a second round-trip, and showing the OLD number after an
+            # explicit reset is the worse failure.
+            _box_start = stats_window_start(box)
+            if _box_start > stats_window_start():
+                result[box] = {
+                    "available": True, "source": "gateway", "reset": _box_start,
+                    "model_name": " + ".join(sorted(m for m in models if m)),
+                    "tps_now": 0.0, "tps_avg_today": 0.0, "tps_max_today": 0.0,
+                    "tps_record": 0.0,
+                    "serving_minutes_today": 0,
+                    "requests": {"hour": 0, "day": 0, "week": 0},
+                }
+                continue
+            rows = [gw[m] for m in models if m in gw]
+            if not rows:
+                result.setdefault(box, {"available": False, "source": "gateway"})
+                continue
+            tok = sum(r["tokens_today"] for r in rows)
+            secs = sum(r["seconds_today"] for r in rows)
+            result[box] = {
+                "available": True,
+                "source": "gateway",
+                "model_name": " + ".join(sorted(m for m in models if m)),
+                "tps_now": max(r["tps_now"] for r in rows),
+                "tps_avg_today": round(tok / secs, 1) if secs > 0 else 0.0,
+                "tps_max_today": max(r["tps_max_today"] for r in rows),
+                "tps_record": max(r["tps_max_today"] for r in rows),
+                "serving_minutes_today": round(secs / 60),
+                "requests": {
+                    "hour": sum(r["requests"]["hour"] for r in rows),
+                    "day": sum(r["requests"]["day"] for r in rows),
+                    "week": sum(r["requests"]["week"] for r in rows),
+                },
+                "approx_requests": False,
+            }
+    except Exception as e:
+        logger.debug(f"gateway-derived serving stats failed: {e}")
+
+    with model_serving_cache_lock:
+        model_serving_cache["data"] = result
+        model_serving_cache["ts"] = time.time()
     return result
 
 def get_mac_metrics(host, user):
@@ -1076,13 +3149,9 @@ def get_mac_metrics(host, user):
     return result
 
 
-def get_target_status(target_name, target_config, fast=False):
-    """Check a target's availability and gather live metrics.
-
-    Linux targets are probed via ComfyUI HTTP + SSH (nvidia-smi). Mac targets
-    have no ComfyUI here, so they report online via SSH and use native metrics.
-    """
-    result = {
+def offline_target_status(target_config):
+    """Full dashboard shape for a target whose live probes failed."""
+    return {
         "online": False,
         "os": target_config.get("os", "linux"),
         "queue_running": 0,
@@ -1090,6 +3159,7 @@ def get_target_status(target_name, target_config, fast=False):
         "gpu": None,
         "ram": None,
         "cpu_percent": None,
+        "cpu_temp": None,
         "gpu_watts": None,
         "gpu_temp": None,
         "gpu_util": None,
@@ -1098,8 +3168,18 @@ def get_target_status(target_name, target_config, fast=False):
         "disk": None,
         "swap": None,
         "disk_io": None,
-        "net_io": None
+        "net_io": None,
+        "loaded_models": None,
     }
+
+
+def get_target_status(target_name, target_config, fast=False):
+    """Check a target's availability and gather live metrics.
+
+    Linux targets are probed via ComfyUI HTTP + SSH (nvidia-smi). Mac targets
+    have no ComfyUI here, so they report online via SSH and use native metrics.
+    """
+    result = offline_target_status(target_config)
 
     # macOS targets: no ComfyUI/nvidia-smi, gather native metrics over SSH
     if target_config.get("os") == "mac":
@@ -1124,6 +3204,14 @@ def get_target_status(target_name, target_config, fast=False):
                     }
             except Exception as e:
                 logger.warning(f"{target_name} Mac metrics unreachable: {e}")
+        # Macs return early, so their loaded-model read happens here (pippin
+        # serves the `code` route - Ben, 2026-07-29: "if it can run a local AI,
+        # I want it on that screen").
+        if target_config.get("model_status_urls"):
+            try:
+                result["loaded_models"] = get_loaded_models(target_name, target_config)
+            except Exception as e:
+                logger.debug(f"{target_name} loaded-model read failed: {e}")
         return result
 
     # Try ComfyUI HTTP endpoints
@@ -1180,22 +3268,62 @@ def get_target_status(target_name, target_config, fast=False):
     except Exception as e:
         logger.warning(f"{target_name} ComfyUI unreachable: {e}")
 
-    if fast and not result["online"]:
-        return result
-
     # Get SSH metrics (CPU, GPU power, temp, util, swap, I/O) - independent of ComfyUI status
     if "ssh_host" in target_config:
         try:
+            # expected_host: verify the box is the one this card names before
+            # trusting its dials (2026-07-30 wrong-box guard). NOTE the card is
+            # called "pippin" but that machine's hostname is "pippen" - a real
+            # spelling difference, not a mismatch, hence TARGET_HOSTNAME_AKA.
             ssh_metrics = get_ssh_metrics(
                 target_config["ssh_host"],
-                target_config.get("ssh_user", "ben")
+                target_config.get("ssh_user", "ben"),
+                expected_host=target_name,
+                hostname_aka=TARGET_HOSTNAME_AKA.get(target_name, ()),
             )
+            if ssh_metrics.get("mismatch"):
+                # Wrong machine answered. Report the card as NOT online and carry
+                # the mismatch through, rather than showing another box's numbers.
+                result["online"] = False
+                result["mismatch"] = True
+                result["reported_host"] = ssh_metrics.get("reported_host")
+                return result
             result["cpu_percent"] = ssh_metrics.get("cpu_percent")
+            result["cpu_temp"] = ssh_metrics.get("cpu_temp")
+            result["gpu_count"] = ssh_metrics.get("gpu_count")
             result["gpu_watts"] = ssh_metrics.get("gpu_watts")
             result["gpu_temp"] = ssh_metrics.get("gpu_temp")
             result["gpu_util"] = ssh_metrics.get("gpu_util")
             if ssh_metrics.get("gpu_power_limit"):
                 result["gpu_power_limit"] = ssh_metrics["gpu_power_limit"]
+
+            # /api/status uses this data even when ComfyUI is intentionally down.
+            # Previously its fast path returned before SSH, leaving Frodo's dial
+            # values null despite the machine and nvidia-smi being healthy.
+            if any(ssh_metrics.get(key) is not None for key in (
+                "cpu_percent", "gpu_watts", "gpu_temp", "gpu_util"
+            )):
+                result["online"] = True
+
+            if result["gpu"] is None and ssh_metrics.get("vram_total_gb") is not None:
+                result["gpu"] = {
+                    "name": ssh_metrics.get("gpu_name") or "Unknown",
+                    "cuda_version": None,
+                    "vram_total_gb": ssh_metrics["vram_total_gb"],
+                    "vram_used_gb": ssh_metrics["vram_used_gb"],
+                    "vram_percent": ssh_metrics["vram_percent"],
+                }
+
+            # System RAM: fall back to the SSH reading when ComfyUI's
+            # /system_stats didn't provide it (ComfyUI is disabled fleet-wide
+            # since 2026-07-25, so in practice this IS the source now) - same
+            # fallback pattern as the GPU/VRAM block above.
+            if result["ram"] is None and ssh_metrics.get("ram_total_gb") is not None:
+                result["ram"] = {
+                    "total_gb": ssh_metrics["ram_total_gb"],
+                    "used_gb": ssh_metrics["ram_used_gb"],
+                    "percent": ssh_metrics["ram_percent"],
+                }
 
             # Swap usage
             if ssh_metrics.get("swap_total_gb") is not None:
@@ -1227,90 +3355,336 @@ def get_target_status(target_name, target_config, fast=False):
             )
             if disk_usage.get("total_gb"):
                 result["disk"] = disk_usage
+
+            if target_config.get("model_status_urls"):
+                result["loaded_models"] = get_loaded_models(target_name, target_config)
+            elif target_config.get("ollama_instances"):
+                result["loaded_models"] = get_ollama_loaded_models(target_config)
         except Exception as e:
             logger.warning(f"{target_name} SSH unreachable: {e}")
 
     return result
 
+
+# ── Shipping pipeline snapshot (ported forward from bak-20260725; Gemini fleet monitor consumes /api/pipeline) ──
+PIPELINE_CACHE_TTL = 45  # seconds - must match CI_QUEUE_CACHE_TTL so ci_running measurement scope is consistent
+pipeline_cache = {"data": None, "ts": 0.0}
+pipeline_cache_lock = threading.Lock()
+pipeline_gh_failing_since = None
+pipeline_last_good = None
+
+def get_pipeline_status():
+    """Shipping-pipeline snapshot for armbrain: issues -> PRs -> CI -> merged
+    today -> deployed today. Read-only GitHub queries, cached 5 min."""
+    now = time.time()
+    with pipeline_cache_lock:
+        if pipeline_cache["data"] is not None and (now - pipeline_cache["ts"]) < PIPELINE_CACHE_TTL:
+            return pipeline_cache["data"]
+
+    global pipeline_gh_failing_since, pipeline_last_good
+    result = {
+        "available": False,
+        "repo": GITHUB_CI_REPO,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    github_reads_ok = False
+    github_fetches_ok = True
+    token = get_gh_ci_token()
+    if token:
+        try:
+            headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
+            # "Today" is CENTRAL TIME (Ben's day), not UTC - counters were resetting at 7pm CT.
+            from zoneinfo import ZoneInfo
+            from datetime import timedelta
+            CT = ZoneInfo("America/Chicago")
+            now_ct = datetime.now(CT)
+            ct_midnight_utc = now_ct.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+            today = ct_midnight_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+            def search_count(q):
+                nonlocal github_fetches_ok
+                r = requests.get("https://api.github.com/search/issues",
+                                 params={"q": q, "per_page": 1}, headers=headers, timeout=8)
+                if not r.ok:
+                    github_fetches_ok = False
+                    logger.warning("GitHub search_count fetch failed: HTTP %s", r.status_code)
+                    return None
+                return r.json().get("total_count", 0)
+            result["issues_open"] = search_count(f"repo:{GITHUB_CI_REPO} type:issue state:open")
+            result["prs_open"] = search_count(f"repo:{GITHUB_CI_REPO} type:pr state:open")
+            result["merged_today"] = search_count(f"repo:{GITHUB_CI_REPO} type:pr merged:>={today}")
+            # merged in last 60 minutes
+            hour_ago = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            result["merged_last_hour"] = search_count(f"repo:{GITHUB_CI_REPO} type:pr merged:>={hour_ago}")
+            # most recent merge timestamp
+            result["last_merge_at"] = None
+            try:
+                r = requests.get(f"https://api.github.com/repos/{GITHUB_CI_REPO}/pulls",
+                                 params={"state": "closed", "sort": "updated", "direction": "desc", "per_page": 30},
+                                 headers=headers, timeout=8)
+                if r.ok:
+                    prs = r.json()
+                    merged_at_times = [pr.get("merged_at") for pr in prs if pr.get("merged_at")]
+                    if merged_at_times:
+                        result["last_merge_at"] = max(merged_at_times)
+                else:
+                    logger.warning("GitHub last-merge fetch failed: HTTP %s", r.status_code)
+            except Exception as e:
+                logger.warning(f"last-merge lookup failed: {e}")
+            spark = []
+            for i in range(6, 0, -1):
+                d0 = (now_ct - timedelta(days=i)).replace(hour=0, minute=0, second=0, microsecond=0)
+                d1 = d0 + timedelta(days=1)
+                q = (f"repo:{GITHUB_CI_REPO} type:pr merged:{d0.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}"
+                     f"..{d1.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}")
+                count = search_count(q)
+                spark.append(count if count is not None else 0)
+            spark.append(result.get("merged_today") or 0)
+            result["merged_spark"] = spark
+            ci = get_ci_queue_status()
+            result["ci_queued"] = ci.get("queued", 0) if ci.get("available") else None
+            # The shipping strip is a workflow-run count, matching the queued
+            # number and allowing an exact, bounded-cost GitHub verification.
+            # Job/runner detail remains available on /api/ci_queue.
+            result["ci_running"] = ci.get("in_progress", 0) if ci.get("available") else None
+            # deploys today (Gateway Deploy workflow - paginated & filtered in Central Time)
+            week_start = (now_ct - timedelta(days=6)).replace(hour=0, minute=0, second=0, microsecond=0)
+            dep_ok = dep_fail = dep_live = 0
+            live_started_min = None
+            dep_days = [0] * 7
+            deploy_url = f"https://api.github.com/repos/{GITHUB_CI_REPO}/actions/workflows/gateway-deploy.yml/runs"
+            for page in (1, 2, 3):
+                r = requests.get(deploy_url, params={"created": f">={week_start.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}", "per_page": 100, "page": page}, headers=headers, timeout=8)
+                if not r.ok:
+                    github_fetches_ok = False
+                    logger.warning("GitHub deploy-runs fetch failed: HTTP %s", r.status_code)
+                    break
+                runs = r.json().get("workflow_runs", [])
+                if not runs:
+                    break
+                for run in runs:
+                    run_ct = None
+                    try:
+                        run_ct = datetime.strptime(run.get("created_at"), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).astimezone(CT)
+                    except Exception:
+                        pass
+                    if run_ct is None:
+                        continue
+                    days_ago = (now_ct.date() - run_ct.date()).days
+                    idx = 6 - days_ago
+                    is_today = (run_ct.date() == now_ct.date())
+                    # Only count ACTUAL production deploy triggers (push to main or workflow_dispatch).
+                    # Exclude merge_group, pull_request, and scheduled test-runs from deploy counters (Ben 2026-08-07).
+                    if run.get("event") not in ("push", "workflow_dispatch"):
+                        continue
+                    if run.get("status") == "completed" and run.get("conclusion") == "success":
+                        if 0 <= idx <= 6:
+                            dep_days[idx] += 1
+                        if is_today:
+                            dep_ok += 1
+                    elif run.get("status") != "completed":
+                        if is_today:
+                            dep_live += 1
+                            try:
+                                t = datetime.strptime(run.get("run_started_at") or run.get("created_at"), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                                m = int((datetime.now(timezone.utc) - t).total_seconds() // 60)
+                                live_started_min = m if live_started_min is None else min(live_started_min, m)
+                            except Exception:
+                                pass
+                    elif run.get("conclusion") not in ("cancelled", "skipped"):
+                        if is_today:
+                            dep_fail += 1
+            result["deploys_spark"] = dep_days
+            result.update({"deploys_ok_today": dep_ok, "deploys_failed_today": dep_fail,
+                           "deploys_in_flight": dep_live, "deploy_started_min": live_started_min})
+            # Last REAL deployment: newest completed run whose `deploy` JOB
+            # succeeded (a green run can be validation-only with deploy
+            # skipped, so run conclusion alone is not enough).
+            try:
+                found = False
+                for page in (1, 2):
+                    if found:
+                        break
+                    r = requests.get(f"https://api.github.com/repos/{GITHUB_CI_REPO}/actions/workflows/gateway-deploy.yml/runs",
+                                     params={"status": "completed", "branch": "main",
+                                             "per_page": 100, "page": page},
+                                     headers=headers, timeout=8)
+                    if not r.ok:
+                        github_fetches_ok = False
+                        logger.warning("GitHub deploy-runs fetch failed: HTTP %s", r.status_code)
+                        break
+                    runs = r.json().get("workflow_runs", [])
+                    if not runs:
+                        break
+                    for run in runs:
+                        # scheduled guard ticks never run the deploy job — skip
+                        # them without burning a jobs API call (same event
+                        # filter the deploy-guard itself uses).
+                        if run.get("event") not in ("push", "workflow_dispatch"):
+                            continue
+                        jr = requests.get(run["jobs_url"], params={"per_page": 100},
+                                          headers=headers, timeout=8)
+                        if not jr.ok:
+                            github_fetches_ok = False
+                            logger.warning("GitHub deploy-jobs fetch failed: HTTP %s", jr.status_code)
+                            continue
+                        dep_job = next((j for j in jr.json().get("jobs", [])
+                                        if j.get("name") == "deploy" and j.get("conclusion") == "success"), None)
+                        if dep_job:
+                            result["last_deploy_at"] = dep_job.get("completed_at") or run.get("updated_at")
+                            result["last_deploy_sha"] = (run.get("head_sha") or "")[:9]
+                            found = True
+                            break
+            except Exception as e:
+                github_fetches_ok = False
+                logger.warning(f"last-deploy lookup failed: {e}")
+            github_reads_ok = github_fetches_ok and all(result.get(field) is not None for field in (
+                "issues_open", "prs_open", "merged_today", "ci_queued", "ci_running"
+            ))
+        except Exception as e:
+            logger.warning(f"pipeline status failed: {e}")
+
+    if github_reads_ok:
+        pipeline_gh_failing_since = None
+        result["available"] = True
+        result["degraded"] = False
+        result["generated_at"] = datetime.now(timezone.utc).isoformat()
+        pipeline_last_good = dict(result)
+    else:
+        if pipeline_gh_failing_since is None:
+            pipeline_gh_failing_since = datetime.now(timezone.utc).isoformat()
+        if pipeline_last_good is not None:
+            result = dict(pipeline_last_good)
+            result["degraded"] = True
+        result["gh_auth_failing_since"] = pipeline_gh_failing_since
+
+    with pipeline_cache_lock:
+        pipeline_cache["data"] = result
+        pipeline_cache["ts"] = time.time()
+    return result
+
+
+@app.route("/api/pipeline", methods=["GET"])
+def api_pipeline():
+    # Pipeline metadata is relatively expensive and cached, but queue depth is
+    # volatile. Overlay the short-lived CI snapshot so the strip does not keep
+    # claiming a superseded running/queued count for the full pipeline TTL.
+    result = dict(get_pipeline_status())
+    ci = get_ci_queue_status()
+    if ci.get("available"):
+        result["ci_queued"] = ci.get("queued", 0)
+        result["ci_running"] = ci.get("in_progress", 0)
+    return jsonify(result)
+
+
 @app.route("/api/status", methods=["GET"])
 def get_status():
     """Get status of all targets and recent jobs."""
-    targets_status = {}
-    with ThreadPoolExecutor(max_workers=max(1, len(CONFIG["targets"]))) as executor:
+    results = {
+        name: offline_target_status(config)
+        for name, config in CONFIG["targets"].items()
+    }
+    executor = ThreadPoolExecutor(max_workers=max(1, len(CONFIG["targets"])))
+    try:
         futures = {
             executor.submit(get_target_status, name, config, True): (name, config)
             for name, config in CONFIG["targets"].items()
         }
-        results = {}
-        for future in as_completed(futures):
+        done, pending = wait(futures, timeout=STATUS_PROBE_TIMEOUT)
+        for future in done:
             name, config = futures[future]
             try:
                 status = future.result()
+                if not isinstance(status, dict):
+                    raise TypeError("target status was not an object")
             except Exception as e:
                 logger.warning(f"{name} status unavailable: {e}")
-                status = {
-                    "online": False,
-                    "os": config.get("os", "linux"),
-                    "queue_running": 0,
-                    "queue_pending": 0,
-                    "gpu": None,
-                    "ram": None,
-                    "cpu_percent": None,
-                    "gpu_watts": None,
-                    "gpu_temp": None,
-                    "gpu_util": None,
-                    "gpu_power_limit": config.get("gpu_power_limit", 300),
-                    "gpu_power_max": config.get("gpu_power_max", 400),
-                    "disk": None,
-                    "swap": None,
-                    "disk_io": None,
-                    "net_io": None,
-                }
-            results[name] = {
-                **status,
-                # Display-only smoothing: don't let one slow/busy probe flip
-                # the dashboard to a false OFFLINE alarm (see apply_display_hysteresis).
-                "online": apply_display_hysteresis(name, status["online"]),
-                "vram_gb": config.get("vram_gb"),
-                "net": config.get("net"),
-                "url": config.get("url")
-            }
+                status = offline_target_status(config)
+            results[name] = {**offline_target_status(config), **status}
+        for future in pending:
+            name, _ = futures[future]
+            logger.warning(
+                f"{name} status probe exceeded {STATUS_PROBE_TIMEOUT}s; using offline stub"
+            )
+            future.cancel()
+    finally:
+        # Do not wait for a slow host after the endpoint's response deadline.
+        executor.shutdown(wait=False, cancel_futures=True)
 
     # Preserve CONFIG order (gandalf, frodo, pippin) regardless of completion order
-    targets_status = {name: results[name] for name in CONFIG["targets"] if name in results}
+    targets_status = {
+        name: {
+            **results[name],
+            # Display-only smoothing: don't let one slow/busy probe flip
+            # the dashboard to a false OFFLINE alarm (see apply_display_hysteresis).
+            # A completely empty fail-soft stub is definitively offline.
+            "online": (
+                False
+                if not results[name]["online"] and not any(
+                    results[name].get(key) is not None
+                    for key in ("gpu", "ram", "cpu_percent", "gpu_watts", "gpu_temp")
+                )
+                else apply_display_hysteresis(name, results[name]["online"])
+            ),
+            "vram_gb": config.get("vram_gb"),
+            "url": config.get("url"),
+        }
+        for name, config in CONFIG["targets"].items()
+    }
 
-    conn = sqlite3.connect(CONFIG["db_path"])
+    today_start = stats_window_start()   # honours a manual reset
+    jobs_today = {}
+    max_util_today = {}
+    peaks_today = {}
+    recent_jobs = []
+    conn = None
+    try:
+        conn = sqlite3.connect(CONFIG["db_path"])
 
-    # Get jobs today count per target
-    today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-    cursor = conn.execute(
-        "SELECT target, COUNT(*) FROM jobs WHERE submitted_at >= ? GROUP BY target",
-        (today_start,)
-    )
-    jobs_today = {row[0]: row[1] for row in cursor.fetchall()}
+        cursor = conn.execute(
+            "SELECT target, COUNT(*) FROM jobs WHERE submitted_at >= ? GROUP BY target",
+            (today_start,)
+        )
+        jobs_today = {row[0]: row[1] for row in cursor.fetchall()}
 
-    # Add jobs_today to each target
+        cursor = conn.execute(
+            "SELECT target, MAX(gpu_util) FROM metrics_history WHERE timestamp >= ? GROUP BY target",
+            (today_start,)
+        )
+        max_util_today = {row[0]: row[1] for row in cursor.fetchall()}
+
+        # Daily high-water mark for EVERY metric, not just GPU use (Ben,
+        # 2026-07-30: he wants the amplifier-style peak-hold marker on all the
+        # dials and bars). Every column is already recorded per poll.
+        cursor = conn.execute(
+            "SELECT target, MAX(gpu_temp), MAX(gpu_watts), MAX(cpu_percent), "
+            "MAX(vram_percent), MAX(ram_percent), MAX(swap_percent) "
+            "FROM metrics_history WHERE timestamp >= ? GROUP BY target",
+            (today_start,)
+        )
+        for row in cursor.fetchall():
+            peaks_today[row[0]] = {
+                "gpu_temp": row[1], "gpu_watts": row[2], "cpu_percent": row[3],
+                "vram_percent": row[4], "ram_percent": row[5], "swap_percent": row[6],
+            }
+
+        cursor = conn.execute(
+            "SELECT id, target, status, submitted_at FROM jobs ORDER BY submitted_at DESC LIMIT 10"
+        )
+        recent_jobs = [
+            {"id": row[0], "target": row[1], "status": row[2], "submitted_at": row[3]}
+            for row in cursor.fetchall()
+        ]
+    except Exception as e:
+        logger.warning(f"status history unavailable: {e}")
+    finally:
+        if conn is not None:
+            conn.close()
+
     for name in targets_status:
         targets_status[name]["jobs_today"] = jobs_today.get(name, 0)
-
-    # Max GPU utilization today per target (from collected metrics)
-    cursor = conn.execute(
-        "SELECT target, MAX(gpu_util) FROM metrics_history WHERE timestamp >= ? GROUP BY target",
-        (today_start,)
-    )
-    max_util_today = {row[0]: row[1] for row in cursor.fetchall()}
-    for name in targets_status:
         v = max_util_today.get(name)
         targets_status[name]["max_util_today"] = round(v) if v is not None else None
-
-    cursor = conn.execute(
-        "SELECT id, target, status, submitted_at FROM jobs ORDER BY submitted_at DESC LIMIT 10"
-    )
-    recent_jobs = [
-        {"id": row[0], "target": row[1], "status": row[2], "submitted_at": row[3]}
-        for row in cursor.fetchall()
-    ]
-    conn.close()
+        targets_status[name]["peaks_today"] = peaks_today.get(name, {})
 
     return jsonify({
         "targets": targets_status,
@@ -1345,88 +3719,100 @@ def get_fleet():
 
     return jsonify(ordered)
 
-
-pipeline_cache = {"data": None, "ts": 0.0}
-pipeline_cache_lock = threading.Lock()
-PIPELINE_CACHE_TTL = 300  # seconds
-
-def get_pipeline_status():
-    """Shipping-pipeline snapshot for armbrain: issues -> PRs -> CI -> merged
-    today -> deployed today. Read-only GitHub queries, cached 5 min."""
-    now = time.time()
-    with pipeline_cache_lock:
-        if pipeline_cache["data"] is not None and (now - pipeline_cache["ts"]) < PIPELINE_CACHE_TTL:
-            return pipeline_cache["data"]
-
-    result = {"available": False, "repo": GITHUB_CI_REPO}
-    token = get_gh_ci_token()
-    if token:
-        try:
-            from datetime import datetime, timezone
-            headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
-            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            def search_count(q):
-                r = requests.get("https://api.github.com/search/issues",
-                                 params={"q": q, "per_page": 1}, headers=headers, timeout=8)
-                return r.json().get("total_count", 0) if r.ok else None
-            result["issues_open"] = search_count(f"repo:{GITHUB_CI_REPO} type:issue state:open")
-            result["prs_open"] = search_count(f"repo:{GITHUB_CI_REPO} type:pr state:open")
-            result["merged_today"] = search_count(f"repo:{GITHUB_CI_REPO} type:pr merged:>={today}")
-            ci = get_ci_queue_status()
-            result["ci_queued"] = ci.get("queued", 0) if ci.get("available") else None
-            result["ci_running"] = ci.get("in_progress", 0) if ci.get("available") else None
-            # deploys today (Gateway Deploy workflow)
-            r = requests.get(f"https://api.github.com/repos/{GITHUB_CI_REPO}/actions/runs",
-                             params={"created": f">={today}", "per_page": 100}, headers=headers, timeout=8)
-            dep_ok = dep_fail = dep_live = 0
-            live_started_min = None
-            if r.ok:
-                for run in r.json().get("workflow_runs", []):
-                    if run.get("name") != "Gateway Deploy":
-                        continue
-                    if run.get("status") != "completed":
-                        dep_live += 1
-                        try:
-                            t = datetime.strptime(run.get("run_started_at") or run.get("created_at"),
-                                                  "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-                            m = int((datetime.now(timezone.utc) - t).total_seconds() // 60)
-                            live_started_min = m if live_started_min is None else min(live_started_min, m)
-                        except Exception:
-                            pass
-                    elif run.get("conclusion") == "success":
-                        dep_ok += 1
-                    elif run.get("conclusion") not in ("cancelled", "skipped"):
-                        dep_fail += 1
-            result.update({"deploys_ok_today": dep_ok, "deploys_failed_today": dep_fail,
-                           "deploys_in_flight": dep_live, "deploy_started_min": live_started_min})
-            result["available"] = True
-        except Exception as e:
-            logger.warning(f"pipeline status failed: {e}")
-
-    with pipeline_cache_lock:
-        pipeline_cache["data"] = result
-        pipeline_cache["ts"] = time.time()
-    return result
-
-@app.route("/api/pipeline", methods=["GET"])
-def api_pipeline():
-    return jsonify(get_pipeline_status())
-
-@app.route("/api/cascade", methods=["GET"])
-def api_cascade():
-    """Dollar-zero task rate and route waterfall from cascade-scraper."""
-    report = load_cascade_report(CASCADE_REPORT_PATH)
-    return jsonify(report), (200 if report["available"] else 503)
-
 @app.route("/api/ci_queue", methods=["GET"])
 def api_ci_queue():
     """Queued/running GitHub Actions counts for armbrain-io/armbrain (cached)."""
     return jsonify(get_ci_queue_status())
 
+@app.route("/api/runson", methods=["GET"])
+def api_runson():
+    """RunsOn runner usage, trial fuse, and AWS credits (cached)."""
+    return jsonify(get_runson_status())
+
+@app.route("/api/reset_stats", methods=["POST", "DELETE"])
+def api_reset_stats():
+    """Reset today's peaks and averages without destroying history."""
+    try:
+        if request.method == "DELETE":
+            try:
+                os.remove(STATS_RESET_FILE)
+            except FileNotFoundError:
+                pass
+            return jsonify({"reset_at": None, "note": "back to midnight"})
+        now_iso = datetime.now().isoformat()
+        # Optional ?host=aragorn (or JSON {"host": ...}) resets ONE box; omitting
+        # it resets the fleet, which is the historical behaviour. Per-host was
+        # added 2026-07-31 so clearing one machine's skewed numbers no longer
+        # discards every other machine's legitimate ones.
+        host = request.args.get("host") or (request.get_json(silent=True) or {}).get("host")
+        os.makedirs(os.path.dirname(STATS_RESET_FILE), exist_ok=True)
+        marks = {}
+        try:
+            with open(STATS_RESET_FILE) as fh:
+                raw = fh.read().strip()
+            if raw:
+                parsed = json.loads(raw)
+                marks = parsed if isinstance(parsed, dict) else {"*": str(parsed)}
+        except (OSError, ValueError, TypeError):
+            marks = {}
+        marks[host or "*"] = now_iso
+        with open(STATS_RESET_FILE, "w") as fh:
+            fh.write(json.dumps(marks))
+        # Drop the cached stats so the reset shows up immediately rather than
+        # after the next cache expiry.
+        with model_serving_cache_lock:
+            model_serving_cache["data"] = None
+            model_serving_cache["ts"] = 0.0
+        return jsonify({"reset_at": now_iso, "host": host or "*", "markers": marks})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/armbrain-logo.svg", methods=["GET"])
+def armbrain_logo():
+    """The real Armbrain mark, recoloured in the brand's own indigo/coral.
+    Lives next to this file on purpose - the original is in an armbrain
+    worktree that can be deleted at any time."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "armbrain-logo.svg")
+    try:
+        with open(path) as fh:
+            return Response(fh.read(), mimetype="image/svg+xml",
+                            headers={"Cache-Control": "public, max-age=86400"})
+    except OSError:
+        return Response("", status=404)
+
+
+@app.route("/api/model_serving", methods=["GET"])
+def api_model_serving():
+    """Tokens/sec dials (now + today-while-serving) and requests served
+    (hour/day/week) for the model boxes."""
+    return jsonify(get_model_serving_stats())
+
+@app.route("/api/fleet_stats", methods=["GET"])
+def api_fleet_stats():
+    """Compact stats bar: CLI agent sessions per box + CI runner busy/total."""
+    return jsonify(get_fleet_stats())
+
 @app.route("/api/model_routes", methods=["GET"])
 def api_model_routes():
     """Live/missing status for each 🔒 local fleet-gateway route (cached)."""
     return jsonify(get_model_route_health())
+
+@app.route("/api/vram-processes", methods=["GET"])
+def api_vram_processes():
+    """Live VRAM processes per target GPU (cached for 5s)."""
+    target = request.args.get("target")
+    if target:
+        if target in CONFIG["targets"]:
+            return jsonify({target: get_vram_processes(target)})
+        else:
+            return jsonify({"error": f"Unknown target '{target}'"}), 404
+
+    results = {}
+    for name, config in CONFIG["targets"].items():
+        if config.get("os") != "mac":
+            results[name] = get_vram_processes(name)
+    return jsonify(results)
 
 @app.route("/api/fleet_power", methods=["POST"])
 def fleet_power():
@@ -1457,10 +3843,11 @@ def fleet_power():
 
         # reboot / shutdown
         if cfg.get("local"):
-            # Hard-disabled 2026-07-21: the dashboard now runs on gandalf, the
-            # fleet hub — a "local" reboot would take down the hub. No node
-            # should be configured local anymore; SSH-manage everything.
-            return jsonify({"error": "Local reboot disabled — this host is the fleet hub"}), 400
+            import subprocess
+            logger.info("Self-reboot requested from dashboard")
+            send_notification("🔄 Gandalf reboot", "Dashboard-triggered self reboot")
+            subprocess.Popen(["bash", "-c", "sleep 2; sudo -n systemctl reboot"])
+            return jsonify({"success": True, "node": node, "action": "reboot"})
         client = get_ssh_client(cfg["ssh_host"], cfg.get("ssh_user", "ben"))
         if client is None:
             return jsonify({"error": f"SSH circuit breaker open for {node}"}), 503
@@ -1641,6 +4028,7 @@ def api_power():
 def index():
     """Dashboard home page."""
     return '''<!DOCTYPE html><html><head><title>GANDALF // FLEET MONITOR</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230a0d14'/%3E%3Crect x='6' y='6' width='20' height='20' rx='2' fill='%23111827' stroke='%23374151' stroke-width='1'/%3E%3Crect x='9' y='9' width='5' height='5' rx='1' fill='%2300fff2'/%3E%3Crect x='18' y='9' width='5' height='5' rx='1' fill='%2339ff14'/%3E%3Crect x='9' y='18' width='5' height='5' rx='1' fill='%2300a8ff'/%3E%3Crect x='18' y='18' width='5' height='5' rx='1' fill='%23ffaa00'/%3E%3Cpath d='M10 3v3M16 3v3M22 3v3 M10 26v3M16 26v3M22 26v3 M3 10h3M3 16h3M3 22h3 M26 10h3M26 16h3M26 22h3' stroke='%234b5563' stroke-width='1.2' stroke-linecap='round'/%3E%3C/svg%3E">
 <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Rajdhani:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
 :root{
@@ -1653,12 +4041,10 @@ def index():
 --glow-yellow:0 0 10px #ffff00,0 0 20px #ffff00,0 0 40px #ffff0088;
 }
 *{box-sizing:border-box}
-@media(min-width:1300px){body{display:grid;grid-template-columns:1fr 1fr;gap:0 14px;align-items:start}
-h1,#topbar,#monitors,#fleet-hosts,#ci-queue-card,#cascade-card,#history{grid-column:1/-1}}
-body{font-family:'Rajdhani',sans-serif;background:var(--bg-dark);color:#e0e0e0;padding:10px;margin:0;
+body{font-family:'Rajdhani',sans-serif;background:var(--bg-dark);color:#e0e0e0;padding:20px;margin:0;
 background-image:radial-gradient(ellipse at top,#0d1a2d 0%,transparent 50%),
-linear-gradient(180deg,transparent 0%,rgba(0,255,242,0.03) 100%);min-height:100vh;font-size:14px}
-@media(min-width:768px){body{padding:12px 20px}}
+linear-gradient(180deg,transparent 0%,rgba(0,255,242,0.03) 100%);min-height:100vh;font-size:18px}
+@media(min-width:768px){body{padding:20px 40px}}
 @media(max-width:767px){
 h1{font-size:1.4em;letter-spacing:2px}
 .gauge-row{gap:10px}
@@ -1671,41 +4057,45 @@ h1{font-size:1.4em;letter-spacing:2px}
 body::before{content:'';position:fixed;top:0;left:0;right:0;bottom:0;
 background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,0,0,0.1) 2px,rgba(0,0,0,0.1) 4px);
 pointer-events:none;z-index:9999;opacity:0.3}
-h1{font-family:'Orbitron',monospace;color:var(--neon-cyan);font-size:1.3em;font-weight:900;letter-spacing:3px;
-text-shadow:var(--glow-cyan);border-bottom:1px solid var(--neon-cyan);padding-bottom:6px;margin:4px 0 10px;
+h1{font-family:'Orbitron',monospace;color:var(--neon-cyan);font-size:2.2em;font-weight:900;letter-spacing:4px;
+text-shadow:var(--glow-cyan);border-bottom:2px solid var(--neon-cyan);padding-bottom:15px;margin-bottom:30px;
 text-transform:uppercase;text-align:center}
 h1::before{content:'◈ ';color:var(--neon-magenta)}
 h1::after{content:' ◈';color:var(--neon-magenta)}
 h3{margin-top:0;color:var(--neon-cyan);font-family:'Orbitron',monospace;font-size:1.1em;letter-spacing:2px;
 text-transform:uppercase;text-shadow:0 0 10px var(--neon-cyan)}
-.card{background:var(--bg-card);padding:12px;border-radius:4px;margin:8px 0;
+.card{background:var(--bg-card);padding:20px;border-radius:4px;margin:20px 0;
 border:1px solid #1a2332;box-shadow:0 0 20px rgba(0,255,242,0.1),inset 0 0 60px rgba(0,0,0,0.3)}
 .card::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;
 background:linear-gradient(90deg,transparent,var(--neon-cyan),transparent)}
 .online{color:var(--neon-green);font-weight:bold;text-shadow:var(--glow-green)}
 .offline{color:var(--neon-red);font-weight:bold;text-shadow:var(--glow-red);animation:pulse 1s infinite}
+/* MISMATCH (2026-07-30): amber, and it pulses like OFFLINE because it also needs
+   attention - but a distinct colour, because "I reached the wrong machine" is a
+   different fault from "this machine is down" and wants a different fix (DNS/DHCP,
+   not a power button). */
+.mismatch{color:var(--neon-amber,#ffb020);font-weight:bold;animation:pulse 1s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.7}}
 @keyframes glow-pulse{0%,100%{filter:brightness(1)}50%{filter:brightness(1.3)}}
-.job{padding:6px 10px;border-left:3px solid var(--neon-cyan);margin:8px 0;background:var(--bg-panel);
+.job{padding:10px 15px;border-left:3px solid var(--neon-cyan);margin:8px 0;background:var(--bg-panel);
 border-radius:0 4px 4px 0;font-family:'Rajdhani',sans-serif;transition:all 0.3s}
 .job:hover{background:#1a2332;border-left-color:var(--neon-magenta);box-shadow:0 0 15px rgba(0,255,242,0.2)}
 .job.video{border-color:var(--neon-magenta)}
 .job.completed{opacity:0.7}
-pre{background:var(--bg-panel);padding:8px;border-radius:4px;overflow-x:auto;border:1px solid #1a2332;
+pre{background:var(--bg-panel);padding:15px;border-radius:4px;overflow-x:auto;border:1px solid #1a2332;
 font-family:'Rajdhani',monospace;color:var(--neon-cyan)}
 table{width:100%;border-collapse:collapse}
-td,th{padding:5px 8px;text-align:left;border-bottom:1px solid #1a2332}
+td,th{padding:12px;text-align:left;border-bottom:1px solid #1a2332}
 th{color:var(--neon-cyan);font-family:'Orbitron',monospace;font-size:0.8em;letter-spacing:1px}
 .gpu-card{background:linear-gradient(135deg,var(--bg-panel) 0%,var(--bg-card) 100%);
-padding:12px;border-radius:8px;margin:6px 0;border:1px solid #1a2332;position:relative;overflow:hidden}
+padding:20px;border-radius:8px;margin:10px 0;border:1px solid #1a2332;position:relative;overflow:hidden}
 .gpu-card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;
 background:linear-gradient(90deg,var(--neon-cyan),var(--neon-magenta),var(--neon-cyan))}
 .gpu-card::after{content:'';position:absolute;top:0;right:0;width:100px;height:100px;
 background:radial-gradient(circle,rgba(0,255,242,0.1) 0%,transparent 70%);pointer-events:none}
-.gpu-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+.gpu-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:15px}
 .gpu-name{font-family:'Orbitron',monospace;font-size:1.3em;font-weight:700;text-transform:uppercase;
 letter-spacing:2px;color:var(--neon-cyan);text-shadow:0 0 10px var(--neon-cyan)}
-.net-badge{font-size:0.65em;opacity:0.85;text-shadow:none;vertical-align:middle}
 .progress-bar{background:#1a1a2e;border-radius:2px;height:24px;overflow:hidden;margin:5px 0;
 border:1px solid #2a2a4e;position:relative}
 .progress-bar::before{content:'';position:absolute;top:0;left:0;right:0;bottom:0;
@@ -1721,13 +4111,13 @@ background:linear-gradient(90deg,transparent,rgba(255,255,255,0.4));opacity:0.3}
 .progress-swap{background:linear-gradient(90deg,#ff004444,var(--neon-red));box-shadow:0 0 20px #ff004466}
 .progress-yellow{background:linear-gradient(90deg,#ffaa0044,var(--neon-yellow));box-shadow:0 0 20px #ffff0066}
 .progress-red{background:linear-gradient(90deg,#ff004444,var(--neon-red));box-shadow:0 0 20px #ff004466}
-.io-stats{display:flex;gap:12px;margin-top:8px;font-size:1em;padding:8px;background:var(--bg-dark);border-radius:4px;border:1px solid #1a2332}
+.io-stats{display:flex;gap:20px;margin-top:15px;font-size:1.05em;padding:12px;background:var(--bg-dark);border-radius:4px;border:1px solid #1a2332}
 .io-stat{display:flex;align-items:center;gap:8px}
 .io-stat .value{color:var(--neon-cyan);font-weight:bold;font-family:'Orbitron',monospace;text-shadow:0 0 10px var(--neon-cyan)}
 .io-stat.warning .value{color:var(--neon-yellow);text-shadow:0 0 10px var(--neon-yellow)}
 .io-stat.danger .value{color:var(--neon-red);text-shadow:0 0 10px var(--neon-red)}
 .time-range{display:flex;gap:8px;margin-bottom:15px}
-.time-range button{background:var(--bg-panel);color:#888;border:1px solid #2a2a4e;padding:5px 10px;
+.time-range button{background:var(--bg-panel);color:#888;border:1px solid #2a2a4e;padding:10px 18px;
 border-radius:4px;cursor:pointer;font-family:'Orbitron',monospace;font-size:0.9em;letter-spacing:1px;
 text-transform:uppercase;transition:all 0.3s}
 .time-range button:hover{border-color:var(--neon-cyan);color:var(--neon-cyan);box-shadow:0 0 15px rgba(0,255,242,0.3)}
@@ -1736,12 +4126,12 @@ box-shadow:var(--glow-cyan)}
 .sparkline-container{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
 .sparkline-box{background:var(--bg-panel);padding:12px;border-radius:4px;border:1px solid #1a2332}
 .sparkline-label{font-size:0.9em;color:#888;margin-bottom:8px;font-family:'Orbitron',monospace;letter-spacing:1px}
-.sparkline{height:34px;display:flex;align-items:end;gap:2px;width:100%;overflow:hidden}
+.sparkline{height:45px;display:flex;align-items:end;gap:2px;width:100%;overflow:hidden}
 .sparkline-bar{background:var(--neon-cyan);flex:1 1 0;min-width:0;border-radius:1px 1px 0 0;
 transition:height 0.5s cubic-bezier(0.4,0,0.2,1);box-shadow:0 0 5px var(--neon-cyan)}
 .sparkline-bar.high{background:var(--neon-yellow);box-shadow:0 0 5px var(--neon-yellow)}
 .sparkline-bar.critical{background:var(--neon-red);box-shadow:0 0 5px var(--neon-red);animation:spark-glow 1.2s ease-in-out infinite}
-.history-machine{padding:10px 12px;border-radius:6px;margin-bottom:8px;border:1px solid #1a2332;overflow:hidden}
+.history-machine{padding:15px 18px;border-radius:6px;margin-bottom:16px;border:1px solid #1a2332;overflow:hidden}
 .history-machine.alt-0{background:rgba(0,255,242,0.04)}
 .history-machine.alt-1{background:rgba(255,0,255,0.05)}
 .max-util{color:var(--neon-green);text-shadow:0 0 8px var(--neon-green);font-family:'Orbitron',monospace}
@@ -1751,7 +4141,58 @@ transition:height 0.5s cubic-bezier(0.4,0,0.2,1);box-shadow:0 0 5px var(--neon-c
 .gauge-arc{}
 .progress-label{display:flex;justify-content:space-between;font-size:1em;color:#888;
 font-family:'Rajdhani',sans-serif;letter-spacing:1px}
+.loaded-models{margin-top:7px;padding:7px 9px;border-left:2px solid var(--neon-cyan);
+background:rgba(0,255,242,0.04);font-size:0.85em;color:#889}
+.loaded-model-title{font-family:'Orbitron',monospace;font-size:0.72em;letter-spacing:1px;color:#667}
+.loaded-model{display:flex;justify-content:space-between;gap:12px;margin-top:3px}
+.loaded-model-name{color:var(--neon-cyan);font-weight:bold}
+.loaded-model-vram{color:var(--neon-green);white-space:nowrap}
 .stat-row{margin:10px 0}
+/* --- COMPACT CARD LAYOUT (2026-07-29, Ben: same info, smaller space) --- */
+.gpu-card.compact{padding:12px 14px;margin:0}
+.gpu-card.compact .gpu-header{margin-bottom:6px}
+.gpu-card.compact .gpu-name{font-size:1.05em;letter-spacing:1px}
+.hdr-right{display:flex;align-items:center;gap:8px;font-size:0.8em}
+.peak-inline{font-family:'Orbitron',monospace;font-size:0.72em;color:var(--neon-green);
+text-shadow:0 0 6px var(--neon-green);white-space:nowrap;opacity:0.85}
+.dial-strip{display:flex;gap:2px;justify-content:space-between;align-items:flex-start;margin:8px 0 6px}
+.io-line{display:flex;gap:12px;white-space:nowrap;align-items:center}
+.card-foot .io-stat{gap:5px}
+/* Each dial owns an equal column so neighbouring labels can never collide. */
+.dial-strip .gauge{flex:1 1 0;min-width:0;overflow:hidden}
+.dial-strip .gauge-dial{margin:0 auto}
+.dial-strip .gauge-label{font-size:0.55em;letter-spacing:1px;margin-top:3px;
+display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dial-strip .gauge-value{font-size:0.78em;margin-top:0;display:block;
+white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dial-strip .gauge.unavailable{opacity:0.35}
+/* --- Tokens/sec strip (2026-07-29, Ben): the card's top accent line became a
+   two-band live indicator. TOP band = tokens/sec right now, BOTTOM band =
+   today's peak tokens/sec. Both on the same scale so they compare. --- */
+.gpu-card.compact.has-tps::before{display:none}
+.tps-strip{position:absolute;top:0;left:0;right:0;height:4px;display:flex;
+flex-direction:column;z-index:2}
+.tps-band{height:2px;width:100%;background:#1d2640;position:relative;overflow:hidden}
+.tps-band .tps-fill{position:absolute;left:0;top:0;bottom:0;width:0;
+transition:width 1.2s cubic-bezier(0.4,0,0.2,1)}
+.tps-band.now .tps-fill{background:linear-gradient(90deg,#00fff2,#39ff14);
+box-shadow:0 0 8px #00fff2}
+.tps-band.peak .tps-fill{background:linear-gradient(90deg,#7a3fff,#ff00ff);
+box-shadow:0 0 8px #ff00ff;opacity:0.85}
+.mini-row{display:grid;grid-template-columns:44px 1fr auto;align-items:center;gap:8px;margin:4px 0}
+.mini-row .progress-bar{height:9px;margin:0;border-radius:3px}
+.mini-label{font-family:'Orbitron',monospace;font-size:0.6em;letter-spacing:1px;color:#778}
+.mini-val{font-family:'Orbitron',monospace;font-size:0.72em;color:#aab;white-space:nowrap}
+.serving-line{margin-top:7px;padding:5px 8px;border-left:2px solid var(--neon-cyan);
+background:rgba(0,255,242,0.04);font-size:0.78em;color:#889;line-height:1.5}
+.serving-line b{color:var(--neon-cyan)}
+.serving-line .tps{font-family:'Orbitron',monospace;color:var(--neon-cyan)}
+.serving-line .dim{color:#667}
+.card-foot{display:flex;justify-content:space-between;align-items:center;gap:8px;
+margin-top:8px;font-size:0.72em;color:#667}
+.card-foot .val{font-family:'Orbitron',monospace;color:var(--neon-cyan)}
+.card-actions{display:flex;gap:6px}
+.card-actions button{margin:0!important;padding:4px 9px;font-size:0.62em;letter-spacing:1px;white-space:nowrap}
 .queue-badge{background:var(--neon-yellow);color:#000;padding:3px 10px;border-radius:2px;font-size:0.8em;
 font-family:'Orbitron',monospace;font-weight:bold;box-shadow:0 0 10px var(--neon-yellow)}
 .queue-badge.empty{background:#2a2a4e;color:#666;box-shadow:none}
@@ -1761,6 +4202,14 @@ font-family:'Orbitron',monospace;font-weight:bold;box-shadow:0 0 10px var(--neon
 .gauge-bg{position:absolute;width:100%;height:200%;border-radius:50%}
 .gauge-mask{position:absolute;bottom:0;left:10%;width:80%;height:80%;background:var(--bg-card);border-radius:999px 999px 0 0}
 .gauge-needle{position:absolute;bottom:0;left:50%;background:linear-gradient(to top,#fff 0%,#fff 60%,var(--neon-cyan) 100%);transform-origin:bottom center;transition:transform 1.5s cubic-bezier(0.4,0,0.2,1);border-radius:2px}
+.gauge-peak{position:absolute;bottom:0;left:50%;transform-origin:bottom center;
+border-radius:1px;transition:transform 1.5s cubic-bezier(0.4,0,0.2,1);pointer-events:none;z-index:4;
+filter:drop-shadow(0 0 3px #ffb000)}
+/* Peak-hold on the bars too: a bright vertical tick parked at today's max. */
+.progress-bar{position:relative}
+.bar-peak{position:absolute;top:-1px;bottom:-1px;width:2px;background:#fff8e1;
+box-shadow:0 0 6px #ffb000,0 0 2px #fff;z-index:3;pointer-events:none;
+transition:left 1.5s cubic-bezier(0.4,0,0.2,1)}
 .gauge-center{position:absolute;bottom:-5px;left:50%;background:#0a0a0f;border:2px solid var(--neon-cyan);border-radius:50%;transition:border-color 0.8s}
 .gauge-label{font-family:'Orbitron',monospace;font-size:0.85em;color:#888;margin-top:8px;
 letter-spacing:2px;text-transform:uppercase}
@@ -1799,6 +4248,12 @@ position:relative;overflow:hidden;font-size:0.78em;line-height:1.5}
 background:linear-gradient(90deg,var(--neon-green),transparent)}
 .fleet-tile.off::before{background:linear-gradient(90deg,var(--neon-red),transparent)}
 .fleet-tile.off{opacity:0.65}
+/* MISMATCH (2026-07-30): the address answered as a different machine. Amber, not
+   red - this is "do not trust this tile", which is a different problem from
+   "this box is down", and it must not look like ordinary offline. Full opacity
+   so it draws the eye instead of fading out like a box that is merely asleep. */
+.fleet-tile.mismatch::before{background:linear-gradient(90deg,var(--neon-amber,#ffb020),transparent)}
+.fleet-tile.mismatch{opacity:1;border-color:var(--neon-amber,#ffb020)}
 .ft-name{font-family:'Orbitron',monospace;font-size:0.85em;letter-spacing:1px;color:var(--neon-cyan);
 text-transform:uppercase;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:2px}
 .ft-stat{display:flex;justify-content:space-between;color:#9ab}
@@ -1823,78 +4278,170 @@ letter-spacing:1px;text-transform:uppercase;transition:all 0.3s}
 .glance-num.hot{color:var(--neon-red);text-shadow:var(--glow-red)}
 .glance-label{font-size:0.75em;color:#889;letter-spacing:1px;text-transform:uppercase;margin-top:2px}
 .glance-unavailable{color:#667;font-size:0.9em;font-style:italic}
-.route-pills{display:flex;gap:5px;flex-wrap:wrap;align-items:center}
-.route-pill{font-family:'Orbitron',monospace;font-size:0.7em;letter-spacing:1px;padding:2px 9px;
+.route-pills{display:flex;gap:8px;flex-wrap:wrap}
+/* Route badges on the machine card that actually serves them (2026-07-29, Ben).
+   GREEN = model resident in memory, GREY = route up but nothing loaded (normal
+   for llama-swap after idle), RED = route missing from the gateway. */
+.card-routes{display:flex;gap:4px;flex-wrap:wrap;margin:6px 0 2px}
+.card-route{font-family:'Orbitron',monospace;font-size:0.6em;letter-spacing:1px;
+padding:2px 7px;border-radius:999px;border:1px solid #2a3450;color:#778;white-space:nowrap}
+.card-route.loaded{color:var(--neon-green);border-color:var(--neon-green);
+box-shadow:0 0 7px rgba(57,255,20,0.3);background:rgba(57,255,20,0.07)}
+.card-route.idle{color:#7d8798;border-color:#333f5c}
+.card-route.missing{color:var(--neon-red);border-color:var(--neon-red);
+box-shadow:0 0 7px rgba(255,0,68,0.3)}
+.ft-routes{display:flex;gap:3px;flex-wrap:wrap;margin-top:5px}
+/* One-row glance strip: CI queue + route health + agents, ~1/3 the height of
+   the three cards it replaced (Ben, 2026-07-29). Numbers big, words small. */
+.ship-flow{display:flex;align-items:stretch;gap:0;flex-wrap:wrap;margin:0 0 9px 0}
+.ship-logo{width:30px;height:30px;display:block;margin:0 auto 3px auto;
+filter:drop-shadow(0 0 6px rgba(99,102,241,0.75))}
+.ship-label{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:0;font-family:'Orbitron',monospace;
+font-size:0.72em;letter-spacing:2px;color:var(--neon-cyan);text-shadow:0 0 8px var(--neon-cyan);
+padding-right:12px;white-space:nowrap}
+.ship-stage{background:rgba(255,255,255,0.025);border:1px solid #1e2942;border-radius:7px;
+padding:7px 14px;min-width:92px;text-align:center;display:flex;flex-direction:column;
+align-items:center;justify-content:center;gap:2px}
+.ship-num{font-family:'Orbitron',monospace;font-size:1.5em;font-weight:700;line-height:1;
+color:var(--neon-cyan);text-shadow:0 0 10px var(--neon-cyan)}
+.ship-num.ok{color:var(--neon-green);text-shadow:0 0 10px var(--neon-green)}
+.ship-num.warn{color:var(--neon-yellow);text-shadow:0 0 10px var(--neon-yellow)}
+.ship-num.hot{color:var(--neon-red);text-shadow:0 0 10px var(--neon-red)}
+.ship-num.stamp{font-size:1.05em;white-space:nowrap}
+.ship-cap{font-family:'Orbitron',monospace;font-size:0.56em;letter-spacing:1.5px;
+text-transform:uppercase;color:#7a839c;white-space:nowrap}
+.ship-sub{font-size:0.62em;color:#5d6478;white-space:nowrap}
+.ship-arrow{display:flex;align-items:center;padding:0 9px;color:var(--neon-magenta);
+font-size:0.9em;text-shadow:0 0 8px var(--neon-magenta)}
+.ship-spark{display:flex;align-items:flex-end;gap:2px;height:11px;margin-top:3px}
+.ship-spark i{width:5px;background:var(--neon-cyan);box-shadow:0 0 4px var(--neon-cyan);
+border-radius:1px 1px 0 0;min-height:1px}
+.ship-updated{align-self:center;margin-left:9px;padding:3px 7px;border:1px solid #2a3450;
+border-radius:999px;color:#758097;font-size:0.62em;white-space:nowrap}
+.ship-updated.stale{color:var(--neon-yellow);border-color:rgba(255,255,0,0.55);
+background:rgba(255,255,0,0.06);box-shadow:0 0 7px rgba(255,255,0,0.16)}
+.runson-grid{display:flex;gap:22px;align-items:center;flex-wrap:wrap}
+.runson-live{min-width:180px}
+.runson-count{font-family:'Orbitron',monospace;font-size:2em;font-weight:700;line-height:1;
+color:var(--neon-green);text-shadow:var(--glow-green)}
+.runson-count.zero{color:#778;text-shadow:none}
+.runson-label{font-family:'Orbitron',monospace;font-size:0.62em;letter-spacing:1.3px;
+text-transform:uppercase;color:#7a839c;margin-top:4px}
+.runson-runners{display:flex;gap:6px;flex-wrap:wrap;margin-top:7px}
+.runson-runner{border:1px solid #2a3450;border-radius:999px;padding:3px 8px;color:#aab2c4;font-size:0.78em}
+.runson-facts{display:flex;gap:22px;flex-wrap:wrap;align-items:center}
+.runson-fact b{display:block;font-family:'Orbitron',monospace;color:var(--neon-cyan);font-size:1.15em}
+.runson-fact span{color:#778;font-size:0.75em}
+.runson-warning{color:var(--neon-yellow);margin:0;font-family:'Rajdhani',sans-serif}
+.runson-budget{width:100%;margin-top:15px;padding-top:13px;border-top:1px solid #27304a}
+.runson-budget-head{display:flex;gap:24px;align-items:flex-end;flex-wrap:wrap;margin-bottom:10px}
+.runson-spend{min-width:128px}
+.runson-spend strong{display:block;font:700 1.35em 'Orbitron',monospace;color:var(--neon-cyan)}
+.runson-spend small,.runson-source{color:#778;font-size:.72em}
+.runson-source{margin-left:auto;text-transform:uppercase;letter-spacing:.8px}
+.runson-na{color:#596174!important;text-shadow:none!important}
+.runson-visuals{display:grid;grid-template-columns:minmax(260px,1.3fr) minmax(220px,1fr);gap:14px}
+.runson-chart{border:1px solid #252e47;border-radius:6px;padding:8px 9px;background:rgba(8,12,24,.35);min-width:0}
+.runson-chart-title{font:600 .66em 'Orbitron',monospace;color:#8992aa;letter-spacing:1px;text-transform:uppercase;margin-bottom:4px}
+.runson-chart svg{display:block;width:100%;height:74px;overflow:visible}
+.runson-bar{fill:#39d7ff;opacity:.75}.runson-bar.zero{opacity:.5}.runson-bar.missing{fill:#424a5d;opacity:.35}
+.runson-credit-line{fill:none;stroke:#39ff14;stroke-width:2;filter:drop-shadow(0 0 3px rgba(57,255,20,.5))}
+.runson-credit-dot{fill:#39ff14}.runson-runway{color:#8c96aa;font-size:.76em;margin-top:4px}
+.runson-gauges{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px}
+.runson-gauge-label{display:flex;justify-content:space-between;color:#8992aa;font-size:.72em;margin-bottom:4px}
+.runson-gauge-track{height:7px;background:#20283c;border-radius:999px;overflow:hidden}
+.runson-gauge-fill{height:100%;border-radius:999px;transition:width .3s}.runson-gauge-fill.good{background:#39ff14}.runson-gauge-fill.warn{background:#d9a54a}.runson-gauge-fill.bad{background:#d94a4a}
+.runson-gauge.dim{opacity:.45}
+@media(max-width:720px){.runson-visuals{grid-template-columns:1fr}.runson-gauges{grid-template-columns:1fr}.runson-source{margin-left:0}}
+.gstrip{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px;align-items:center}
+.gcell{display:flex;align-items:center;gap:9px;padding:2px 4px;border-left:2px solid #24304d;min-width:0}
+.gcell .gicon{font-size:1.15em;line-height:1;flex:0 0 auto}
+.gnum{font-family:'Orbitron',monospace;font-size:1.35em;font-weight:700;line-height:1;
+color:var(--neon-cyan);text-shadow:0 0 9px var(--neon-cyan)}
+.gnum.ok{color:var(--neon-green);text-shadow:0 0 9px var(--neon-green)}
+.gnum.warn{color:var(--neon-yellow);text-shadow:0 0 9px var(--neon-yellow)}
+.gnum.hot{color:var(--neon-red);text-shadow:0 0 9px var(--neon-red)}
+.gcap{font-size:0.62em;letter-spacing:1px;text-transform:uppercase;color:#778;
+font-family:'Orbitron',monospace;margin-top:2px;white-space:nowrap}
+.gpair{display:flex;flex-direction:column;align-items:center;flex:0 0 auto}
+.gdim{color:#667;font-size:0.8em}
+.gbar{flex:1 1 auto;min-width:36px;height:7px;border-radius:3px;background:#182137;
+border:1px solid #24304d;overflow:hidden;position:relative}
+.gbar i{display:block;height:100%;background:linear-gradient(90deg,#00fff2,#39ff14);
+box-shadow:0 0 7px #00fff2;transition:width 1.2s cubic-bezier(0.4,0,0.2,1)}
+.gbar i.hot{background:linear-gradient(90deg,#ff9500,#ff0044);box-shadow:0 0 7px #ff0044}
+.gdots{display:flex;gap:3px;flex-wrap:wrap;flex:1 1 auto}
+.gdot{width:8px;height:8px;border-radius:50%;background:#2a3450;border:1px solid #37436a}
+.gdot.loaded{background:var(--neon-green);border-color:var(--neon-green);box-shadow:0 0 6px var(--neon-green)}
+.gdot.missing{background:var(--neon-red);border-color:var(--neon-red);box-shadow:0 0 6px var(--neon-red)}
+.route-pill{font-family:'Orbitron',monospace;font-size:0.8em;letter-spacing:1px;padding:5px 12px;
 border-radius:999px;border:1px solid #2a2a4e;background:var(--bg-panel);color:#889}
 .route-pill.live{color:var(--neon-green);border-color:var(--neon-green);box-shadow:0 0 8px rgba(57,255,20,0.25)}
-.pipe-row{display:flex;align-items:stretch;gap:0;flex-wrap:wrap}
-.pipe-stage{background:var(--bg-panel);border:1px solid #1a2332;border-radius:6px;padding:8px 14px;text-align:center;min-width:96px}
-.pipe-stage .pn{font-family:'Orbitron',monospace;font-size:1.5em;font-weight:700;color:var(--neon-cyan);text-shadow:0 0 8px var(--neon-cyan)}
-.pipe-stage .pl{font-size:0.75em;color:#889;letter-spacing:1px;text-transform:uppercase;margin-top:2px}
-.pipe-stage.hot .pn{color:var(--neon-yellow);text-shadow:0 0 8px var(--neon-yellow)}
-.pipe-stage.live .pn{color:var(--neon-green);text-shadow:0 0 8px var(--neon-green);animation:glow-pulse 1.5s infinite}
-.pipe-stage.bad .pn{color:var(--neon-red);text-shadow:0 0 8px var(--neon-red)}
-.pipe-arrow{display:flex;align-items:center;color:var(--neon-magenta);padding:0 8px;font-size:1.3em;text-shadow:0 0 8px var(--neon-magenta)}
-.pipe-sub{font-size:0.72em;color:#667;margin-top:2px}
-.cascade-head{display:flex;gap:16px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
-.cascade-zero{font-family:'Orbitron',monospace;font-size:2.2em;color:var(--neon-green);text-shadow:var(--glow-green)}
-.cascade-waterfall{display:grid;grid-template-columns:repeat(4,minmax(130px,1fr));gap:8px}
-.cascade-tier{background:var(--bg-panel);border:1px solid #263348;border-radius:6px;padding:10px;position:relative}
-.cascade-tier-name{font-family:'Orbitron',monospace;font-size:0.72em;color:#9aa;letter-spacing:1px}
-.cascade-tier-value{font-family:'Orbitron',monospace;font-size:1.35em;color:var(--neon-cyan);margin-top:5px}
-.cascade-spark{color:var(--neon-magenta);letter-spacing:2px;font-size:0.8em;margin-top:5px}
-.cascade-links{display:flex;gap:8px;flex-wrap:wrap;margin-top:9px}
-.cascade-link{font-size:0.8em;color:#889;border:1px solid #263348;border-radius:999px;padding:3px 8px}
-.cascade-link.leaking{color:var(--neon-red);border-color:var(--neon-red);animation:pulse 1.5s infinite}
-.cascade-stale{color:var(--neon-red);border:1px solid var(--neon-red);padding:8px;border-radius:4px}
-@media(max-width:767px){.cascade-waterfall{grid-template-columns:1fr 1fr}}
 .route-pill.missing{color:var(--neon-red);border-color:var(--neon-red);box-shadow:0 0 8px rgba(255,0,68,0.25);animation:pulse 1.5s infinite}
+/* VRAM Hover Tooltip */
+.vram-row{cursor:pointer}
+.vram-row:hover .progress-bar{border-color:var(--neon-cyan);box-shadow:0 0 10px rgba(0,255,242,0.4)}
+.vram-tooltip{position:fixed;z-index:10000;background:var(--bg-card);border:1px solid var(--neon-cyan);
+border-radius:6px;padding:12px 14px;box-shadow:var(--glow-cyan),0 10px 30px rgba(0,0,0,0.8);
+font-family:'Rajdhani',sans-serif;color:#e0e0e0;font-size:15px;min-width:320px;max-width:480px;
+pointer-events:none;opacity:0;display:none;transition:opacity 0.15s ease-in-out}
+.vram-tooltip.visible{display:block;opacity:1}
+.vram-tooltip-hdr{font-family:'Orbitron',monospace;font-size:0.85em;font-weight:700;letter-spacing:1.5px;
+color:var(--neon-cyan);text-transform:uppercase;border-bottom:1px solid #1a2332;padding-bottom:6px;
+margin-bottom:8px;display:flex;justify-content:space-between;align-items:center}
+.vram-tooltip-list{display:flex;flex-direction:column;gap:8px;max-height:300px;overflow-y:auto}
+.vram-proc-item{background:var(--bg-panel);border-left:3px solid var(--neon-green);padding:6px 10px;border-radius:0 4px 4px 0}
+.vram-proc-hdr{display:flex;justify-content:space-between;align-items:center;font-weight:600;color:#fff}
+.vram-proc-name{font-family:'Orbitron',monospace;font-size:0.9em;color:var(--neon-cyan)}
+.vram-proc-vram{font-family:'Orbitron',monospace;color:var(--neon-green);font-weight:700}
+.vram-proc-details{font-size:0.85em;color:#aaa;margin-top:2px}
+.vram-proc-model{color:var(--neon-yellow)}
+.vram-proc-port{color:var(--neon-magenta);font-family:monospace}
+.vram-tooltip-footer{border-top:1px solid #1a2332;margin-top:8px;padding-top:6px;font-size:0.85em;
+color:#889;display:flex;justify-content:space-between;font-family:'Orbitron',monospace}
+.vram-tooltip-footer .sum-val{color:var(--neon-green)}
+.vram-tooltip-footer .free-val{color:var(--neon-cyan)}
+/* Last-updated stamp: proves the page is live. If this stops ticking, the
+   dashboard has gone stale - which is exactly the failure it exists to show. */
+.hdr-wrap{position:relative}
+.last-updated{position:absolute;top:2px;right:0;font-family:'Rajdhani',sans-serif;
+font-size:0.62em;letter-spacing:1px;text-transform:uppercase;line-height:1.25;
+text-align:right;opacity:0.85;pointer-events:auto;white-space:nowrap}
+.last-updated .lu-label{display:block;font-size:0.82em;color:#5b6b7a;letter-spacing:2px}
+/* Fixed width, monospaced digits, preserved padding. Rajdhani is proportional and
+   has no guaranteed tabular figures, so a ticking clock made the whole stamp
+   shimmer once a second. ch units on a monospace stack make every character the
+   same width, and the JS pads to a constant length, so the box never reflows. */
+.last-updated .lu-time{display:block;font-weight:600;
+font-family:'JetBrains Mono','SF Mono',Menlo,Consolas,'DejaVu Sans Mono',monospace;
+font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1;
+letter-spacing:0;white-space:pre;width:22ch;text-align:right}
+.last-updated.fresh .lu-time{color:var(--neon-green);text-shadow:0 0 6px #39ff1466}
+.last-updated.aging .lu-time{color:var(--neon-yellow);text-shadow:0 0 6px #ffff0066}
+.last-updated.stale .lu-time{color:var(--neon-red);text-shadow:0 0 8px #ff004488}
+@media(max-width:767px){.last-updated{position:static;text-align:center;margin:-18px 0 14px}}
 </style></head>
-<body><h1>GANDALF // FLEET MONITOR</h1>
+<body><div class="hdr-wrap"><h1>GANDALF // FLEET MONITOR</h1><div id="last-updated" class="last-updated" title="Time of the most recent successful data refresh. Green = fresh, amber = aging, red = this page has gone stale."><span class="lu-label">last updated</span><span class="lu-time" id="lu-time">connecting…</span></div></div>
 
-<div id="topbar" style="margin:4px 0 14px 0;display:flex;align-items:center;gap:12px;flex-wrap:wrap"><div id="fleet-summary" style="font-size:0.95em;color:#889">Loading fleet summary...</div><div id="route-health-body" style="margin-left:auto"></div></div>
+<div id="fleet-summary" style="margin:4px 0 14px 0;font-size:0.95em;color:#889">Loading fleet summary...</div>
+
+<div class=card id=glance-strip style="padding:9px 12px;margin:10px 0">
+<div id="ship-flow" class="ship-flow"><span class="gdim">shipping pipeline…</span></div>
+<div class="gstrip">
+<div class="gcell" id="ci-queue-body"><span class="gdim">CI queue…</span></div>
+<div class="gcell" id="route-health-body"><span class="gdim">routes…</span></div>
+<div class="gcell" id="fleet-stats-body"><span class="gdim">agents…</span></div>
+</div>
+</div>
 
 <div class=card id=monitors><p>Loading...</p></div>
 <div class=card id=fleet-hosts style="padding:12px 15px;margin:12px 0">
 <div id=fleet-row class=fleet-row><p style="grid-column:1/-1;color:#667;margin:0">Scanning fleet hosts...</p></div>
 </div>
 
-<div class=card id=ci-queue-card style="padding:12px 15px;margin:12px 0">
-<h3>🏭 Shipping Pipeline — armbrain</h3>
-<div id="ci-queue-body"><p style="color:#667;margin:0">Loading pipeline...</p></div>
-</div>
-
-<div class=card id=cascade-card>
-<h3>💧 Cascade Monitor — dollar-zero resolution</h3>
-<div id=cascade-body><p style="color:#667;margin:0">Loading cascade rollup...</p></div>
-</div>
-
-<div class=card id=energy>
-<h3>⚡ Energy &amp; Cost — by Machine</h3>
-<div id="energy-by-machine"><p>Loading...</p></div>
-<p style="margin-top:12px;color:#666;font-size:0.8em">GPU power only (nvidia-smi) at PEC time-of-use rates. Excludes CPU/PSU overhead; Macs report no wattage.</p>
-</div>
-
-<div class=card><h3>🖥️ Fleet</h3>
-<table>
-<tr><th>Machine</th><th>Hardware</th><th>GPU</th><th>Role</th></tr>
-<tr><td>🧙 <b>Gandalf</b></td><td>Ryzen 9 9950X · 256GB</td><td><b style="color:#d9a54a">RTX PRO 6000 · 96GB</b></td><td>Video + heavy generation</td></tr>
-<tr><td>🧝 <b>Frodo</b></td><td>Core i9-9900K · 128GB</td><td><b style="color:#5a8a4a">RTX 5090 · 32GB</b></td><td>Flux / SDXL generation</td></tr>
-<tr><td>🍎 <b>Pippin</b></td><td>Mac Studio M1 Max · 64GB</td><td><b style="color:#5a8a4a">32-core Apple GPU</b></td><td>Mac workloads</td></tr>
-</table>
-</div>
-
-<div class=card id=energy-fleet>
-<h3>⚡ Fleet Energy &amp; Cost — All Machines</h3>
-<div id="energy-fleet-body"><p>Loading...</p></div>
-</div>
-
-<div class=card><h3>📡 API Endpoints</h3><pre>GET  /api/status  - Target status + live metrics
-GET  /api/logs    - Job / usage history
-GET  /api/history - Historical metrics (range=hour|day|week|month)
-GET  /api/energy  - GPU energy + time-of-use cost (day/week/month)
-GET  /api/cascade - Dollar-zero resolution + tier waterfall
-GET  /api/health  - Health check</pre>
+<div class=card id=runson-card>
+<h3>☁️ RunsOn CI</h3>
+<div id=runson-body><p>Loading...</p></div>
 </div>
 
 <div class=card id=history>
@@ -1908,9 +4455,39 @@ GET  /api/health  - Health check</pre>
 <div id="sparklines"><p>Loading history...</p></div>
 </div>
 
+<div class=card id=energy>
+<h3>⚡ Energy &amp; Cost — by Machine</h3>
+<div id="energy-by-machine"><p>Loading...</p></div>
+<p style="margin-top:12px;color:#666;font-size:0.8em">GPU power only (nvidia-smi) at PEC time-of-use rates. Excludes CPU/PSU overhead; Macs report no wattage.</p>
+</div>
+
+<div class=card><h3>🖥️ Fleet</h3>
+<table>
+<tr><th>Machine</th><th>Hardware</th><th>GPU</th><th>Role</th></tr>
+<tr><td>🧙 <b>Gandalf</b></td><td>Ryzen 9 9950X · 256GB</td><td><b style="color:#d9a54a">RTX PRO 6000 · 96GB</b></td><td>Video + heavy generation</td></tr>
+<tr><td>🧝 <b>Frodo</b></td><td>Core i9-9900K · 128GB</td><td><b style="color:#5a8a4a">RTX 5090 · 32GB</b></td><td>Flux / SDXL generation</td></tr>
+<tr><td>👑 <b>Aragorn</b></td><td>Ryzen 9 9950X · 123GB</td><td><b style="color:#5a8a4a">RTX 5080 + RTX 5070 · 28GB</b></td><td>Local LLM routes + CI runners</td></tr>
+<tr><td>🍎 <b>Pippin</b></td><td>Mac Studio M1 Max · 64GB</td><td><b style="color:#5a8a4a">32-core Apple GPU</b></td><td>Mac workloads</td></tr>
+</table>
+</div>
+
+<div class=card id=energy-fleet>
+<h3>⚡ Fleet Energy &amp; Cost — All Machines</h3>
+<div id="energy-fleet-body"><p>Loading...</p></div>
+</div>
+
+<div class=card><h3>📡 API Endpoints</h3><pre>GET  /api/status  - Target status + live metrics
+GET  /api/logs    - Job / usage history
+GET  /api/history - Historical metrics (range=hour|day|week|month)
+GET  /api/energy  - GPU energy + time-of-use cost (day/week/month)
+GET  /api/fleet_stats - CLI agent sessions per box + CI runner busy/total
+GET  /api/model_serving - tokens/sec dials + requests served (model boxes)
+GET  /api/runson  - RunsOn live runners + jobs/trial/credits
+GET  /api/health  - Health check</pre>
+</div>
 
 <script>
-const icons = {gandalf: "🧙", frodo: "🧝", pippin: "🍎", shadowfax: "🐴"};
+const icons = {gandalf: "🧙", frodo: "🧝", pippin: "🍎", shadowfax: "🐴", aragorn: "👑"};
 const fleetIcons = {northfarthing: "🌾", eastfarthing: "🌾", southfarthing: "🌾", westfarthing: "🌾", shadowfax: "🐴", sam: "🌱"};
 
 // Core vs Reserve summary (2026-07-18): 5-of-6 reserve boxes down at any given
@@ -1934,10 +4511,12 @@ function updateFleetSummary() {
     const reserveUp = RESERVE_FLEET_NAMES.filter(n => lastFleetOnline[n]).length;
     const reserveTotal = RESERVE_FLEET_NAMES.length;
     const coreColor = (coreUp === coreTotal) ? 'var(--neon-green)' : 'var(--neon-red)';
+    el.title = (!lastFleetOnline['shadowfax'] && coreUp < coreTotal)
+        ? 'Core detail: shadowfax unreachable from gandalf (primary SSH path)'
+        : 'Core and reserve availability as seen from gandalf';
     el.innerHTML =
         '<b>Core:</b> <span style="color:' + coreColor + ';font-weight:bold">' + coreUp + '/' + coreTotal + ' up</span>' +
-        ' &nbsp;·&nbsp; <b>Reserve (Shire):</b> <span style="color:#8a8">' + reserveUp + '/' + reserveTotal + ' up</span>' +
-        ' <span style="color:#556;font-size:0.85em">— reserve boxes are on-demand, not always-on</span>';
+        ' &nbsp;·&nbsp; <b>Reserve (Shire):</b> <span style="color:#8a8">' + reserveUp + '/' + reserveTotal + ' up</span>';
 }
 
 function tempClass(t) { return t >= 85 ? "hot" : (t >= 70 ? "warn" : ""); }
@@ -1945,26 +4524,27 @@ function pctClass(p) { return p >= 90 ? "hot" : (p >= 70 ? "warn" : ""); }
 
 let fleetInitialized = false;
 
-// Connection-type badge: 🔌 = wired ethernet, 📶 = wifi (from config "net" field)
-function netBadge(net) {
-    if (net === 'eth') return ' <span class="net-badge" title="Wired (Ethernet)">🔌</span>';
-    if (net === 'wifi') return ' <span class="net-badge" title="Wi-Fi">📶</span>';
-    return '';
-}
-
 function fleetTileHtml(name, n) {
     const icon = fleetIcons[name] || '🖥️';
-    let html = '<div class="fleet-tile' + (n.online ? '' : ' off') + '" id="fleet-tile-' + name + '">';
-    html += '<div class="ft-name">' + icon + ' ' + name + netBadge(n.net) + '</div>';
+    let html = '<div class="fleet-tile' + (n.online ? '' : ' off') + (n.mismatch ? ' mismatch' : '') + '" id="fleet-tile-' + name + '">';
+    html += '<div class="ft-name">' + icon + ' ' + name + '</div>';
     if (n.online) {
         html += '<div class="ft-stat"><span>CPU</span><b class="' + pctClass(n.cpu) + '" id="ft-cpu-' + name + '">' + n.cpu + '%</b></div>';
         html += '<div class="ft-stat"><span>TEMP</span><b class="' + tempClass(n.temp_c) + '" id="ft-temp-' + name + '">' + n.temp_c + '°C</b></div>';
         html += '<div class="ft-stat"><span>RAM</span><b class="' + pctClass(n.ram_pct) + '" id="ft-ram-' + name + '">' + n.ram_used_gb + '/' + n.ram_total_gb + 'G</b></div>';
+    } else if (n.mismatch) {
+        // The address for this tile answered as a DIFFERENT machine, so we have
+        // no trustworthy numbers for THIS box. Say exactly that - deliberately no
+        // stats, because numbers on screen get believed. See _fleet_host_matches.
+        html += '<div class="ft-stat"><span style="color:var(--neon-amber,#ffb020)">MISMATCH</span><b></b></div>';
+        html += '<div class="ft-stat"><span style="font-size:10px">got</span><b style="font-size:10px">' + (n.reported_host || '?') + '</b></div>';
+        html += '<div class="ft-stat"><span style="font-size:10px">at</span><b style="font-size:10px">' + (n.ssh_host || '?') + '</b></div>';
     } else {
         html += '<div class="ft-stat"><span style="color:var(--neon-red)">OFFLINE</span><b></b></div>';
         html += '<div class="ft-stat"><span>&nbsp;</span><b></b></div>';
         html += '<div class="ft-stat"><span>&nbsp;</span><b></b></div>';
     }
+    html += '<div class="ft-routes" id="ft-routes-' + name + '"></div>';
     if (n.can_wake) {
         // Shire boxes: full power control — shutdown / restart / wake
         html += '<div class="ft-btns">';
@@ -1993,7 +4573,7 @@ function refreshFleet() {
             document.getElementById('fleet-row').innerHTML = html;
             for (const [name, n] of Object.entries(data)) {
                 const tile = document.getElementById('fleet-tile-' + name);
-                if (tile) tile.dataset.shape = n.online + ':' + n.can_wake;
+                if (tile) tile.dataset.shape = n.online + ':' + n.can_wake + ':' + !!n.mismatch;
             }
             fleetInitialized = true;
             return;
@@ -2003,7 +4583,9 @@ function refreshFleet() {
         // pure stat ticks update text in place).
         for (const [name, n] of Object.entries(data)) {
             const tile = document.getElementById('fleet-tile-' + name);
-            const key = n.online + ':' + n.can_wake;
+            // mismatch is part of the shape: flipping into or out of MISMATCH must
+            // rebuild the tile, or a stale tile keeps showing the old body.
+            const key = n.online + ':' + n.can_wake + ':' + !!n.mismatch;
             if (!tile || tile.dataset.shape !== key) {
                 const html = fleetTileHtml(name, n);
                 if (tile) {
@@ -2052,98 +4634,104 @@ function fleetPower(node, action) {
 
 function ciQueueNumClass(n) { return n === 0 ? 'zero' : (n <= 3 ? 'warn' : 'hot'); }
 
-function refreshCiQueue() {
+function sparkHtml(vals) {
+    if (!vals || !vals.length) return '';
+    const peak = Math.max(1, ...vals);
+    return '<div class="ship-spark">' + vals.map(v =>
+        '<i style="height:' + Math.max(1, Math.round((v / peak) * 11)) + 'px"></i>').join('') + '</div>';
+}
+
+function shipStage(num, cap, cls, sub, spark, help) {
+    return '<div class="ship-stage"' + (help ? ' title="' + help.replace(/"/g, '') + '"' : '') + '><div class="ship-num ' + (cls || '') + '">' + num + '</div>'
+         + '<div class="ship-cap">' + cap + '</div>'
+         + (sub ? '<div class="ship-sub">' + sub + '</div>' : '')
+         + (spark ? sparkHtml(spark) : '') + '</div>';
+}
+
+// The development pipeline as a left-to-right flow: what is queued, what is in
+// flight, what actually shipped. Ben asked for this shape specifically.
+function refreshShipFlow() {
     fetch('/api/pipeline').then(r => r.json()).then(d => {
-        const el = document.getElementById('ci-queue-body');
+        const el = document.getElementById('ship-flow');
         if (!el) return;
         if (!d.available) {
-            el.innerHTML = '<p class="glance-unavailable">Pipeline signal unavailable right now (token fetch or GitHub API failed) — not necessarily a real outage, just a stale read.</p>';
+            let since = '';
+            if (d.gh_auth_failing_since) {
+                const t = new Date(d.gh_auth_failing_since);
+                since = ' since ' + t.toLocaleString('en-US', {month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZone: 'America/Chicago', timeZoneName: 'short'});
+            }
+            el.innerHTML = '<span class="gdim">shipping pipeline unavailable (GitHub read failed)' + since + ' — stale, not an outage</span>';
             return;
         }
-        const n = v => (v === null || v === undefined) ? '—' : v;
-        const stage = (num, label, cls, sub) =>
-            '<div class="pipe-stage ' + (cls || '') + '"><div class="pn">' + n(num) + '</div>' +
-            '<div class="pl">' + label + '</div>' + (sub ? '<div class="pipe-sub">' + sub + '</div>' : '') + '</div>';
-        const arrow = '<div class="pipe-arrow">▶</div>';
-        const ciCls = (d.ci_queued > 5) ? 'hot' : (d.ci_running > 0 ? 'live' : '');
-        const depLive = d.deploys_in_flight > 0;
-        const depSub = depLive ? ('🚀 ' + d.deploys_in_flight + ' in flight · ' + n(d.deploy_started_min) + 'm')
-                               : (d.deploys_failed_today > 0 ? ('⚠ ' + d.deploys_failed_today + ' failed') : 'all landed');
-        el.innerHTML = '<div class="pipe-row">' +
-            stage(d.issues_open, 'Issues open') + arrow +
-            stage(d.prs_open, 'PRs open') + arrow +
-            stage(n(d.ci_queued) + '/' + n(d.ci_running), 'CI q/run', ciCls) + arrow +
-            stage(d.merged_today, 'Merged today', d.merged_today > 0 ? 'live' : '') + arrow +
-            stage(d.deploys_ok_today, 'Deployed today', depLive ? 'live' : (d.deploys_failed_today > 0 ? 'bad' : ''), depSub) +
-            '</div>';
+        const ARROW = '<div class="ship-arrow">&#10148;</div>';
+        const ciNum = d.ci_queued + '/' + d.ci_running;
+        const ciCls = d.ci_queued > 5 ? 'hot' : (d.ci_queued > 0 ? 'warn' : 'ok');
+        let deploySub = '';
+        if (d.deploys_in_flight) deploySub = d.deploys_in_flight + ' in flight' + (d.deploy_started_min !== null && d.deploy_started_min !== undefined ? ' · ' + d.deploy_started_min + 'm' : '');
+        else if (d.deploys_failed_today) deploySub = d.deploys_failed_today + ' failed';
+        else if (d.deploys_ok_today) deploySub = 'all landed';
+        let mergedSub = '';
+        if (d.last_merge_at) {
+            const t = new Date(d.last_merge_at).toLocaleTimeString('en-US', {hour:'numeric', minute:'2-digit', timeZone:'America/Chicago'}).toLowerCase().replace(' ','');
+            mergedSub = 'Last: ' + t + (d.merged_last_hour !== null && d.merged_last_hour !== undefined ? ' · 60m: ' + d.merged_last_hour : '');
+        }
+        let stamp = '--';
+        if (d.last_deploy_at) {
+            const t = new Date(d.last_deploy_at);
+            stamp = t.toLocaleString('en-US', {month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZone: 'America/Chicago'});
+        }
+        const generated = d.generated_at ? new Date(d.generated_at) : null;
+        const generatedValid = generated && !Number.isNaN(generated.getTime());
+        const updatedTime = generatedValid
+            ? generated.toLocaleTimeString('en-US', {hour: 'numeric', minute: '2-digit', second: '2-digit', timeZone: 'America/Chicago'})
+            : '--';
+        const stale = generatedValid && (Date.now() - generated.getTime() > 10 * 60 * 1000);
+        const degradedNote = d.degraded ? ' (GitHub read failing - showing last good)' : '';
+        const updatedChip = '<div class="ship-updated' + (stale ? ' stale' : '') + '">updated ' + updatedTime + ' CT' + degradedNote + '</div>';
+        el.innerHTML =
+            '<div class="ship-label"><img src="/armbrain-logo.svg" alt="Armbrain" class="ship-logo" title="Armbrain - the product this pipeline ships">SHIPPING</div>' +
+            shipStage(d.issues_open, 'issues open', '', '', null, HELP.issues) + ARROW +
+            shipStage(d.prs_open, 'prs open', '', '', null, HELP.prs) + ARROW +
+            shipStage(ciNum, 'ci q/run', ciCls, '', null, HELP.ciqr) + ARROW +
+            shipStage(d.merged_today, 'merged today', 'ok', mergedSub, d.merged_spark, HELP.merged) + ARROW +
+            shipStage(d.deploys_ok_today, 'deployed today', d.deploys_failed_today ? 'hot' : '', deploySub, d.deploys_spark, HELP.deployed) + ARROW +
+            '<div class="ship-stage" title="' + HELP.lastdep.replace(/"/g, '') + '"><div class="ship-num stamp">' + stamp + '</div>'
+              + '<div class="ship-cap">last deploy (CT)</div>'
+              + (d.last_deploy_sha ? '<div class="ship-sub">⎇ ' + d.last_deploy_sha + '</div>' : '') + '</div>'
+              + updatedChip;
     }).catch(() => {
-        const el = document.getElementById('ci-queue-body');
-        if (el) el.innerHTML = '<p class="glance-unavailable">Pipeline check failed to load.</p>';
+        const el = document.getElementById('ship-flow');
+        if (el && !el.querySelector('.ship-stage')) el.innerHTML = '<span class="gdim">shipping pipeline failed to load.</span>';
     });
 }
 
-function escapeCascade(value) {
-    return String(value).replace(/[&<>"']/g, c => (
-        {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]
-    ));
-}
-
-function cascadeSpark(values) {
-    if (!Array.isArray(values) || !values.length) return '—';
-    const bars = '▁▂▃▄▅▆▇█';
-    const max = Math.max(1, ...values.map(Number));
-    return values.map(v => bars[Math.min(7, Math.round(Number(v) * 7 / max))]).join('');
-}
-
-function refreshCascade() {
-    fetch('/api/cascade').then(async r => {
-        const data = await r.json();
-        if (!r.ok || !data.available) throw new Error(data.error || 'cascade report unavailable');
-        return data;
-    }).then(d => {
-        const el = document.getElementById('cascade-body');
-        const tasks = d.tasks || {};
-        const baseline = tasks.target_status === 'ready_to_set'
-            ? '14-day baseline complete — set the explicit target from measured performance'
-            : 'Collecting baseline: ' + (tasks.baseline_days || 0) + '/' + (tasks.baseline_days_required || 14) + ' observed days';
-        let html = '';
-        if (d.stale) {
-            html += '<div class="cascade-stale">⚠ Cascade data is stale. Latest routing event is older than 15 minutes.</div>';
+function refreshCiQueue() {
+    fetch('/api/ci_queue').then(r => r.json()).then(d => {
+        const el = document.getElementById('ci-queue-body');
+        if (!el) return;
+        if (!d.available) {
+            el.innerHTML = '<p class="glance-unavailable">CI signal unavailable right now (token fetch or GitHub API failed) — not necessarily a real outage, just a stale read.</p>';
+            return;
         }
-        html += '<div class="cascade-head"><div><div class="cascade-zero">' +
-            Number(tasks.dollar_zero_pct || 0).toFixed(1) + '%</div><div style="color:#889">dollar-zero tasks · ' +
-            Number(tasks.dollar_zero || 0) + '/' + Number(tasks.completed || 0) +
-            ' completed</div><div class="cascade-spark">' +
-            cascadeSpark((tasks.daily || []).map(day => day.dollar_zero_pct)) +
-            '</div></div><div style="color:#889">' + escapeCascade(baseline) + '</div></div>';
-        const tierLabels = {
-            local_free: 'LOCAL FREE', local_big: 'LOCAL BIG',
-            subscription: 'SUBSCRIPTION', metered: 'METERED'
-        };
-        const tierMap = Object.fromEntries((d.tiers || []).map(t => [t.tier, t]));
-        html += '<div class="cascade-waterfall">';
-        Object.keys(tierLabels).forEach(key => {
-            const t = tierMap[key] || {};
-            html += '<div class="cascade-tier"><div class="cascade-tier-name">' + tierLabels[key] +
-                '</div><div class="cascade-tier-value">' + Number(t.resolution_pct || 0).toFixed(1) +
-                '% resolved</div><div style="color:#889">' + Number(t.handled || 0) + ' handled · ' +
-                (t.median_latency_ms === null || t.median_latency_ms === undefined ? '—' : Number(t.median_latency_ms) + 'ms median') +
-                '</div><div class="cascade-spark">' + cascadeSpark(t.sparkline) + '</div></div>';
-        });
-        html += '</div><div class="cascade-links">';
-        (d.links || []).forEach(link => {
-            const reason = escapeCascade(link.top_reason || 'other').replaceAll('_', ' ');
-            html += '<span class="cascade-link ' + (link.leaking ? 'leaking' : '') + '">' +
-                escapeCascade(link.from_tier) + ' → ' + escapeCascade(link.to_tier) + ': ' +
-                Number(link.today_count || 0) + ' today · ' + Number(link.today_rate_pct || 0).toFixed(1) +
-                '% · ' + reason + (link.leaking ? ' · LEAKING' : '') + '</span>';
-        });
-        html += '</div><p style="color:#667;font-size:0.8em;margin:8px 0 0">' +
-            escapeCascade(d.definition || '') + '</p>';
-        el.innerHTML = html;
-    }).catch(err => {
-        const el = document.getElementById('cascade-body');
-        if (el) el.innerHTML = '<div class="cascade-stale">⚠ Cascade metric unavailable: ' + escapeCascade(err.message) + '</div>';
+        const running = d.in_progress;
+        const runningLabel = 'Running Runs';
+        const runnerDetail = (d.active_runner_count === null || d.active_runner_count === undefined)
+            ? ''
+            : d.active_runner_count + ' active runner' + (d.active_runner_count === 1 ? '' : 's');
+        const orphanDetail = d.orphaned_queued
+            ? ' · ' + d.orphaned_queued + ' stale orphan' + (d.orphaned_queued === 1 ? '' : 's') + ' excluded'
+            : '';
+        const tip = d.repo + ' — the same queue-depth signal the Shire autoscaler watches'
+                  + (runnerDetail ? ' · ' + runnerDetail : '') + orphanDetail;
+        el.innerHTML =
+            '<span class="gicon" title="CI queue">🚦</span>' +
+            '<div class="gpair"><div class="gnum ' + ciQueueNumClass(d.queued) + '">' + d.queued + '</div><div class="gcap">queued</div></div>' +
+            '<div class="gpair"><div class="gnum ok">' + running + '</div><div class="gcap">' + (runningLabel === 'Running Jobs' ? 'running' : 'runs') + '</div></div>' +
+            '<div class="gbar" title="' + tip + '"><i class="' + (d.queued > 5 ? 'hot' : '') + '" style="width:' +
+                Math.min(100, (d.queued + running) === 0 ? 0 : (running / Math.max(1, running + d.queued)) * 100) + '%"></i></div>';
+    }).catch(() => {
+        const el = document.getElementById('ci-queue-body');
+        if (el) el.innerHTML = '<p class="glance-unavailable">CI queue check failed to load.</p>';
     });
 }
 
@@ -2156,27 +4744,247 @@ function refreshRouteHealth() {
             return;
         }
         const missing = d.routes.filter(r => !r.live);
-        let html = '<div class="route-pills"><span style="color:#667;font-size:0.75em;letter-spacing:1px">🛰️ ROUTES ' +
-            (d.routes.length - missing.length) + '/' + d.routes.length + '</span>';
-        d.routes.forEach(r => {
-            html += '<span class="route-pill ' + (r.live ? 'live' : 'missing') + '">' + (r.live ? '● ' : '✕ ') + r.name + '</span>';
+        const loaded = d.routes.filter(r => r.loaded);
+
+        // The pills themselves live on each machine's own card now (Ben,
+        // 2026-07-29: "move the coding pathways down to the machine they are
+        // running on"). This panel keeps only the fleet-wide summary so a
+        // route vanishing on a DARK box is still visible somewhere.
+        const byBox = {};
+        d.routes.forEach(r => { (byBox[r.box] = byBox[r.box] || []).push(r); });
+        Object.keys(byBox).forEach(box => {
+            const slot = document.getElementById('routes-' + box) || document.getElementById('ft-routes-' + box);
+            if (!slot) return;
+            const pills = byBox[box].map(r => {
+                const cls = !r.live ? 'missing' : (r.loaded ? 'loaded' : 'idle');
+                const mark = !r.live ? '✕ ' : (r.loaded ? '● ' : '○ ');
+                const state = !r.live ? 'route MISSING from the gateway'
+                          : (r.loaded ? r.model + ' loaded in memory'
+                                      : r.model + ' configured, not loaded right now');
+                return '<span class="card-route ' + cls + '" title="' + r.name + ' on ' + r.box + ' — ' + state + ' (' + r.model + '). ' + HELP.routepill.replace(/"/g, '') + '">' + mark + r.name + '</span>';
+            }).join('');
+            if (slot.dataset.lastVal !== pills) { slot.dataset.lastVal = pills; slot.innerHTML = pills; }
         });
-        html += '</div>';
-        if (missing.length) {
-            html += '<div style="color:var(--neon-red);font-size:0.8em;text-align:right">' + missing.length + ' MISSING: ' + missing.map(r => r.name).join(', ') + '</div>';
-        }
-        el.innerHTML = html;
-    }).catch(() => {
+
+        const dots = d.routes.map(r => {
+            const cls = !r.live ? 'missing' : (r.loaded ? 'loaded' : '');
+            const state = !r.live ? 'MISSING from gateway' : (r.loaded ? 'loaded in memory' : 'configured, not loaded');
+            return '<span class="gdot ' + cls + '" title="' + r.name + ' (' + r.box + ') — ' + state + '"></span>';
+        }).join('');
+        el.innerHTML =
+            '<span class="gicon" title="' + HELP.routesum.replace(/"/g, '') + '">🛰️</span>' +
+            '<div class="gpair" title="' + HELP.routesum.replace(/"/g, '') + '"><div class="gnum ' + (missing.length ? 'hot' : 'ok') + '">' + loaded.length + '/' + d.routes.length + '</div>' +
+            '<div class="gcap">' + (missing.length ? missing.length + ' missing' : 'loaded') + '</div></div>' +
+            '<div class="gdots" title="' + HELP.routesum.replace(/"/g, '') + '">' + dots + '</div>';
+    }).catch(err => {
+        console.error('route health render failed:', err);   // do not hide real bugs
         const el = document.getElementById('route-health-body');
-        if (el) el.innerHTML = '<p class="glance-unavailable">Model route check failed to load.</p>';
+        if (!el) return;
+        if (!el.dataset.retried) {
+            el.dataset.retried = '1';
+            el.innerHTML = '<span class="gdim">routes…</span>';
+            setTimeout(refreshRouteHealth, 3000);
+            return;
+        }
+        el.innerHTML = '<span class="gdim" title="The dashboard could not reach its own route-health endpoint. Usually means the service restarted; it retries automatically.">route check unavailable — retrying</span>';
     });
 }
 
-function progressBar(percent, cls, id) {
+// Model serving dials: t/s now + today's serving-time-only average, and
+// requests served 1h/24h/7d. Containers live inside the model-serving target
+// cards (built on the initial /api/status render), so this fills them lazily
+// and just updates the gauges afterwards.
+const TPS_GAUGE_PLACEHOLDER_MAX = 1;
+// TPS-only thresholds. The red band is 15% of today's observed peak, capped
+// at the average so the visible bands can never invert. The tan->green edge
+// is always the live serving-time average for this specific box.
+const TPS_RED_PEAK_FRACTION = 0.15;
+const TPS_DIAL_BOXES = {
+    gandalf: 'tps-dial-gandalf',
+    frodo: 'tps-dial-frodo',
+    aragorn: 'tps-dial-aragorn',
+    pippin: 'tps-dial-pippin',
+};
+function tpsDialZones(avgToday, peakToday, allTimeRecord) {
+    const record = Number(allTimeRecord);
+    const average = Math.max(0, Number(avgToday) || 0);
+    const peak = Math.max(0, Number(peakToday) || 0);
+    if (!Number.isFinite(record) || record <= 0 || average >= record) return null;
+    const redEnd = Math.min(average, peak * TPS_RED_PEAK_FRACTION);
+    return {redEnd: redEnd, tanEnd: average, max: record};
+}
+function tpsGaugeGradient(zones) {
+    const redDeg = (zones.redEnd / zones.max) * 180;
+    const tanDeg = (zones.tanEnd / zones.max) * 180;
+    return 'conic-gradient(from 0.75turn, '
+        + '#d94a4a 0deg, #d94a4a ' + redDeg + 'deg, '
+        + '#d9a54a ' + redDeg + 'deg, #d9a54a ' + tanDeg + 'deg, '
+        + '#39ff14 ' + tanDeg + 'deg, #39ff14 180deg, transparent 180deg)';
+}
+function updateTpsGauge(id, value, avgToday, peakToday, allTimeRecord) {
+    const gauge = document.getElementById(id);
+    const hasZones = avgToday !== null && avgToday !== undefined
+        && peakToday !== null && peakToday !== undefined
+        && allTimeRecord !== null && allTimeRecord !== undefined
+        && Number.isFinite(Number(avgToday)) && Number.isFinite(Number(peakToday))
+        && Number.isFinite(Number(allTimeRecord));
+    const zones = hasZones ? tpsDialZones(avgToday, peakToday, allTimeRecord) : null;
+    if (gauge && zones) {
+        const bg = gauge.querySelector('.gauge-bg');
+        if (bg) bg.style.background = tpsGaugeGradient(zones);
+        gauge.dataset.max = String(zones.max);
+        gauge.dataset.tpsZoneOrder = 'red-tan-green';
+        gauge.dataset.tpsRedEnd = String(zones.redEnd);
+        gauge.dataset.tpsTanEnd = String(zones.tanEnd);
+        gauge.dataset.tpsModelRecord = String(zones.max);
+    }
+    if (!zones) {
+        updateGauge(id, null, 0, TPS_GAUGE_PLACEHOLDER_MAX, '', true, () => '#d94a4a');
+        return;
+    }
+    updateGauge(id, value, 0, zones.max, '', true, function(percent) {
+        if (!zones) return '#d94a4a';
+        const gaugeValue = (percent / 100) * zones.max;
+        if (gaugeValue <= zones.redEnd) return '#d94a4a';
+        if (gaugeValue <= zones.tanEnd) return '#d9a54a';
+        return '#39ff14';
+    });
+}
+function refreshModelServing() {
+    fetch('/api/model_serving').then(r => r.json()).then(data => {
+        for (const [name, s] of Object.entries(data)) {
+            const el = document.getElementById('serving-' + name);
+            if (!el) continue;
+            const card = document.getElementById('card-' + name);
+            const dialId = TPS_DIAL_BOXES[name];
+            // Same wrong-box guard as the other dials: /api/status must have
+            // verified this card's identity before serving stats can fill it.
+            if (dialId && (!card || card.dataset.identityOk !== 'true')) {
+                updateTpsGauge(dialId, null, null, null, null);
+                el.innerHTML = '<span class="dim">serving stats unavailable (identity not verified)</span>';
+                continue;
+            }
+            if (!s.available) {
+                if (dialId) updateTpsGauge(dialId, null, null, null, null);
+                el.innerHTML = '<span class="dim">serving stats unavailable</span>';
+                continue;
+            }
+            if (dialId) {
+                updateTpsGauge(dialId, s.tps_now, s.tps_avg_today, s.tps_max_today, s.tps_record);
+                const validRecord = Number(s.tps_record) > Number(s.tps_avg_today);
+                updatePeakMarker(
+                    dialId + '-peak', validRecord ? s.tps_max_today : null,
+                    0, validRecord ? s.tps_record : TPS_GAUGE_PLACEHOLDER_MAX
+                );
+            }
+            // Two-band strip at the top of the card: now (top) vs today's peak
+            // (bottom), on one shared scale so the bars are comparable.
+            const peak = s.tps_max_today || 0;
+            const scale = Math.max(Number(s.tps_record) || 0, peak, 1);
+            const nowFill = document.getElementById('tps-fill-now-' + name);
+            const peakFill = document.getElementById('tps-fill-peak-' + name);
+            if (nowFill) nowFill.style.width = Math.min(100, (s.tps_now / scale) * 100) + '%';
+            if (peakFill) peakFill.style.width = Math.min(100, (peak / scale) * 100) + '%';
+
+            // COMPACT (2026-07-29): the two t/s dials collapsed into one text line.
+            const servingHtml = '<span class="tps">' + Math.round(s.tps_now) + '</span> t/s now · '
+                + '<span class="tps">' + Math.round(peak) + '</span> peak today · '
+                + '<span class="tps">' + Math.round(s.tps_avg_today) + '</span> avg · '
+                + '<span class="dim">req ' + s.requests.hour + '/1h · ' + s.requests.day + '/24h · ' + s.requests.week + '/7d'
+                + (s.approx_requests ? '≈' : '')
+                + ' · ' + s.serving_minutes_today + ' min served</span>';
+            if (el.dataset.lastVal !== servingHtml) {
+                el.dataset.lastVal = servingHtml;
+                el.innerHTML = servingHtml;
+            }
+            el.dataset.init = '1';
+        }
+    }).catch(() => {});
+}
+
+function refreshFleetStats() {
+    fetch('/api/fleet_stats').then(r => r.json()).then(d => {
+        const el = document.getElementById('fleet-stats-body');
+        if (!el) return;
+        const a = d.agents || {boxes: {}, total: 0};
+        // null = box unreadable right now (down / circuit open) - show ?, not 0
+        const agentDetail = Object.entries(a.boxes).map(([n, v]) =>
+            n + ' ' + (v === null || v === undefined ? '?' : v)).join(' · ');
+        const r = d.runners || {};
+        const f = (r.available ? (r.fleet || {busy: 0, total: 0, online: 0}) : null);
+        const runnerDetail = r.available
+            ? Object.entries(r.boxes).map(([n, b]) => n + ' ' + b.busy + '/' + b.total).join(' · ')
+            : 'runner counts unavailable (gh / GitHub API failed) — stale read, not an outage';
+        let html = '<span class="gicon" title="agents: ' + agentDetail + '">🤖</span>'
+                 + '<div class="gpair" title="' + HELP.agents.replace(/"/g, '') + ' Per box: ' + agentDetail + '"><div class="gnum">' + a.total + '</div><div class="gcap">agents</div></div>';
+        if (f) {
+            const pct = f.total > 0 ? (f.busy / f.total) * 100 : 0;
+            const hot = (f.online > 0 && f.busy >= f.online);
+            html += '<div class="gpair" title="' + HELP.runners.replace(/"/g, '') + ' Per box: ' + runnerDetail + '"><div class="gnum ' + (hot ? 'hot' : (f.busy ? 'warn' : 'ok')) + '">'
+                 + f.busy + '/' + f.total + '</div><div class="gcap">runners</div></div>'
+                 + '<div class="gbar" title="' + runnerDetail + '"><i class="' + (hot ? 'hot' : '') + '" style="width:' + pct + '%"></i></div>';
+        } else {
+            html += '<span class="gdim" title="' + runnerDetail + '">runners ?</span>';
+        }
+        el.innerHTML = html;
+    }).catch(() => {
+        const el = document.getElementById('fleet-stats-body');
+        if (el) el.innerHTML = '<p class="glance-unavailable">Fleet stats failed to load.</p>';
+    });
+}
+
+function progressBar(percent, cls, id, peakPct) {
     let barClass = cls;
     if (percent > 90) barClass = 'progress-red';
     else if (percent > 70) barClass = 'progress-yellow';
-    return '<div class="progress-bar"><div id="' + id + '" class="progress-fill ' + barClass + '" data-percent="' + percent + '" style="width:' + percent + '%"></div></div>';
+    const peak = (peakPct === null || peakPct === undefined)
+        ? ''
+        : '<div class="bar-peak" id="' + id + '-peak" title="Peak today: ' + Math.round(peakPct) + '% — ' + HELP.peak.replace(/"/g, '') + '" style="left:' + Math.max(0, Math.min(100, peakPct)) + '%"></div>';
+    return '<div class="progress-bar"><div id="' + id + '" class="progress-fill ' + barClass + '" data-percent="' + percent + '" style="width:' + percent + '%"></div>' + peak + '</div>';
+}
+
+function updateBarPeak(id, peakPct) {
+    const el = document.getElementById(id + '-peak');
+    if (!el) return;
+    if (peakPct === null || peakPct === undefined) { el.style.display = 'none'; return; }
+    const v = Math.max(0, Math.min(100, peakPct));
+    if (el.dataset.lastVal === String(v)) return;
+    el.dataset.lastVal = String(v);
+    el.style.display = '';
+    el.style.left = v + '%';
+    el.title = 'Peak today: ' + Math.round(peakPct) + '%';
+}
+
+// COMPACT (2026-07-29): one line, not a titled block.
+function loadedModelsHtml(lm) {
+    if (!lm || !lm.available) {
+        return '<span class="dim">model status unavailable</span>';
+    }
+    if (!lm.models || !lm.models.length) {
+        return '<span class="dim">no model loaded</span>';
+    }
+    return lm.models.map(model => {
+        const missingMemory = model.vram_gb === null || model.vram_gb === undefined;
+        const memoryLabel = model.memory_label ? model.memory_label + ' ' : '';
+        const memoryValue = missingMemory
+            ? '<span class="dim">n/a</span>'
+            : model.vram_gb.toFixed(1) + ' GB';
+        return '<b>● ' + model.name + '</b> <span class="tps">' +
+            memoryLabel + memoryValue + '</span>' +
+            (model.where ? ' <span class="dim">on ' + model.where + '</span>' : '');
+    }).join('<br>');
+}
+
+// Label + thin bar + value, all on ONE line (compact card layout).
+function miniRow(label, percent, cls, barId, labelId, valueText, peakPct) {
+    const isVram = (label === 'VRAM' || (barId && barId.startsWith('vram-')));
+    const help = isVram ? '' : (HELP[label.toLowerCase()] || '');
+    const targetAttr = isVram ? ' data-vram-target="' + barId.replace('vram-', '') + '"' : '';
+    const extraClass = isVram ? ' vram-row' : '';
+    const titleAttr = help ? ' title="' + help.replace(/"/g, '') + '"' : '';
+    return '<div class="mini-row' + extraClass + '"' + targetAttr + titleAttr + '><span class="mini-label">' + label + '</span>' +
+        progressBar(percent, cls, barId, peakPct) +
+        '<span class="mini-val" id="' + labelId + '">' + valueText + '</span></div>';
 }
 
 // Update existing progress bars smoothly
@@ -2244,7 +5052,68 @@ function getSwapColor(percent) {
     return '#ff0044';
 }
 
-function renderGauge(value, min, max, label, unit, showLimit, size, reverseColors, id) {
+// Plain-English explanations for every reading on the page (Ben, 2026-07-30).
+// Static text, no live values - the tooltip explains WHAT the number is, the
+// number itself says how much.
+const HELP = {
+    gpu:   'GPU USE - how hard the graphics card is working right now, 0 to 100%. A model answering a question pushes this up. The bright mark on the arc is the highest it reached today.',
+    power: 'POWER DRAW - watts the graphics card is pulling right now. The small grey number at the bottom of the card is its ceiling. The mark on the arc is today high point.',
+    temp:  'TEMPERATURE - how hot the chip is, in Celsius. Green is fine, yellow is warm, red means it is throttling itself to avoid damage. Around 85C is where to start worrying.',
+    cpu:   'PROCESSOR USE - how busy the regular processor is, separate from the graphics card. High here with low GPU usually means the box is compiling or running tests, not serving a model.',
+    swap:  'SWAP - memory that has spilled from RAM onto the disk. Zero is ideal. Anything high means the box ran out of real memory and is now much slower.',
+    vram:  'GRAPHICS MEMORY - the graphics card own memory, which is what a model has to fit inside. A model bigger than this either will not run or spills onto the processor and crawls.',
+    ram:   'SYSTEM MEMORY - ordinary RAM. Separate from graphics memory. Running out shows up as swap.',
+    mem:   'MEMORY - on a Mac the processor and graphics share one pool, so this single number covers both.',
+    disk:  'DISK - how full the drive is. No high-water mark here on purpose: disk usage only climbs, so today maximum is just the current number.',
+    io:    'DISK and NETWORK traffic in megabytes per second, read/write and in/out. Useful for spotting a box that is busy moving data rather than thinking.',
+    tps:   'TOKENS PER SECOND - the speed the model is writing. A token is roughly three quarters of a word. NOW is this second, PEAK TODAY is the fastest it managed today, AVG is the average across everything it served today.',
+    toks:  'TOKENS PER SECOND - the speed the model is writing right now. A token is roughly three quarters of a word. The bright mark is today high point.',
+    reqs:  'REQUESTS - how many times something asked this box for an answer, in the last hour, last 24 hours and last 7 days.',
+    served:'SERVING TIME - total minutes this box spent actually generating today. A big request count with few minutes means lots of short answers.',
+    model: 'LOADED MODEL - which AI model is sitting in memory right now, and how much memory it is using. Empty means nothing is loaded and the next request will wait for it to load.',
+    peak:  'The high-water mark for today. Like the peak needle on a stereo amplifier: it stays where the loudest moment was, even after the level drops back down. Resets at midnight.',
+    routepill: 'A ROUTE is a nickname you ask for instead of naming a model, so the gateway can pick the machine. This badge sits on the machine that serves it. GREEN means the model is loaded in memory and will answer immediately. GREY means the route works but nothing is loaded, so the first request waits while it loads. RED means the route is missing from the gateway entirely - that one is a problem.',
+    routesum:  'LOADED ROUTES - how many of your local model routes have their model actually sitting in memory right now, out of the total number of local routes. Grey dots are idle, not broken: models unload after sitting unused, and the next request loads them again. Only red is a real fault.',
+    agents:    'CLI AGENTS - how many AI coding agents are running across the fleet right now.',
+    runners:   'RUNNERS - GitHub Actions workers available to run your tests and builds, shown as busy out of total. When busy equals total, new work waits in line.',
+    issues:    'ISSUES OPEN - open tickets on the armbrain repository.',
+    prs:       'PULL REQUESTS OPEN - finished work waiting to be reviewed and merged.',
+    ciqr:      'CI QUEUED / RUNNING - automated test runs waiting to start, and runs happening now. A growing queued number means you are short on runners.',
+    merged:    'MERGED TODAY - pull requests that landed in the main branch today. The little bars are the last seven days, so you can see whether today is normal.',
+    deployed:  'DEPLOYED TODAY - releases that went live today. The little bars are the last seven days.',
+    lastdep:   'LAST DEPLOY - when the most recent release went out, in Central Time, and the short code identifying exactly which version it was.',
+    maxutil:   'The busiest this graphics card got today, as a percentage.',
+};
+
+function peakMarkerHtml(peakValue, min, max, size, id) {
+    // A thin tick parked at today's high-water mark. Only the outer ~28% of the
+    // bar is painted, so it reads as a mark ON the arc, not a second needle.
+    const s = size || 1;
+    const h = Math.round(52 * s);   // past the arc's outer rim, per Ben
+    const w = Math.max(3, Math.round(3.5 * s));
+    const has = peakValue !== null && peakValue !== undefined;
+    const pct = has ? Math.max(0, Math.min(100, ((peakValue - min) / (max - min)) * 100)) : 0;
+    const angle = -90 + (pct * 1.8);
+    return '<div class="gauge-peak" id="' + id + '" title="' + HELP.peak.replace(/"/g, '') + '"' +
+        ' style="width:' + w + 'px;height:' + h + 'px;margin-left:' + (-w / 2) + 'px;' +
+        'transform:rotate(' + angle + 'deg);opacity:' + (has ? 0.95 : 0) + ';' +
+        'background:linear-gradient(to top,transparent 0%,transparent 55%,#ffd166 55%,#fff8e1 100%)"></div>';
+}
+
+function updatePeakMarker(id, peakValue, min, max) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const has = peakValue !== null && peakValue !== undefined;
+    const pct = has ? Math.max(0, Math.min(100, ((peakValue - min) / (max - min)) * 100)) : 0;
+    const angle = -90 + (pct * 1.8);
+    const key = has ? String(angle) : 'none';
+    if (el.dataset.lastVal === key) return;
+    el.dataset.lastVal = key;
+    el.style.opacity = has ? 0.95 : 0;
+    el.style.transform = 'rotate(' + angle + 'deg)';
+}
+
+function renderGauge(value, min, max, label, unit, showLimit, size, reverseColors, id, peakValue) {
     const s = size || 1;
     const w = Math.round(100 * s);
     const h = Math.round(50 * s);
@@ -2276,18 +5145,20 @@ function renderGauge(value, min, max, label, unit, showLimit, size, reverseColor
         gradient = 'conic-gradient(from 0.75turn, #39ff14 0deg, #39ff14 126deg, #d9a54a 126deg, #d9a54a 162deg, #d94a4a 162deg, #d94a4a 180deg, transparent 180deg)';
     }
 
-    return '<div class="gauge" id="' + gaugeId + '" style="width:' + w + 'px" data-min="' + min + '" data-max="' + max + '">' +
+    const help = HELP[label.toLowerCase().replace(/[^a-z]/g, '')] || '';
+    return '<div class="gauge' + (value === null ? ' unavailable' : '') + '" id="' + gaugeId + '" style="width:' + w + 'px" data-min="' + min + '" data-max="' + max + '" title="' + help.replace(/"/g, '') + '">' +
         '<div class="gauge-dial" style="width:' + w + 'px;height:' + h + 'px">' +
         '<div class="gauge-bg" style="background:' + gradient + '"></div>' +
         '<div class="gauge-mask"></div>' +
         '<div class="gauge-needle" style="width:' + needleW + 'px;height:' + needleH + 'px;margin-left:' + (-needleW/2) + 'px;transform:rotate(' + angle + 'deg);background:linear-gradient(to top,#fff 0%,#fff 60%,' + color + ' 100%)"></div>' +
+        (peakValue !== undefined ? peakMarkerHtml(peakValue, min, max, s, gaugeId + '-peak') : '') +
         '<div class="gauge-center" style="width:' + centerSize + 'px;height:' + centerSize + 'px;margin-left:' + (-centerSize/2) + 'px;border-color:' + color + '"></div>' +
         '</div>' +
         '<div class="gauge-label">' + label + '</div>' +
         '<div class="gauge-value" style="color:' + color + ';text-shadow:0 0 10px ' + color + '">' + displayValue + '</div></div>';
 }
 
-function renderSwapGauge(value, max, size, id) {
+function renderSwapGauge(value, max, size, id, peakValue) {
     // Swap uses different color logic
     let color;
     if (value === 0) { color = '#39ff14'; }
@@ -2309,11 +5180,12 @@ function renderSwapGauge(value, max, size, id) {
     // Swap gradient: green at 0, yellow 0-70%, red >70%
     const gradient = 'conic-gradient(from 0.75turn, #39ff14 0deg, #39ff14 5deg, #d9a54a 5deg, #d9a54a 126deg, #d94a4a 126deg, #d94a4a 180deg, transparent 180deg)';
 
-    return '<div class="gauge" id="' + gaugeId + '" style="width:' + w + 'px" data-min="0" data-max="' + max + '">' +
+    return '<div class="gauge" id="' + gaugeId + '" style="width:' + w + 'px" data-min="0" data-max="' + max + '" title="' + HELP.swap + '">' +
         '<div class="gauge-dial" style="width:' + w + 'px;height:' + h + 'px">' +
         '<div class="gauge-bg" style="background:' + gradient + '"></div>' +
         '<div class="gauge-mask"></div>' +
         '<div class="gauge-needle" style="width:' + needleW + 'px;height:' + needleH + 'px;margin-left:' + (-needleW/2) + 'px;transform:rotate(' + angle + 'deg);background:linear-gradient(to top,#fff 0%,#fff 60%,' + color + ' 100%)"></div>' +
+        (peakValue !== undefined ? peakMarkerHtml(peakValue, 0, max, s, gaugeId + '-peak') : '') +
         '<div class="gauge-center" style="width:' + centerSize + 'px;height:' + centerSize + 'px;margin-left:' + (-centerSize/2) + 'px;border-color:' + color + '"></div>' +
         '</div>' +
         '<div class="gauge-label">SWAP</div>' +
@@ -2433,6 +5305,18 @@ function updateGauge(id, value, min, max, unit, showLimit, colorFn) {
     const gauge = document.getElementById(id);
     if (!gauge) return;
 
+    if (value === null || value === undefined) {
+        if (gauge.dataset.lastVal === 'unavailable') return;
+        gauge.dataset.lastVal = 'unavailable';
+        gauge.classList.add('unavailable');
+        const needle = gauge.querySelector('.gauge-needle');
+        const valueEl = gauge.querySelector('.gauge-value');
+        if (needle) needle.style.transform = 'rotate(-90deg)';
+        if (valueEl) valueEl.textContent = '--';
+        return;
+    }
+    gauge.classList.remove('unavailable');
+
     const clampedValue = Math.max(min, Math.min(max, value));
     const percent = ((clampedValue - min) / (max - min)) * 100;
     const angle = -90 + (percent * 1.8);
@@ -2463,21 +5347,36 @@ function updateGauge(id, value, min, max, unit, showLimit, colorFn) {
 
 function refresh() {
     fetch("/api/status").then(r => r.json()).then(data => {
-        for (const [name, info] of Object.entries(data.targets)) { lastTargetsOnline[name] = info.online; }
+        const targets = data.targets || {};
+        for (const [name, info] of Object.entries(targets)) { lastTargetsOnline[name] = info.online; }
         updateFleetSummary();
         // If not initialized, build the full HTML
         if (!initialized) {
             let html = '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:20px">';
 
-            for (const [name, info] of Object.entries(data.targets)) {
+            for (const [name, info] of Object.entries(targets)) {
                 const icon = icons[name] || "🖥️";
-                const status = info.online ? '<span class="online">ONLINE</span>' : '<span class="offline">OFFLINE</span>';
+                // MISMATCH outranks ONLINE/OFFLINE: if the address answered as a
+                // different machine we know nothing trustworthy about this box, and
+                // saying so beats saying "offline" (which would read as "asleep").
+                const status = info.mismatch
+                    ? '<span class="mismatch" title="This address answered as ' + (info.reported_host || 'another machine') + ' - check DNS/DHCP">MISMATCH (' + (info.reported_host || '?') + ')</span>'
+                    : (info.online ? '<span class="online">ONLINE</span>' : '<span class="offline">OFFLINE</span>');
 
                 const isMac = info.os === 'mac';
 
-                html += '<div class="gpu-card" id="card-' + name + '">';
-                html += '<div class="gpu-header"><span class="gpu-name">' + icon + ' ' + name + netBadge(info.net) + '</span>';
-                html += '<div style="display:flex;align-items:center;gap:10px"><span id="status-' + name + '">' + status + '</span>';
+                const isModelBox = ['gandalf', 'frodo', 'pippin', 'aragorn'].includes(name);
+                const hasTpsDial = Object.prototype.hasOwnProperty.call(TPS_DIAL_BOXES, name) && !info.mismatch;
+                html += '<div class="gpu-card compact' + (isModelBox ? ' has-tps' : '') + '" id="card-' + name + '" data-identity-ok="' + (info.online && !info.mismatch) + '">';
+                // Two-band tokens/sec strip in place of the flat accent line.
+                if (isModelBox) {
+                    html += '<div class="tps-strip" id="tps-strip-' + name + '">'
+                         +  '<div class="tps-band now" title="Tokens/sec being served right now"><div class="tps-fill" id="tps-fill-now-' + name + '"></div></div>'
+                         +  '<div class="tps-band peak" title="Peak tokens/sec reached today"><div class="tps-fill" id="tps-fill-peak-' + name + '"></div></div>'
+                         +  '</div>';
+                }
+                html += '<div class="gpu-header"><span class="gpu-name">' + icon + ' ' + name + '</span>';
+                html += '<div class="hdr-right"><span id="status-' + name + '">' + status + '</span>';
                 if (!isMac) {
                     html += '<div class="machine-power">';
                     html += '<button class="reboot-btn" data-target="' + name + '" title="Reboot">&#x21bb;</button>';
@@ -2487,88 +5386,140 @@ function refresh() {
                 html += '</div></div>';
 
                 const maxUtil = (info.max_util_today === null || info.max_util_today === undefined) ? '--' : info.max_util_today;
-                html += '<div class="queue-info">';
-                html += '<div class="max-util" id="maxutil-' + name + '">' + maxUtil + '% max utilization today</div>';
-                html += '</div>';
+                // The old "99% max utilization today" text line is gone - that
+                // number is now the peak-hold tick on the GPU dial itself.
+
+                html += '<div class="card-routes" id="routes-' + name + '"></div>';
 
                 if (info.online && isMac) {
-                    html += '<div class="gauge-row">';
-                    html += renderGauge(info.gpu_util, 0, 100, "GPU UTIL", "%", false, 1.5, true, 'util-' + name);
-                    html += renderGauge(info.cpu_percent, 0, 100, "CPU", "%", false, 1.5, false, 'cpu-' + name);
-                    html += '</div>';
-                    html += '<div class="gauge-row">';
+                    // COMPACT: one dial strip, then inline micro-bars.
+                    const pk = info.peaks_today || {};
+                    html += '<div class="dial-strip">';
+                    html += renderGauge(info.gpu_util, 0, 100, "GPU", "%", false, 0.7, true, 'util-' + name, info.max_util_today);
+                    html += renderGauge(info.cpu_percent, 0, 100, "CPU", "%", false, 0.7, false, 'cpu-' + name, pk.cpu_percent);
+                    if (hasTpsDial) {
+                        html += renderGauge(null, 0, TPS_GAUGE_PLACEHOLDER_MAX, "TOK/S", "", true, 0.7, true, TPS_DIAL_BOXES[name], null);
+                    }
                     const swapPct = info.swap ? info.swap.percent : 0;
-                    html += renderSwapGauge(swapPct, 100, 1, 'swap-' + name);
+                    html += renderSwapGauge(swapPct, 100, 0.7, 'swap-' + name, pk.swap_percent);
                     html += '</div>';
 
                     if (info.ram) {
-                        html += '<div class="stat-row">';
-                        html += '<div class="progress-label"><span>🧠 Memory</span><span id="ram-label-' + name + '">' + info.ram.used_gb + ' / ' + info.ram.total_gb + ' GB</span></div>';
-                        html += progressBar(info.ram.percent, "progress-ram", 'ram-' + name);
-                        html += '</div>';
+                        html += miniRow('MEM', info.ram.percent, 'progress-ram', 'ram-' + name,
+                                        'ram-label-' + name, info.ram.used_gb + ' / ' + info.ram.total_gb + ' GB', pk.ram_percent);
                     }
 
                     if (info.disk) {
                         const diskUsed = info.disk.total_gb >= 1000 ? (info.disk.used_gb / 1024).toFixed(1) + ' TB' : info.disk.used_gb + ' GB';
                         const diskTotal = info.disk.total_gb >= 1000 ? (info.disk.total_gb / 1024).toFixed(1) + ' TB' : info.disk.total_gb + ' GB';
-                        html += '<div class="stat-row">';
-                        html += '<div class="progress-label"><span>💿 Disk</span><span id="disk-label-' + name + '">' + diskUsed + ' / ' + diskTotal + '</span></div>';
-                        html += progressBar(info.disk.percent, "progress-disk", 'disk-' + name);
-                        html += '</div>';
+                        html += miniRow('DISK', info.disk.percent, 'progress-disk', 'disk-' + name,
+                                        'disk-label-' + name, diskUsed + ' / ' + diskTotal);
                     }
 
-                    html += '<div style="margin-top:10px;font-size:0.85em;color:#888">Apple M1 Max · 64GB Unified · 32-core GPU</div>';
+                    if (isModelBox) {
+                        html += '<div class="serving-line">';
+                        html += '<div id="loaded-models-' + name + '" title="' + HELP.model.replace(/"/g, '') + '">' + loadedModelsHtml(info.loaded_models) + '</div>';
+                        html += '<div id="serving-' + name + '" title="' + HELP.tps.replace(/"/g, '') + ' ' + HELP.reqs.replace(/"/g, '') + '"></div>';
+                        html += '</div>';
+                    }
+                    html += '<div class="card-foot"><span>Apple M1 Max · 64GB Unified · 32-core GPU</span></div>';
                 } else if (info.online && info.gpu) {
-                    html += '<div class="gauge-row">';
-                    html += renderGauge(info.gpu_util, 0, 100, "GPU UTIL", "%", false, 1.5, true, 'util-' + name);
-                    html += renderGauge(info.gpu_watts, 0, info.gpu_power_max, "POWER", "W", true, 1.5, false, 'power-' + name);
+                    // COMPACT: all five vitals in ONE dial row.
+                    const pk = info.peaks_today || {};
+                    html += '<div class="dial-strip">';
+                    html += renderGauge(info.gpu_util, 0, 100, "GPU", "%", false, 0.7, true, 'util-' + name, info.max_util_today);
+                    html += renderGauge(info.gpu_watts, 0, info.gpu_power_max, "POWER", "W", false, 0.7, false, 'power-' + name, pk.gpu_watts);
+                    if (!hasTpsDial) html += renderGauge(info.gpu_temp, 24, 90, "TEMP", "°C", false, 0.7, false, 'temp-' + name, pk.gpu_temp);
+                    html += renderGauge(info.cpu_percent, 0, 100, "CPU", "%", false, 0.7, false, 'cpu-' + name, pk.cpu_percent);
+                    if (hasTpsDial) {
+                        html += renderGauge(null, 0, TPS_GAUGE_PLACEHOLDER_MAX, "TOK/S", "", true, 0.7, true, TPS_DIAL_BOXES[name], null);
+                    } else {
+                        const swapPct = info.swap ? info.swap.percent : 0;
+                        html += renderSwapGauge(swapPct, 100, 0.7, 'swap-' + name, pk.swap_percent);
+                    }
                     html += '</div>';
-                    html += '<div class="gauge-row">';
-                    html += renderGauge(info.gpu_temp, 24, 90, "TEMP", "°C", false, 1, false, 'temp-' + name);
-                    html += renderGauge(info.cpu_percent, 0, 100, "CPU", "%", false, 1, false, 'cpu-' + name);
-                    const swapPct = info.swap ? info.swap.percent : 0;
-                    html += renderSwapGauge(swapPct, 100, 1, 'swap-' + name);
-                    html += '</div>';
-                    html += '<button class="power-btn" data-target="' + name + '" data-current="' + info.gpu_power_limit + '" data-max="' + info.gpu_power_max + '">⚡ Set Power Limit</button>';
-                    html += '<button class="swap-btn" data-target="' + name + '">🧹 Clear Swap</button>';
 
-                    html += '<div class="stat-row">';
-                    html += '<div class="progress-label"><span>🎮 VRAM</span><span id="vram-label-' + name + '">' + info.gpu.vram_used_gb + ' / ' + info.gpu.vram_total_gb + ' GB</span></div>';
-                    html += progressBar(info.gpu.vram_percent, "progress-vram", 'vram-' + name);
-                    html += '</div>';
+                    html += miniRow('VRAM', info.gpu.vram_percent, 'progress-vram', 'vram-' + name,
+                                    'vram-label-' + name, info.gpu.vram_used_gb + ' / ' + info.gpu.vram_total_gb + ' GB', pk.vram_percent);
 
                     if (info.ram) {
-                        html += '<div class="stat-row">';
-                        html += '<div class="progress-label"><span>💾 RAM</span><span id="ram-label-' + name + '">' + info.ram.used_gb + ' / ' + info.ram.total_gb + ' GB</span></div>';
-                        html += progressBar(info.ram.percent, "progress-ram", 'ram-' + name);
-                        html += '</div>';
+                        html += miniRow('RAM', info.ram.percent, 'progress-ram', 'ram-' + name,
+                                        'ram-label-' + name, info.ram.used_gb + ' / ' + info.ram.total_gb + ' GB', pk.ram_percent);
                     }
 
                     if (info.disk) {
                         const diskUsed = info.disk.total_gb >= 1000 ? (info.disk.used_gb / 1024).toFixed(1) + ' TB' : info.disk.used_gb + ' GB';
                         const diskTotal = info.disk.total_gb >= 1000 ? (info.disk.total_gb / 1024).toFixed(1) + ' TB' : info.disk.total_gb + ' GB';
-                        html += '<div class="stat-row">';
-                        html += '<div class="progress-label"><span>💿 Disk</span><span id="disk-label-' + name + '">' + diskUsed + ' / ' + diskTotal + '</span></div>';
-                        html += progressBar(info.disk.percent, "progress-disk", 'disk-' + name);
+                        html += miniRow('DISK', info.disk.percent, 'progress-disk', 'disk-' + name,
+                                        'disk-label-' + name, diskUsed + ' / ' + diskTotal);
+                    }
+
+                    // Loaded model + tokens/sec, one line each (was 2 gauges + a block)
+                    if (isModelBox || info.loaded_models) {
+                        html += '<div class="serving-line">';
+                        html += '<div id="loaded-models-' + name + '" title="' + HELP.model.replace(/"/g, '') + '">' + loadedModelsHtml(info.loaded_models) + '</div>';
+                        if (isModelBox) html += '<div id="serving-' + name + '" title="' + HELP.tps.replace(/"/g, '') + ' ' + HELP.reqs.replace(/"/g, '') + '"></div>';
                         html += '</div>';
                     }
 
-                // I/O Stats
-                    html += '<div class="io-stats">';
+                    html += '<div class="card-foot">';
+                    let ioTxt = '';
                     if (info.disk_io) {
-                        html += '<div class="io-stat" id="disk-io-' + name + '">📀 <span class="value">' + info.disk_io.read_mbps + '/' + info.disk_io.write_mbps + '</span> MB/s</div>';
+                        ioTxt += '<span class="io-stat" id="disk-io-' + name + '">📀 <span class="value val">' + info.disk_io.read_mbps + '/' + info.disk_io.write_mbps + '</span> MB/s</span>';
                     }
                     if (info.net_io) {
-                        html += '<div class="io-stat" id="net-io-' + name + '">🌐 <span class="value">' + info.net_io.rx_mbps + '/' + info.net_io.tx_mbps + '</span> MB/s</div>';
+                        ioTxt += '<span class="io-stat" id="net-io-' + name + '">🌐 <span class="value val">' + info.net_io.rx_mbps + '/' + info.net_io.tx_mbps + '</span> MB/s</span>';
+                    }
+                    html += '<span class="io-line" title="' + HELP.io.replace(/"/g, '') + '">' + ioTxt + '</span>';
+                    html += '<span class="card-actions">';
+                    html += '<button class="power-btn" data-target="' + name + '" data-current="' + info.gpu_power_limit + '" data-max="' + info.gpu_power_max + '" title="Set Power Limit">⚡ PWR</button>';
+                    html += '<button class="swap-btn" data-target="' + name + '" title="Clear Swap">🧹 SWAP</button>';
+                    html += '</span></div>';
+                    html += '<div style="margin-top:5px;font-size:0.7em;color:#556">' + info.gpu.name + (info.gpu.cuda_version ? ' (CUDA ' + info.gpu.cuda_version + ')' : '') + ' · ' + info.gpu_power_max + 'W' + (info.gpu_count > 1 ? ' · ' + info.gpu_count + ' GPUs pooled' : '') + '</div>';
+                } else if (info.online) {
+                    // Online box with no readable GPU (e.g. aragorn before its
+                    // nvidia driver is installed). Same compact shape, CPU vitals.
+                    const pk = info.peaks_today || {};
+                    html += '<div class="dial-strip">';
+                    html += renderGauge(info.cpu_percent, 0, 100, "CPU", "%", false, 0.7, false, 'cpu-' + name, pk.cpu_percent);
+                    if (hasTpsDial) {
+                        html += renderGauge(null, 0, TPS_GAUGE_PLACEHOLDER_MAX, "TOK/S", "", true, 0.7, true, TPS_DIAL_BOXES[name], null);
+                    } else {
+                        html += renderGauge(info.cpu_temp, 24, 90, "TEMP", "°C", false, 0.7, false, 'temp-' + name, pk.gpu_temp);
+                        const swapPct = info.swap ? info.swap.percent : 0;
+                        html += renderSwapGauge(swapPct, 100, 0.7, 'swap-' + name, pk.swap_percent);
                     }
                     html += '</div>';
 
-                    html += '<div style="margin-top:10px;font-size:0.85em;color:#888">' + info.gpu.name + (info.gpu.cuda_version ? ' (CUDA ' + info.gpu.cuda_version + ')' : '') + '</div>';
+                    if (info.ram) {
+                        html += miniRow('RAM', info.ram.percent, 'progress-ram', 'ram-' + name,
+                                        'ram-label-' + name, info.ram.used_gb + ' / ' + info.ram.total_gb + ' GB', pk.ram_percent);
+                    }
+                    if (info.disk) {
+                        const diskUsed = info.disk.total_gb >= 1000 ? (info.disk.used_gb / 1024).toFixed(1) + ' TB' : info.disk.used_gb + ' GB';
+                        const diskTotal = info.disk.total_gb >= 1000 ? (info.disk.total_gb / 1024).toFixed(1) + ' TB' : info.disk.total_gb + ' GB';
+                        html += miniRow('DISK', info.disk.percent, 'progress-disk', 'disk-' + name,
+                                        'disk-label-' + name, diskUsed + ' / ' + diskTotal);
+                    }
+                    html += '<div class="serving-line"><span class="dim">no GPU driver installed - GPU dials appear once nvidia-smi is available</span>';
+                    if (isModelBox) html += '<div id="serving-' + name + '" title="' + HELP.tps.replace(/"/g, '') + ' ' + HELP.reqs.replace(/"/g, '') + '"></div>';
+                    html += '</div>';
+                    html += '<div class="card-foot">';
+                    let ioTxt2 = '';
+                    if (info.disk_io) {
+                        ioTxt2 += '<span class="io-stat" id="disk-io-' + name + '">📀 <span class="value val">' + info.disk_io.read_mbps + '/' + info.disk_io.write_mbps + '</span> MB/s</span>';
+                    }
+                    if (info.net_io) {
+                        ioTxt2 += '<span class="io-stat" id="net-io-' + name + '">🌐 <span class="value val">' + info.net_io.rx_mbps + '/' + info.net_io.tx_mbps + '</span> MB/s</span>';
+                    }
+                    html += '<span class="io-line" title="' + HELP.io.replace(/"/g, '') + '">' + ioTxt2 + '</span>';
+                    html += '<span class="card-actions">';
+                    html += '<button class="swap-btn" data-target="' + name + '" title="Clear Swap">🧹 SWAP</button>';
+                    html += '</span></div>';
                 }
 
-                if (info.url) {
-                    html += '<div style="margin-top:10px"><a href="' + info.url + '" target="comfyui-' + name + '" style="color:var(--neon-cyan);font-size:0.9em">Open ComfyUI →</a></div>';
-                }
+                // ComfyUI link removed 2026-07-28 (Ben): ComfyUI is disabled fleet-wide,
+                // so the link only ever led to a dead port.
                 html += '</div>';
             }
             html += '</div>';
@@ -2577,19 +5528,27 @@ function refresh() {
 
         } else {
             // UPDATE PATH: Just update values in place
-            for (const [name, info] of Object.entries(data.targets)) {
+            for (const [name, info] of Object.entries(targets)) {
+                const card = document.getElementById('card-' + name);
+                if (card) card.dataset.identityOk = String(info.online && !info.mismatch);
                 // Update max utilization today
-                const maxUtilEl = document.getElementById('maxutil-' + name);
-                if (maxUtilEl) {
-                    const maxUtil = (info.max_util_today === null || info.max_util_today === undefined) ? '--' : info.max_util_today;
-                    maxUtilEl.textContent = maxUtil + '% max utilization today';
-                }
+                updatePeakMarker('util-' + name + '-peak', info.max_util_today, 0, 100);
 
                 if (info.online && info.os === 'mac') {
+                    const lmEl = document.getElementById('loaded-models-' + name);
+                    if (lmEl) {
+                        const lmHtml = loadedModelsHtml(info.loaded_models);
+                        if (lmEl.dataset.lastVal !== lmHtml) { lmEl.dataset.lastVal = lmHtml; lmEl.innerHTML = lmHtml; }
+                    }
                     updateGauge('util-' + name, info.gpu_util, 0, 100, '%', false, getUtilColor);
                     updateGauge('cpu-' + name, info.cpu_percent, 0, 100, '%', false, getNormalColor);
                     const swapPct = info.swap ? info.swap.percent : 0;
                     updateGauge('swap-' + name, swapPct, 0, 100, '%', false, getSwapColor);
+                    const pk = info.peaks_today || {};
+                    updatePeakMarker('cpu-' + name + '-peak', pk.cpu_percent, 0, 100);
+                    updatePeakMarker('swap-' + name + '-peak', pk.swap_percent, 0, 100);
+                    updateBarPeak('ram-' + name, pk.ram_percent);
+                    updateBarPeak('disk-' + name, null);
 
                     if (info.ram) {
                         updateProgressBar('ram-' + name, info.ram.percent, 'progress-ram');
@@ -2608,16 +5567,34 @@ function refresh() {
                 } else if (info.online && info.gpu) {
                     // Update gauges
                     updateGauge('util-' + name, info.gpu_util, 0, 100, '%', false, getUtilColor);
-                    updateGauge('power-' + name, info.gpu_watts, 0, info.gpu_power_max, 'W', true, getNormalColor);
-                    updateGauge('temp-' + name, info.gpu_temp, 24, 90, '°C', false, getNormalColor);
+                    updateGauge('power-' + name, info.gpu_watts, 0, info.gpu_power_max, 'W', false, getNormalColor);
+                    if (!Object.prototype.hasOwnProperty.call(TPS_DIAL_BOXES, name)) updateGauge('temp-' + name, info.gpu_temp, 24, 90, '°C', false, getNormalColor);
                     updateGauge('cpu-' + name, info.cpu_percent, 0, 100, '%', false, getNormalColor);
-                    const swapPct = info.swap ? info.swap.percent : 0;
-                    updateGauge('swap-' + name, swapPct, 0, 100, '%', false, getSwapColor);
+                    if (!Object.prototype.hasOwnProperty.call(TPS_DIAL_BOXES, name)) {
+                        const swapPct = info.swap ? info.swap.percent : 0;
+                        updateGauge('swap-' + name, swapPct, 0, 100, '%', false, getSwapColor);
+                    }
+                    // Peak-hold marks: today's high-water mark on every dial and bar.
+                    const pk = info.peaks_today || {};
+                    updatePeakMarker('power-' + name + '-peak', pk.gpu_watts, 0, info.gpu_power_max);
+                    if (!Object.prototype.hasOwnProperty.call(TPS_DIAL_BOXES, name)) updatePeakMarker('temp-' + name + '-peak', pk.gpu_temp, 24, 90);
+                    updatePeakMarker('cpu-' + name + '-peak', pk.cpu_percent, 0, 100);
+                    if (!Object.prototype.hasOwnProperty.call(TPS_DIAL_BOXES, name)) updatePeakMarker('swap-' + name + '-peak', pk.swap_percent, 0, 100);
+                    updateBarPeak('vram-' + name, pk.vram_percent);
+                    updateBarPeak('ram-' + name, pk.ram_percent);
 
                     // Update progress bars
                     updateProgressBar('vram-' + name, info.gpu.vram_percent, 'progress-vram');
                     const vramLabel = document.getElementById('vram-label-' + name);
                     if (vramLabel) vramLabel.textContent = info.gpu.vram_used_gb + ' / ' + info.gpu.vram_total_gb + ' GB';
+                    const loadedModelsEl = document.getElementById('loaded-models-' + name);
+                    if (loadedModelsEl) {
+                        const loadedHtml = loadedModelsHtml(info.loaded_models);
+                        if (loadedModelsEl.dataset.lastVal !== loadedHtml) {
+                            loadedModelsEl.dataset.lastVal = loadedHtml;
+                            loadedModelsEl.innerHTML = loadedHtml;
+                        }
+                    }
 
                     if (info.ram) {
                         updateProgressBar('ram-' + name, info.ram.percent, 'progress-ram');
@@ -2730,7 +5707,7 @@ function refreshHistory() {
         let html = '';
 
         let idx = 0;
-        for (const [target, points] of Object.entries(data.data)) {
+        for (const [target, points] of Object.entries(data.data || {})) {
             const icon = icons[target] || '🖥️';
             html += '<div class="history-machine alt-' + (idx % 2) + '"><h4 style="margin:0 0 12px 0;color:#ccc">' + icon + ' ' + target.charAt(0).toUpperCase() + target.slice(1) + '</h4>';
             html += '<div class="sparkline-container">';
@@ -2763,13 +5740,14 @@ function fmtCell(ec) {
 function refreshEnergy() {
     fetch('/api/energy').then(r => r.json()).then(data => {
         const order = ['gandalf', 'frodo', 'pippin'];
-        const names = order.filter(n => n in data.by_machine)
-            .concat(Object.keys(data.by_machine).filter(n => !order.includes(n)));
+        const byMachine = data.by_machine || {};
+        const names = order.filter(n => n in byMachine)
+            .concat(Object.keys(byMachine).filter(n => !order.includes(n)));
 
         // Per-machine table
         let rows = '<table><tr><th>Machine</th><th>Today</th><th>This Week</th><th>This Month</th></tr>';
         names.forEach(name => {
-            const m = data.by_machine[name];
+            const m = byMachine[name];
             const icon = icons[name] || '🖥️';
             const label = name.charAt(0).toUpperCase() + name.slice(1);
             if (!m || m.metered === false) {
@@ -2783,25 +5761,165 @@ function refreshEnergy() {
         rows += '</table>';
         document.getElementById('energy-by-machine').innerHTML = rows;
 
-        // Fleet aggregate
-        const f = data.fleet;
+        // Fleet aggregate — fail-soft: a partial/failed fetch (e.g. flaky phone
+        // link over Tailscale) must not throw on a missing fleet/window, it just
+        // shows 0 for that cell instead of nuking the whole panel.
+        const f = data.fleet || {};
         let fleet = '<table><tr><th>Period</th><th>GPU Energy</th><th>Cost</th></tr>';
         [['Today', 'day'], ['This Week', 'week'], ['This Month', 'month']].forEach(([lbl, k]) => {
+            const c = f[k] || {kwh: 0, cost: 0};
             fleet += '<tr><td><b>' + lbl + '</b></td><td><b style="color:var(--neon-cyan)">'
-                  + f[k].kwh.toFixed(2) + '</b> kWh</td><td><b class="cost">$' + f[k].cost.toFixed(2) + '</b></td></tr>';
+                  + (c.kwh || 0).toFixed(2) + '</b> kWh</td><td><b class="cost">$' + (c.cost || 0).toFixed(2) + '</b></td></tr>';
         });
         fleet += '</table>';
-        fleet += '<p style="margin-top:10px;color:#666;font-size:0.8em">Base ' + data.base_per_kwh.toFixed(6)
-              + ' $/kWh + PEC time-of-use. ' + data.note + '</p>';
+        fleet += '<p style="margin-top:10px;color:#666;font-size:0.8em">Base ' + (data.base_per_kwh || 0).toFixed(6)
+              + ' $/kWh + PEC time-of-use. ' + (data.note || '') + '</p>';
         document.getElementById('energy-fleet-body').innerHTML = fleet;
     }).catch(err => {
         document.getElementById('energy-by-machine').innerHTML = '<p style="color:#d94a4a">Error loading energy: ' + err + '</p>';
     });
 }
 
+function runsonEscape(value) {
+    return String(value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+}
+
+function runsonAge(minutes) {
+    if (minutes === null || minutes === undefined) return 'age unknown';
+    if (minutes < 60) return minutes + 'm';
+    if (minutes < 1440) return Math.floor(minutes / 60) + 'h ' + (minutes % 60) + 'm';
+    return Math.floor(minutes / 1440) + 'd ' + Math.floor((minutes % 1440) / 60) + 'h';
+}
+
+function runsonMoney(value) {
+    if (value === null || value === undefined || !Number.isFinite(Number(value))) {
+        return '<span class="runson-na">n/a</span>';
+    }
+    return '$' + Number(value).toFixed(2);
+}
+
+function runsonDailySpendChart(rows) {
+    const points = Array.isArray(rows) ? rows.slice(-30) : [];
+    while (points.length < 30) points.unshift({date: '', spend: null});
+    const measured = points.map(p => Number(p.spend)).filter((v, i) =>
+        points[i].spend !== null && points[i].spend !== undefined && Number.isFinite(v));
+    const maxSpend = measured.length ? Math.max(0.01, ...measured) : 1;
+    const bars = points.map((p, i) => {
+        const known = p.spend !== null && p.spend !== undefined && Number.isFinite(Number(p.spend));
+        const value = known ? Math.max(0, Number(p.spend)) : null;
+        // A measured zero is a visible baseline tick; missing data is a dimmed tick, never a fake zero.
+        const height = known ? (value === 0 ? 2 : Math.max(3, 58 * value / maxSpend)) : 2;
+        const cls = known ? (value === 0 ? 'runson-bar zero' : 'runson-bar') : 'runson-bar missing';
+        const title = (p.date || 'no sample') + ' · ' + (known ? '$' + value.toFixed(2) : 'n/a');
+        return '<rect class="' + cls + '" x="' + (i * 10 + 1) + '" y="' + (68 - height)
+            + '" width="7" height="' + height + '"><title>' + runsonEscape(title) + '</title></rect>';
+    }).join('');
+    return '<svg id="runson-spend-chart" viewBox="0 0 300 74" role="img" aria-label="Daily spend, last 30 days">'
+        + '<line x1="0" y1="68" x2="300" y2="68" stroke="#30394f"/>' + bars + '</svg>';
+}
+
+function runsonCreditsChart(runway, remaining) {
+    const samples = ((runway || {}).samples || []).filter(p =>
+        Number.isFinite(Number(p.credits)) && Number.isFinite(Date.parse(p.ts)));
+    let svg = '<svg id="runson-credits-chart" viewBox="0 0 300 74" role="img" aria-label="Remaining AWS credits">';
+    if (samples.length >= 2) {
+        const times = samples.map(p => Date.parse(p.ts));
+        const values = samples.map(p => Number(p.credits));
+        const minT = Math.min(...times), maxT = Math.max(...times);
+        const minV = Math.min(...values), maxV = Math.max(...values);
+        const coords = samples.map((p, i) => {
+            const x = 4 + 292 * (times[i] - minT) / Math.max(1, maxT - minT);
+            const y = maxV === minV ? 35 : 6 + 58 * (maxV - values[i]) / (maxV - minV);
+            return {x: x, y: y, p: p};
+        });
+        svg += '<polyline class="runson-credit-line" points="' + coords.map(c => c.x + ',' + c.y).join(' ') + '"/>';
+        svg += coords.map(c => '<circle class="runson-credit-dot" cx="' + c.x + '" cy="' + c.y
+            + '" r="2"><title>' + runsonEscape(c.p.ts + ' · $' + Number(c.p.credits).toFixed(2)) + '</title></circle>').join('');
+    } else {
+        svg += '<line x1="0" y1="68" x2="300" y2="68" stroke="#424a5d" opacity=".35"/>';
+    }
+    svg += '</svg>';
+    const projection = (runway || {}).projection_date;
+    const caption = projection
+        ? 'credits last until ~' + runsonEscape(projection) + ' at this pace'
+        : '<span class="runson-na">runway n/a</span>';
+    return svg + '<div class="runson-runway">' + runsonMoney(remaining) + ' remaining · ' + caption + '</div>';
+}
+
+function runsonBudgetGauge(label, spent, limit) {
+    const known = spent !== null && spent !== undefined && Number.isFinite(Number(spent));
+    const safeLimit = Number(limit) > 0 ? Number(limit) : 1;
+    const percent = known ? 100 * Math.max(0, Number(spent)) / safeLimit : 0;
+    // Spend semantics invert the dashboard's capacity colors: HIGH spend is bad.
+    const tone = percent > 90 ? 'bad' : (percent >= 60 ? 'warn' : 'good');
+    return '<div class="runson-gauge' + (known ? '' : ' dim') + '"><div class="runson-gauge-label"><span>'
+        + runsonEscape(label) + '</span><span>' + (known ? runsonMoney(spent) + ' / $' + safeLimit.toFixed(0) : 'n/a')
+        + '</span></div><div class="runson-gauge-track"><div class="runson-gauge-fill ' + tone
+        + '" style="width:' + Math.min(100, percent) + '%"></div></div></div>';
+}
+
+function refreshRunsOn() {
+    fetch('/api/runson').then(r => r.json()).then(d => {
+        const card = document.getElementById('runson-card');
+        const body = document.getElementById('runson-body');
+        if (!card || !body) return;
+        if (d.deployed === false) {
+            card.style.display = 'none';
+            return;
+        }
+        card.style.display = '';
+        if (!d.available) {
+            const warning = d.error === 'credentials'
+                ? '⚠ AWS creds expired - run: aws login --remote --profile armbrain --region us-east-2'
+                : '⚠ RunsOn AWS data unavailable';
+            body.innerHTML = '<p class="runson-warning">' + warning + '</p>';
+            return;
+        }
+
+        const count = Number(d.live_runners || 0);
+        const runners = (d.runners || []).map(r =>
+            '<span class="runson-runner">' + runsonEscape(r.instance_type || 'unknown') + ' · '
+            + runsonEscape(runsonAge(r.age_minutes)) + '</span>').join('');
+        const runnerDetail = count === 0
+            ? '<div class="runson-label">no runners active</div>'
+            : '<div class="runson-runners">' + runners + '</div>';
+        const creditsNumber = (d.credits_remaining === null || d.credits_remaining === undefined)
+            ? Number.NaN : Number(d.credits_remaining);
+        const credits = Number.isFinite(creditsNumber) ? '$' + creditsNumber.toFixed(2) : 'n/a';
+        const limits = d.budget_limits || {};
+        const budgetStrip = '<div class="runson-budget" id="runson-budget-strip">'
+            + '<div class="runson-budget-head">'
+            + '<div class="runson-spend"><strong id="runson-spent-today">' + runsonMoney(d.spent_today)
+            + '</strong><small>Spent today</small></div>'
+            + '<div class="runson-spend"><strong id="runson-spent-month">' + runsonMoney(d.spent_month)
+            + '</strong><small>Spent this month</small></div>'
+            + '<div class="runson-source">' + runsonEscape(d.cost_source_label || 'n/a') + '</div></div>'
+            + '<div class="runson-visuals"><div class="runson-chart"><div class="runson-chart-title">Daily spend · 30 days</div>'
+            + runsonDailySpendChart(d.daily_spend) + '</div>'
+            + '<div class="runson-chart"><div class="runson-chart-title">Credits runway</div>'
+            + runsonCreditsChart(d.credits_runway, d.credits_remaining) + '</div></div>'
+            + '<div class="runson-gauges" id="runson-budget-gauges">'
+            + runsonBudgetGauge('Daily fuse', d.spent_today, limits.daily || 10)
+            + runsonBudgetGauge('Monthly guard', d.spent_month, limits.monthly_guard || 25)
+            + '</div></div>';
+        body.innerHTML = '<div class="runson-grid">'
+            + '<div class="runson-live"><div class="runson-count' + (count === 0 ? ' zero' : '') + '">' + count + '</div>'
+            + '<div class="runson-label">live runners</div>' + runnerDetail + '</div>'
+            + '<div class="runson-facts">'
+            + '<div class="runson-fact"><b>' + Number(d.jobs_today || 0) + '</b><span>jobs today</span></div>'
+            + '<div class="runson-fact"><b>' + Number(d.trial_days_remaining || 0) + ' days</b><span>to $'
+            + Number(d.subscription_usd_per_year || 350) + '/year charge · ' + runsonEscape(d.trial_charge_date || '2026-09-12') + '</span></div>'
+            + '<div class="runson-fact"><b>' + credits + '</b><span>AWS credits remaining</span></div>'
+            + '</div>' + budgetStrip + '</div>';
+    }).catch(() => {
+        const body = document.getElementById('runson-body');
+        if (body) body.innerHTML = '<p class="runson-warning">⚠ RunsOn panel failed to load</p>';
+    });
+}
+
 // --- Polling control: pause everything when the tab isn't visible, resume ---
 // --- with an immediate refresh when it becomes visible again.              ---
-let statusTimer = null, fleetTimer = null, historyTimer = null, energyTimer = null, ciQueueTimer = null, routeHealthTimer = null, cascadeTimer = null;
+let statusTimer = null, fleetTimer = null, historyTimer = null, energyTimer = null, ciQueueTimer = null, routeHealthTimer = null, fleetStatsTimer = null, modelServingTimer = null, shipFlowTimer = null, runsonTimer = null;
 
 function startPolling() {
     if (!statusTimer) statusTimer = setInterval(refresh, 12000);     // queue/GPU state: 12s
@@ -2809,9 +5927,33 @@ function startPolling() {
     if (!historyTimer) historyTimer = setInterval(refreshHistory, 60000);
     if (!energyTimer) energyTimer = setInterval(refreshEnergy, 60000);
     if (!ciQueueTimer) ciQueueTimer = setInterval(refreshCiQueue, 45000);        // matches backend cache TTL
+    if (!shipFlowTimer) shipFlowTimer = setInterval(refreshShipFlow, 45000);     // matches backend 45s cache TTL
+    if (!runsonTimer) runsonTimer = setInterval(refreshRunsOn, 120000);           // matches AWS cache TTL
     if (!routeHealthTimer) routeHealthTimer = setInterval(refreshRouteHealth, 30000);
-    if (!cascadeTimer) cascadeTimer = setInterval(refreshCascade, 60000);
+    if (!fleetStatsTimer) fleetStatsTimer = setInterval(refreshFleetStats, 60000); // matches backend cache TTL
+    if (!modelServingTimer) modelServingTimer = setInterval(refreshModelServing, 60000); // matches sampler cadence
 }
+
+// Background heartbeat. Chrome throttles background-tab timers to roughly once a
+// minute, so 60s is the fastest cadence that actually survives being hidden. This
+// exists because a fleet monitor that freezes when it is not the focused tab is
+// useless as a glanceable display - which is the reported bug.
+let slowTimer = null;
+const panelRefreshers = [
+    ['refresh', refresh], ['refreshFleet', refreshFleet], ['refreshHistory', refreshHistory],
+    ['refreshEnergy', refreshEnergy], ['refreshCiQueue', refreshCiQueue],
+    ['refreshShipFlow', refreshShipFlow], ['refreshRunsOn', refreshRunsOn],
+    ['refreshRouteHealth', refreshRouteHealth], ['refreshFleetStats', refreshFleetStats],
+    ['refreshModelServing', refreshModelServing]
+];
+function startSlowPolling() {
+    if (!slowTimer) slowTimer = setInterval(() => {
+        panelRefreshers.forEach(([label, fn]) => {
+            try { fn(); } catch (err) { console.error('[dashboard] ' + label + ' failed in background:', err); }
+        });
+    }, 60000);
+}
+function stopSlowPolling() { clearInterval(slowTimer); slowTimer = null; }
 
 function stopPolling() {
     clearInterval(statusTimer); statusTimer = null;
@@ -2819,34 +5961,240 @@ function stopPolling() {
     clearInterval(historyTimer); historyTimer = null;
     clearInterval(energyTimer); energyTimer = null;
     clearInterval(ciQueueTimer); ciQueueTimer = null;
+    clearInterval(shipFlowTimer); shipFlowTimer = null;
+    clearInterval(runsonTimer); runsonTimer = null;
     clearInterval(routeHealthTimer); routeHealthTimer = null;
-    clearInterval(cascadeTimer); cascadeTimer = null;
+    clearInterval(fleetStatsTimer); fleetStatsTimer = null;
+    clearInterval(modelServingTimer); modelServingTimer = null;
+}
+
+let vramTooltipEl = null;
+let activeVramTarget = null;
+let lastVramFetchTime = 0;
+let cachedVramData = {};
+
+function initVramTooltip() {
+    if (document.getElementById('vram-tooltip')) return;
+    vramTooltipEl = document.createElement('div');
+    vramTooltipEl.id = 'vram-tooltip';
+    vramTooltipEl.className = 'vram-tooltip';
+    document.body.appendChild(vramTooltipEl);
+
+    document.addEventListener('mouseover', function(e) {
+        const row = e.target.closest('.vram-row');
+        if (row && row.dataset.vramTarget) {
+            showVramTooltip(row.dataset.vramTarget, e);
+        }
+    });
+
+    document.addEventListener('mousemove', function(e) {
+        const row = e.target.closest('.vram-row');
+        if (row && vramTooltipEl && vramTooltipEl.classList.contains('visible')) {
+            positionVramTooltip(e);
+        }
+    });
+
+    document.addEventListener('mouseout', function(e) {
+        const row = e.target.closest('.vram-row');
+        if (row) {
+            const related = e.relatedTarget ? e.relatedTarget.closest('.vram-row') : null;
+            if (related !== row) {
+                hideVramTooltip();
+            }
+        }
+    });
+}
+
+function positionVramTooltip(e) {
+    if (!vramTooltipEl) return;
+    const padding = 15;
+    let left = e.clientX + padding;
+    let top = e.clientY + padding;
+
+    const rect = vramTooltipEl.getBoundingClientRect();
+    if (left + rect.width > window.innerWidth - 10) {
+        left = e.clientX - rect.width - padding;
+    }
+    if (top + rect.height > window.innerHeight - 10) {
+        top = e.clientY - rect.height - padding;
+    }
+    vramTooltipEl.style.left = Math.max(10, left) + 'px';
+    vramTooltipEl.style.top = Math.max(10, top) + 'px';
+}
+
+function showVramTooltip(targetName, e) {
+    if (!vramTooltipEl) initVramTooltip();
+    activeVramTarget = targetName;
+    positionVramTooltip(e);
+    vramTooltipEl.classList.add('visible');
+
+    const now = Date.now();
+    if (cachedVramData[targetName] && (now - lastVramFetchTime < 3000)) {
+        renderVramTooltipContent(targetName, cachedVramData[targetName]);
+        return;
+    }
+
+    if (!cachedVramData[targetName]) {
+        vramTooltipEl.innerHTML = '<div class="vram-tooltip-hdr"><span>🧠 VRAM Processes</span><span>' + targetName.toUpperCase() + '</span></div><div>Loading VRAM processes…</div>';
+    }
+
+    fetch('/api/vram-processes?target=' + encodeURIComponent(targetName))
+        .then(r => r.json())
+        .then(data => {
+            const targetData = data[targetName] || data;
+            cachedVramData[targetName] = targetData;
+            lastVramFetchTime = Date.now();
+            if (activeVramTarget === targetName) {
+                renderVramTooltipContent(targetName, targetData);
+            }
+        })
+        .catch(err => {
+            if (activeVramTarget === targetName) {
+                vramTooltipEl.innerHTML = '<div class="vram-tooltip-hdr"><span>🧠 VRAM Processes</span><span>' + targetName.toUpperCase() + '</span></div><div style="color:var(--neon-red)">Error loading VRAM processes</div>';
+            }
+        });
+}
+
+function hideVramTooltip() {
+    activeVramTarget = null;
+    if (vramTooltipEl) {
+        vramTooltipEl.classList.remove('visible');
+    }
+}
+
+function renderVramTooltipContent(targetName, data) {
+    if (!vramTooltipEl) return;
+    if (!data || !data.available) {
+        vramTooltipEl.innerHTML = '<div class="vram-tooltip-hdr"><span>🧠 VRAM Processes</span><span>' + targetName.toUpperCase() + '</span></div>' +
+            '<div style="color:#889">GPU process data unavailable</div>';
+        return;
+    }
+
+    const procs = data.processes || [];
+    let html = '<div class="vram-tooltip-hdr"><span>🧠 VRAM Processes</span><span>' + targetName.toUpperCase() + '</span></div>';
+
+    if (procs.length === 0) {
+        html += '<div style="color:#889;padding:6px 0">No active compute processes holding VRAM</div>';
+    } else {
+        html += '<div class="vram-tooltip-list">';
+        for (const p of procs) {
+            html += '<div class="vram-proc-item">';
+            html += '<div class="vram-proc-hdr">';
+            html += '<span class="vram-proc-name">' + (p.process_name || 'unknown') + ' <span style="color:#889;font-size:0.85em">(PID ' + p.pid + ')</span></span>';
+            html += '<span class="vram-proc-vram">' + p.vram_mb.toLocaleString() + ' MiB</span>';
+            html += '</div>';
+
+            const details = [];
+            if (p.model) details.push('<span class="vram-proc-model">' + p.model + '</span>');
+            if (p.port) details.push('<span class="vram-proc-port">port ' + p.port + '</span>');
+            if (details.length > 0) {
+                html += '<div class="vram-proc-details">' + details.join(' · ') + '</div>';
+            }
+            html += '</div>';
+        }
+        html += '</div>';
+    }
+
+    const sumMb = data.sum_vram_mb !== undefined ? data.sum_vram_mb : (data.used_vram_mb || 0);
+    const freeMb = data.free_vram_mb !== undefined ? data.free_vram_mb : 0;
+    const totalMb = data.total_vram_mb !== undefined ? data.total_vram_mb : 0;
+
+    html += '<div class="vram-tooltip-footer">';
+    html += '<span>Sum: <span class="sum-val">' + sumMb.toLocaleString() + ' MiB</span></span>';
+    html += '<span>Free: <span class="free-val">' + freeMb.toLocaleString() + ' MiB</span></span>';
+    if (totalMb > 0) {
+        html += '<span>Total: ' + totalMb.toLocaleString() + ' MiB</span>';
+    }
+    html += '</div>';
+
+    vramTooltipEl.innerHTML = html;
 }
 
 document.addEventListener('visibilitychange', () => {
     if (document.hidden) {
+        // Do NOT go silent - drop to a 60s heartbeat so the page is current the
+        // instant it is looked at again, instead of showing however-old data.
         stopPolling();
+        startSlowPolling();
     } else {
-        // Immediate catch-up refresh, then resume the interval cadence.
-        refresh();
-        refreshFleet();
-        refreshHistory();
-        refreshEnergy();
-        refreshCiQueue();
-        refreshRouteHealth();
-        refreshCascade();
+        stopSlowPolling();
+        // Resume the cadence FIRST, then catch up. If a catch-up call throws, the
+        // timers are already armed, so the page keeps updating either way.
         startPolling();
+        panelRefreshers.forEach(([n, f]) => {
+            try { f(); } catch (err) { console.error('[dashboard] ' + n + ' failed on resume:', err); }
+        });
     }
 });
 
-refresh();
-refreshHistory();
-refreshEnergy();
-refreshFleet();
-refreshCiQueue();
-refreshRouteHealth();
-refreshCascade();
-if (!document.hidden) startPolling();
+// --- Last-updated stamp -------------------------------------------------
+// Every successful /api/ response stamps the clock. The ticker below renders it
+// and turns amber then red as it ages, so a dashboard that has stopped updating
+// SAYS SO instead of quietly showing hours-old numbers.
+let lastUpdateMs = 0;
+(function stampSuccessfulApiCalls() {
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = function (input, init) {
+        const url = (typeof input === 'string') ? input : (input && input.url) || '';
+        return nativeFetch(input, init).then(res => {
+            if (res && res.ok && url.indexOf('/api/') !== -1) lastUpdateMs = Date.now();
+            return res;
+        });
+    };
+})();
+
+function renderLastUpdated() {
+    const el = document.getElementById('last-updated');
+    const t = document.getElementById('lu-time');
+    if (!el || !t) return;
+    if (!lastUpdateMs) { t.textContent = 'connecting…'.padStart(15, ' '); el.className = 'last-updated aging'; return; }
+    const d = new Date(lastUpdateMs);
+    const age = Math.max(0, Math.round((Date.now() - lastUpdateMs) / 1000));
+    // Central Time explicitly - this box runs UTC and a bare local time would lie.
+    // 2-digit hour so 9:59 and 10:00 are the same width.
+    const clock = d.toLocaleTimeString('en-US', {
+        timeZone: 'America/Chicago', hour12: true,
+        hour: '2-digit', minute: '2-digit', second: '2-digit'
+    });
+    // Pad to a constant length so the line never changes width as the age grows
+    // from "1s" to "59s" to "12m". Paired with white-space:pre and a fixed ch
+    // width in CSS, the stamp is dead still.
+    const ago = age < 60 ? age + 's'
+              : age < 3600 ? Math.floor(age / 60) + 'm'
+              : Math.floor(age / 3600) + 'h';
+    t.textContent = clock + ' CT ' + (ago + ' ago').padStart(7, ' ');
+    // 12s is the fastest cadence; 45s means a beat was missed, 120s means stopped.
+    el.className = 'last-updated ' + (age <= 45 ? 'fresh' : age <= 120 ? 'aging' : 'stale');
+}
+setInterval(renderLastUpdated, 1000);
+
+// --- Bootstrap ----------------------------------------------------------
+// startPolling() runs FIRST and every call below is isolated.
+// Previously startPolling() was the LAST statement of an unguarded sequence, so a
+// single synchronous throw in any one of the ten refresh calls above it silently
+// disabled ALL auto-refresh for the life of the page - and because the
+// visibilitychange resume path called the same functions in the same unguarded
+// way, switching tabs could not recover it either. The page then sat on its
+// initial server-rendered numbers forever, looking healthy.
+function safeCall(label, fn) {
+    try { fn(); } catch (err) { console.error('[dashboard] ' + label + ' failed at startup:', err); }
+}
+
+startPolling();   // arm the timers before anything that can throw
+if (document.hidden) startSlowPolling();   // loaded in a background tab: still beat
+safeCall('initVramTooltip', initVramTooltip);
+safeCall('refresh', refresh);
+safeCall('refreshHistory', refreshHistory);
+safeCall('refreshEnergy', refreshEnergy);
+safeCall('refreshFleet', refreshFleet);
+safeCall('refreshCiQueue', refreshCiQueue);
+safeCall('refreshShipFlow', refreshShipFlow);
+safeCall('refreshRunsOn', refreshRunsOn);
+safeCall('refreshRouteHealth', refreshRouteHealth);
+safeCall('refreshFleetStats', refreshFleetStats);
+// first serving refresh waits for the target cards (built by refresh()) to exist
+setTimeout(() => safeCall('refreshModelServing', refreshModelServing), 5000);
+renderLastUpdated();
 </script></body></html>'''
 
 def rate_for(dt):
@@ -2909,21 +6257,35 @@ def get_energy():
     month_start = day_start.replace(day=1)
     windows = {"day": day_start, "week": week_start, "month": month_start}
 
-    conn = sqlite3.connect(CONFIG["db_path"])
-    by_machine = {}
+    by_machine = {
+        name: (
+            {"metered": False}
+            if cfg.get("os") == "mac"
+            else {
+                "metered": True,
+                **{w: {"kwh": 0.0, "cost": 0.0} for w in windows},
+            }
+        )
+        for name, cfg in CONFIG["targets"].items()
+    }
     fleet = {w: {"kwh": 0.0, "cost": 0.0} for w in windows}
-    for name, cfg in CONFIG["targets"].items():
-        # Macs report no wattage (powermetrics needs sudo), so they aren't metered
-        if cfg.get("os") == "mac":
-            by_machine[name] = {"metered": False}
-            continue
-        by_machine[name] = {"metered": True}
-        for wname, wstart in windows.items():
-            ec = energy_cost_since(conn, name, wstart)
-            by_machine[name][wname] = ec
-            fleet[wname]["kwh"] += ec["kwh"]
-            fleet[wname]["cost"] += ec["cost"]
-    conn.close()
+    conn = None
+    try:
+        conn = sqlite3.connect(CONFIG["db_path"])
+        for name, cfg in CONFIG["targets"].items():
+            # Macs report no wattage (powermetrics needs sudo), so they aren't metered
+            if cfg.get("os") == "mac":
+                continue
+            for wname, wstart in windows.items():
+                ec = energy_cost_since(conn, name, wstart)
+                by_machine[name][wname] = ec
+                fleet[wname]["kwh"] += ec["kwh"]
+                fleet[wname]["cost"] += ec["cost"]
+    except Exception as e:
+        logger.warning(f"energy history unavailable: {e}")
+    finally:
+        if conn is not None:
+            conn.close()
 
     for w in fleet:
         fleet[w]["kwh"] = round(fleet[w]["kwh"], 3)
@@ -2972,10 +6334,11 @@ def get_history():
         # Group by day
         group_minutes = 1440
     else:
-        return jsonify({"error": "Invalid range. Use: hour, day, week, month"}), 400
-
-    conn = sqlite3.connect(CONFIG["db_path"])
-    conn.row_factory = sqlite3.Row
+        return jsonify({
+            "range": range_param,
+            "data": {},
+            "error": "Invalid range. Use: hour, day, week, month",
+        }), 400
 
     # Build query
     query = """
@@ -2993,16 +6356,29 @@ def get_history():
 
     query += " ORDER BY timestamp ASC"
 
-    cursor = conn.execute(query, params)
-    rows = cursor.fetchall()
-    conn.close()
+    rows = []
+    conn = None
+    try:
+        conn = sqlite3.connect(CONFIG["db_path"])
+        conn.row_factory = sqlite3.Row
+        cursor = conn.execute(query, params)
+        rows = cursor.fetchall()
+    except Exception as e:
+        logger.warning(f"metrics history unavailable: {e}")
+    finally:
+        if conn is not None:
+            conn.close()
 
     # Group and aggregate data
-    result = {}
+    result = {
+        name: []
+        for name in CONFIG["targets"]
+        if not target_filter or name == target_filter
+    }
     for row in rows:
         target = row["target"]
         if target not in result:
-            result[target] = []
+            continue
 
         result[target].append({
             "timestamp": row["timestamp"],
@@ -3028,7 +6404,10 @@ def get_history():
             bucket_start = None
 
             for point in result[target]:
-                ts = datetime.fromisoformat(point["timestamp"])
+                try:
+                    ts = datetime.fromisoformat(point["timestamp"])
+                except (TypeError, ValueError):
+                    continue
                 if bucket_start is None:
                     bucket_start = ts
                     bucket = [point]
@@ -3046,9 +6425,6 @@ def get_history():
                 aggregated.append(aggregate_bucket(bucket))
 
             result[target] = aggregated
-
-    # Only surface configured targets, in CONFIG order (gandalf, frodo, pippin)
-    result = {t: result[t] for t in CONFIG["targets"] if t in result}
 
     return jsonify({
         "range": range_param,
@@ -3096,16 +6472,42 @@ if __name__ == "__main__":
     sync_thread = threading.Thread(target=sync_comfyui_jobs, daemon=True)
     sync_thread.start()
 
-    # Start ComfyUI watchdog (auto-restart if down)
-    watchdog_thread = threading.Thread(target=comfyui_watchdog_loop, daemon=True)
-    watchdog_thread.start()
+    # Model-serving sampler (tokens/sec + requests served, persisted to sqlite)
+    serving_thread = threading.Thread(target=collect_model_serving, daemon=True)
+    serving_thread.start()
+
+    # ComfyUI watchdog (auto-restart if down) — OFF BY DEFAULT.
+    #
+    # Ben, 2026-07-25: "I'm not even running comfy" / "take it off the auto
+    # boot up". ComfyUI holds GPU memory he wants free. The systemd unit was
+    # disabled and comfyui was dropped from the service-watchdog lists, but
+    # THIS thread kept resurrecting it anyway — it SSHes to each target and
+    # runs `sudo systemctl restart comfyui` (see restart_comfyui), which
+    # starts a *disabled* unit just fine. Caught 2026-07-27: comfyui had been
+    # restarting on gandalf hourly, and the watchdog was also failing against
+    # frodo (unit renamed comfyui.service.disabled-2026-07-25) every cycle.
+    #
+    # A kill switch was documented as existing but was never actually in the
+    # code, so there was no way to turn this off short of editing the file.
+    # Set COMFYUI_WATCHDOG_ENABLED=1 to opt back in when ComfyUI is
+    # deliberately put into service again.
+    if os.environ.get("COMFYUI_WATCHDOG_ENABLED", "").strip() in ("1", "true", "yes", "on"):
+        watchdog_thread = threading.Thread(target=comfyui_watchdog_loop, daemon=True)
+        watchdog_thread.start()
+        logger.info("ComfyUI watchdog: ENABLED (COMFYUI_WATCHDOG_ENABLED set)")
+    else:
+        logger.info(
+            "ComfyUI watchdog: DISABLED (default). ComfyUI will NOT be auto-restarted. "
+            "Set COMFYUI_WATCHDOG_ENABLED=1 to re-enable."
+        )
 
     logger.info("")
     logger.info("=" * 60)
-    logger.info("  SHADOWFAX FLEET MONITOR")
+    logger.info("  GANDALF FLEET MONITOR")
     logger.info("=" * 60)
     logger.info(f"  Listening: http://0.0.0.0:5000")
-    logger.info(f"  Dashboard: http://shadowfax.local")
+    # Stale since the 2026-07-21 move to gandalf; corrected 2026-07-30.
+    logger.info(f"  Dashboard: http://{FLEET_IPS['gandalf']}:5000")
     logger.info(f"  Targets:   {', '.join(CONFIG['targets'].keys())}")
     logger.info(f"  Notifications: Pushover {'enabled' if PUSHOVER_CONFIG['enabled'] else 'disabled'}")
     logger.info("=" * 60)
