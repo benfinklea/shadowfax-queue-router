@@ -4408,7 +4408,14 @@ color:#889;display:flex;justify-content:space-between;font-family:'Orbitron',mon
 font-size:0.62em;letter-spacing:1px;text-transform:uppercase;line-height:1.25;
 text-align:right;opacity:0.85;pointer-events:auto;white-space:nowrap}
 .last-updated .lu-label{display:block;font-size:0.82em;color:#5b6b7a;letter-spacing:2px}
-.last-updated .lu-time{display:block;font-weight:600}
+/* Fixed width, monospaced digits, preserved padding. Rajdhani is proportional and
+   has no guaranteed tabular figures, so a ticking clock made the whole stamp
+   shimmer once a second. ch units on a monospace stack make every character the
+   same width, and the JS pads to a constant length, so the box never reflows. */
+.last-updated .lu-time{display:block;font-weight:600;
+font-family:'JetBrains Mono','SF Mono',Menlo,Consolas,'DejaVu Sans Mono',monospace;
+font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1;
+letter-spacing:0;white-space:pre;width:22ch;text-align:right}
 .last-updated.fresh .lu-time{color:var(--neon-green);text-shadow:0 0 6px #39ff1466}
 .last-updated.aging .lu-time{color:var(--neon-yellow);text-shadow:0 0 6px #ffff0066}
 .last-updated.stale .lu-time{color:var(--neon-red);text-shadow:0 0 8px #ff004488}
@@ -6135,17 +6142,22 @@ function renderLastUpdated() {
     const el = document.getElementById('last-updated');
     const t = document.getElementById('lu-time');
     if (!el || !t) return;
-    if (!lastUpdateMs) { t.textContent = 'connecting…'; el.className = 'last-updated aging'; return; }
+    if (!lastUpdateMs) { t.textContent = 'connecting…'.padStart(15, ' '); el.className = 'last-updated aging'; return; }
     const d = new Date(lastUpdateMs);
     const age = Math.max(0, Math.round((Date.now() - lastUpdateMs) / 1000));
     // Central Time explicitly - this box runs UTC and a bare local time would lie.
+    // 2-digit hour so 9:59 and 10:00 are the same width.
     const clock = d.toLocaleTimeString('en-US', {
-        timeZone: 'America/Chicago', hour: 'numeric', minute: '2-digit', second: '2-digit'
+        timeZone: 'America/Chicago', hour12: true,
+        hour: '2-digit', minute: '2-digit', second: '2-digit'
     });
-    const ago = age < 60 ? age + 's ago'
-              : age < 3600 ? Math.floor(age / 60) + 'm ago'
-              : Math.floor(age / 3600) + 'h ago';
-    t.textContent = clock + ' CT · ' + ago;
+    // Pad to a constant length so the line never changes width as the age grows
+    // from "1s" to "59s" to "12m". Paired with white-space:pre and a fixed ch
+    // width in CSS, the stamp is dead still.
+    const ago = age < 60 ? age + 's'
+              : age < 3600 ? Math.floor(age / 60) + 'm'
+              : Math.floor(age / 3600) + 'h';
+    t.textContent = clock + ' CT ' + (ago + ' ago').padStart(7, ' ');
     // 12s is the fastest cadence; 45s means a beat was missed, 120s means stopped.
     el.className = 'last-updated ' + (age <= 45 ? 'fresh' : age <= 120 ? 'aging' : 'stale');
 }
