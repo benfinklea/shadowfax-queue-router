@@ -4401,8 +4401,20 @@ margin-bottom:8px;display:flex;justify-content:space-between;align-items:center}
 color:#889;display:flex;justify-content:space-between;font-family:'Orbitron',monospace}
 .vram-tooltip-footer .sum-val{color:var(--neon-green)}
 .vram-tooltip-footer .free-val{color:var(--neon-cyan)}
+/* Last-updated stamp: proves the page is live. If this stops ticking, the
+   dashboard has gone stale - which is exactly the failure it exists to show. */
+.hdr-wrap{position:relative}
+.last-updated{position:absolute;top:2px;right:0;font-family:'Rajdhani',sans-serif;
+font-size:0.62em;letter-spacing:1px;text-transform:uppercase;line-height:1.25;
+text-align:right;opacity:0.85;pointer-events:auto;white-space:nowrap}
+.last-updated .lu-label{display:block;font-size:0.82em;color:#5b6b7a;letter-spacing:2px}
+.last-updated .lu-time{display:block;font-weight:600}
+.last-updated.fresh .lu-time{color:var(--neon-green);text-shadow:0 0 6px #39ff1466}
+.last-updated.aging .lu-time{color:var(--neon-yellow);text-shadow:0 0 6px #ffff0066}
+.last-updated.stale .lu-time{color:var(--neon-red);text-shadow:0 0 8px #ff004488}
+@media(max-width:767px){.last-updated{position:static;text-align:center;margin:-18px 0 14px}}
 </style></head>
-<body><h1>GANDALF // FLEET MONITOR</h1>
+<body><div class="hdr-wrap"><h1>GANDALF // FLEET MONITOR</h1><div id="last-updated" class="last-updated" title="Time of the most recent successful data refresh. Green = fresh, amber = aging, red = this page has gone stale."><span class="lu-label">last updated</span><span class="lu-time" id="lu-time">connecting…</span></div></div>
 
 <div id="fleet-summary" style="margin:4px 0 14px 0;font-size:0.95em;color:#889">Loading fleet summary...</div>
 
@@ -5915,6 +5927,18 @@ function startPolling() {
     if (!modelServingTimer) modelServingTimer = setInterval(refreshModelServing, 60000); // matches sampler cadence
 }
 
+// Background heartbeat. Chrome throttles background-tab timers to roughly once a
+// minute, so 60s is the fastest cadence that actually survives being hidden. This
+// exists because a fleet monitor that freezes when it is not the focused tab is
+// useless as a glanceable display - which is the reported bug.
+let slowTimer = null;
+function startSlowPolling() {
+    if (!slowTimer) slowTimer = setInterval(() => {
+        try { refresh(); } catch (err) { console.error('[dashboard] background refresh failed:', err); }
+    }, 60000);
+}
+function stopSlowPolling() { clearInterval(slowTimer); slowTimer = null; }
+
 function stopPolling() {
     clearInterval(statusTimer); statusTimer = null;
     clearInterval(fleetTimer); fleetTimer = null;
@@ -6072,36 +6096,88 @@ function renderVramTooltipContent(targetName, data) {
 
 document.addEventListener('visibilitychange', () => {
     if (document.hidden) {
+        // Do NOT go silent - drop to a 60s heartbeat so the page is current the
+        // instant it is looked at again, instead of showing however-old data.
         stopPolling();
+        startSlowPolling();
     } else {
-        // Immediate catch-up refresh, then resume the interval cadence.
-        refresh();
-        refreshFleet();
-        refreshHistory();
-        refreshEnergy();
-        refreshCiQueue();
-        refreshShipFlow();
-        refreshRunsOn();
-        refreshRouteHealth();
-        refreshFleetStats();
-        refreshModelServing();
+        stopSlowPolling();
+        // Resume the cadence FIRST, then catch up. If a catch-up call throws, the
+        // timers are already armed, so the page keeps updating either way.
         startPolling();
+        [['refresh', refresh], ['refreshFleet', refreshFleet], ['refreshHistory', refreshHistory],
+         ['refreshEnergy', refreshEnergy], ['refreshCiQueue', refreshCiQueue],
+         ['refreshShipFlow', refreshShipFlow], ['refreshRunsOn', refreshRunsOn],
+         ['refreshRouteHealth', refreshRouteHealth], ['refreshFleetStats', refreshFleetStats],
+         ['refreshModelServing', refreshModelServing]].forEach(([n, f]) => {
+            try { f(); } catch (err) { console.error('[dashboard] ' + n + ' failed on resume:', err); }
+        });
     }
 });
 
-initVramTooltip();
-refresh();
-refreshHistory();
-refreshEnergy();
-refreshFleet();
-refreshCiQueue();
-refreshShipFlow();
-refreshRunsOn();
-refreshRouteHealth();
-refreshFleetStats();
+// --- Last-updated stamp -------------------------------------------------
+// Every successful /api/ response stamps the clock. The ticker below renders it
+// and turns amber then red as it ages, so a dashboard that has stopped updating
+// SAYS SO instead of quietly showing hours-old numbers.
+let lastUpdateMs = 0;
+(function stampSuccessfulApiCalls() {
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = function (input, init) {
+        const url = (typeof input === 'string') ? input : (input && input.url) || '';
+        return nativeFetch(input, init).then(res => {
+            if (res && res.ok && url.indexOf('/api/') !== -1) lastUpdateMs = Date.now();
+            return res;
+        });
+    };
+})();
+
+function renderLastUpdated() {
+    const el = document.getElementById('last-updated');
+    const t = document.getElementById('lu-time');
+    if (!el || !t) return;
+    if (!lastUpdateMs) { t.textContent = 'connecting…'; el.className = 'last-updated aging'; return; }
+    const d = new Date(lastUpdateMs);
+    const age = Math.max(0, Math.round((Date.now() - lastUpdateMs) / 1000));
+    // Central Time explicitly - this box runs UTC and a bare local time would lie.
+    const clock = d.toLocaleTimeString('en-US', {
+        timeZone: 'America/Chicago', hour: 'numeric', minute: '2-digit', second: '2-digit'
+    });
+    const ago = age < 60 ? age + 's ago'
+              : age < 3600 ? Math.floor(age / 60) + 'm ago'
+              : Math.floor(age / 3600) + 'h ago';
+    t.textContent = clock + ' CT · ' + ago;
+    // 12s is the fastest cadence; 45s means a beat was missed, 120s means stopped.
+    el.className = 'last-updated ' + (age <= 45 ? 'fresh' : age <= 120 ? 'aging' : 'stale');
+}
+setInterval(renderLastUpdated, 1000);
+
+// --- Bootstrap ----------------------------------------------------------
+// startPolling() runs FIRST and every call below is isolated.
+// Previously startPolling() was the LAST statement of an unguarded sequence, so a
+// single synchronous throw in any one of the ten refresh calls above it silently
+// disabled ALL auto-refresh for the life of the page - and because the
+// visibilitychange resume path called the same functions in the same unguarded
+// way, switching tabs could not recover it either. The page then sat on its
+// initial server-rendered numbers forever, looking healthy.
+function safeCall(label, fn) {
+    try { fn(); } catch (err) { console.error('[dashboard] ' + label + ' failed at startup:', err); }
+}
+
+startPolling();   // arm the timers before anything that can throw
+if (document.hidden) startSlowPolling();   // loaded in a background tab: still beat
+safeCall('initVramTooltip', initVramTooltip);
+safeCall('refresh', refresh);
+safeCall('refreshHistory', refreshHistory);
+safeCall('refreshEnergy', refreshEnergy);
+safeCall('refreshFleet', refreshFleet);
+safeCall('refreshCiQueue', refreshCiQueue);
+safeCall('refreshShipFlow', refreshShipFlow);
+safeCall('refreshRunsOn', refreshRunsOn);
+safeCall('refreshRouteHealth', refreshRouteHealth);
+safeCall('refreshFleetStats', refreshFleetStats);
 // first serving refresh waits for the target cards (built by refresh()) to exist
-setTimeout(refreshModelServing, 5000);
-if (!document.hidden) startPolling();
+setTimeout(() => safeCall('refreshModelServing', refreshModelServing), 5000);
+renderLastUpdated();
 </script></body></html>'''
 
 def rate_for(dt):
