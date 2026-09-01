@@ -5927,7 +5927,7 @@ function startPolling() {
     if (!historyTimer) historyTimer = setInterval(refreshHistory, 60000);
     if (!energyTimer) energyTimer = setInterval(refreshEnergy, 60000);
     if (!ciQueueTimer) ciQueueTimer = setInterval(refreshCiQueue, 45000);        // matches backend cache TTL
-    if (!shipFlowTimer) shipFlowTimer = setInterval(refreshShipFlow, 120000);    // /api/pipeline is cached 5 min
+    if (!shipFlowTimer) shipFlowTimer = setInterval(refreshShipFlow, 45000);     // matches backend 45s cache TTL
     if (!runsonTimer) runsonTimer = setInterval(refreshRunsOn, 120000);           // matches AWS cache TTL
     if (!routeHealthTimer) routeHealthTimer = setInterval(refreshRouteHealth, 30000);
     if (!fleetStatsTimer) fleetStatsTimer = setInterval(refreshFleetStats, 60000); // matches backend cache TTL
@@ -5939,9 +5939,18 @@ function startPolling() {
 // exists because a fleet monitor that freezes when it is not the focused tab is
 // useless as a glanceable display - which is the reported bug.
 let slowTimer = null;
+const panelRefreshers = [
+    ['refresh', refresh], ['refreshFleet', refreshFleet], ['refreshHistory', refreshHistory],
+    ['refreshEnergy', refreshEnergy], ['refreshCiQueue', refreshCiQueue],
+    ['refreshShipFlow', refreshShipFlow], ['refreshRunsOn', refreshRunsOn],
+    ['refreshRouteHealth', refreshRouteHealth], ['refreshFleetStats', refreshFleetStats],
+    ['refreshModelServing', refreshModelServing]
+];
 function startSlowPolling() {
     if (!slowTimer) slowTimer = setInterval(() => {
-        try { refresh(); } catch (err) { console.error('[dashboard] background refresh failed:', err); }
+        panelRefreshers.forEach(([label, fn]) => {
+            try { fn(); } catch (err) { console.error('[dashboard] ' + label + ' failed in background:', err); }
+        });
     }, 60000);
 }
 function stopSlowPolling() { clearInterval(slowTimer); slowTimer = null; }
@@ -6112,11 +6121,7 @@ document.addEventListener('visibilitychange', () => {
         // Resume the cadence FIRST, then catch up. If a catch-up call throws, the
         // timers are already armed, so the page keeps updating either way.
         startPolling();
-        [['refresh', refresh], ['refreshFleet', refreshFleet], ['refreshHistory', refreshHistory],
-         ['refreshEnergy', refreshEnergy], ['refreshCiQueue', refreshCiQueue],
-         ['refreshShipFlow', refreshShipFlow], ['refreshRunsOn', refreshRunsOn],
-         ['refreshRouteHealth', refreshRouteHealth], ['refreshFleetStats', refreshFleetStats],
-         ['refreshModelServing', refreshModelServing]].forEach(([n, f]) => {
+        panelRefreshers.forEach(([n, f]) => {
             try { f(); } catch (err) { console.error('[dashboard] ' + n + ' failed on resume:', err); }
         });
     }
