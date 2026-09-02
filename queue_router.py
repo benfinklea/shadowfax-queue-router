@@ -4389,7 +4389,7 @@ text-transform:uppercase;color:#7a839c;margin-top:4px}
 @media(max-width:1279px){.monitor-glance-band{grid-template-columns:1fr}}
 @media(max-width:720px){.runson-visuals,#runson-card .runson-visuals{grid-template-columns:1fr}.runson-gauges,#runson-card .runson-gauges{grid-template-columns:1fr}.runson-source{margin-left:0}}
 .gstrip{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px;align-items:center}
-.gcell{display:flex;flex-wrap:wrap;align-items:center;align-content:center;gap:0 9px;
+.gcell{display:grid;grid-template-columns:max-content max-content 1fr;align-items:center;align-content:center;gap:0 9px;
 padding:0 4px;border-left:2px solid #24304d;min-width:0}
 .gcell .gicon{font-size:1.15em;line-height:1;flex:0 0 auto}
 .gnum{font-family:'Orbitron',monospace;font-size:1.15em;font-weight:700;line-height:1;
@@ -4399,14 +4399,14 @@ color:var(--neon-cyan);text-shadow:0 0 9px var(--neon-cyan)}
 .gnum.hot{color:var(--neon-red);text-shadow:0 0 9px var(--neon-red)}
 .gcap{font-size:0.56em;letter-spacing:1px;text-transform:uppercase;color:#778;
 font-family:'Orbitron',monospace;margin-top:2px;white-space:nowrap}
-.gpair{display:flex;flex-direction:column;align-items:center;flex:0 0 auto}
+.gpair{display:flex;flex-direction:column;align-items:center;justify-self:start;flex:0 0 auto}
 .gdim{color:#667;font-size:0.8em}
-.gbar{flex:0 0 100%;width:100%;height:5px;border-radius:3px;background:#182137;
+.gbar{grid-column:1/-1;width:100%;height:5px;border-radius:3px;background:#182137;
 border:1px solid #24304d;overflow:hidden;position:relative}
 .gbar i{display:block;height:100%;background:linear-gradient(90deg,#00fff2,#39ff14);
 box-shadow:0 0 7px #00fff2;transition:width 1.2s cubic-bezier(0.4,0,0.2,1)}
 .gbar i.hot{background:linear-gradient(90deg,#ff9500,#ff0044);box-shadow:0 0 7px #ff0044}
-.gdots{display:flex;gap:3px;flex-wrap:wrap;flex:0 0 100%;width:100%;min-height:8px}
+.gdots{grid-column:1/-1;display:flex;gap:3px;flex-wrap:wrap;width:100%;min-height:8px}
 .gdot{width:8px;height:8px;border-radius:50%;background:#2a3450;border:1px solid #37436a}
 .gdot.loaded{background:var(--neon-green);border-color:var(--neon-green);box-shadow:0 0 6px var(--neon-green)}
 .gdot.missing{background:var(--neon-red);border-color:var(--neon-red);box-shadow:0 0 6px var(--neon-red)}
