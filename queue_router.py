@@ -4320,6 +4320,9 @@ border-radius:1px 1px 0 0;min-height:1px}
 border-radius:999px;color:#758097;font-size:0.62em;white-space:nowrap}
 .ship-updated.stale{color:var(--neon-yellow);border-color:rgba(255,255,0,0.55);
 background:rgba(255,255,0,0.06);box-shadow:0 0 7px rgba(255,255,0,0.16)}
+.monitor-glance-band{display:grid;grid-template-columns:minmax(720px,1.25fr) minmax(500px,.75fr);
+gap:10px;align-items:start;margin:10px 0}
+.monitor-glance-band>.card{margin:0}
 .runson-grid{display:flex;gap:22px;align-items:center;flex-wrap:wrap}
 .runson-live{min-width:180px}
 .runson-count{font-family:'Orbitron',monospace;font-size:2em;font-weight:700;line-height:1;
@@ -4352,25 +4355,58 @@ text-transform:uppercase;color:#7a839c;margin-top:4px}
 .runson-gauge-track{height:7px;background:#20283c;border-radius:999px;overflow:hidden}
 .runson-gauge-fill{height:100%;border-radius:999px;transition:width .3s}.runson-gauge-fill.good{background:#39ff14}.runson-gauge-fill.warn{background:#d9a54a}.runson-gauge-fill.bad{background:#d94a4a}
 .runson-gauge.dim{opacity:.45}
-@media(max-width:720px){.runson-visuals{grid-template-columns:1fr}.runson-gauges{grid-template-columns:1fr}.runson-source{margin-left:0}}
+/* RunsOn shares the glance band, so retain every datum while tightening its
+   typography, gaps, and charts to the same glanceable density. */
+#runson-card{padding:9px 12px;min-width:0}
+#runson-card h3{font-size:.78em;margin:0 0 6px;letter-spacing:1.2px}
+#runson-card .runson-grid{gap:8px 12px;align-items:flex-start}
+#runson-card .runson-live{min-width:88px}
+#runson-card .runson-count{font-size:1.35em}
+#runson-card .runson-label{font-size:.55em;margin-top:2px}
+#runson-card .runson-runners{gap:3px;margin-top:3px}
+#runson-card .runson-runner{padding:1px 5px;font-size:.65em}
+#runson-card .runson-facts{gap:7px 12px;flex:1 1 330px}
+#runson-card .runson-fact b{font-size:.88em}
+#runson-card .runson-fact span{font-size:.64em}
+#runson-card .runson-flow{gap:7px}
+#runson-card .runson-flow-cell b{font-size:1.15em}
+#runson-card .runson-flow-cell span{font-size:.58em;margin-top:2px}
+#runson-card .runson-flow-arrow{font-size:1em;padding-bottom:9px}
+#runson-card .runson-budget{margin-top:6px;padding-top:6px}
+#runson-card .runson-budget-head{gap:12px;margin-bottom:4px}
+#runson-card .runson-spend{min-width:88px}
+#runson-card .runson-spend strong{font-size:.9em}
+#runson-card .runson-spend strong,#runson-card .runson-spend small{line-height:1.1}
+#runson-card .runson-spend small,#runson-card .runson-source{font-size:.6em}
+#runson-card .runson-visuals{grid-template-columns:minmax(180px,1.3fr) minmax(160px,1fr);gap:6px}
+#runson-card .runson-chart{padding:4px 6px}
+#runson-card .runson-chart-title{font-size:.55em;margin-bottom:1px}
+#runson-card .runson-chart svg{height:44px}
+#runson-card .runson-runway{font-size:.62em;margin-top:1px}
+#runson-card .runson-gauges{gap:6px;margin-top:5px}
+#runson-card .runson-gauge-label{font-size:.6em;margin-bottom:2px}
+#runson-card .runson-gauge-track{height:5px}
+@media(max-width:1279px){.monitor-glance-band{grid-template-columns:1fr}}
+@media(max-width:720px){.runson-visuals,#runson-card .runson-visuals{grid-template-columns:1fr}.runson-gauges,#runson-card .runson-gauges{grid-template-columns:1fr}.runson-source{margin-left:0}}
 .gstrip{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px;align-items:center}
-.gcell{display:flex;align-items:center;gap:9px;padding:2px 4px;border-left:2px solid #24304d;min-width:0}
+.gcell{display:flex;flex-wrap:wrap;align-items:center;align-content:center;gap:0 9px;
+padding:0 4px;border-left:2px solid #24304d;min-width:0}
 .gcell .gicon{font-size:1.15em;line-height:1;flex:0 0 auto}
-.gnum{font-family:'Orbitron',monospace;font-size:1.35em;font-weight:700;line-height:1;
+.gnum{font-family:'Orbitron',monospace;font-size:1.15em;font-weight:700;line-height:1;
 color:var(--neon-cyan);text-shadow:0 0 9px var(--neon-cyan)}
 .gnum.ok{color:var(--neon-green);text-shadow:0 0 9px var(--neon-green)}
 .gnum.warn{color:var(--neon-yellow);text-shadow:0 0 9px var(--neon-yellow)}
 .gnum.hot{color:var(--neon-red);text-shadow:0 0 9px var(--neon-red)}
-.gcap{font-size:0.62em;letter-spacing:1px;text-transform:uppercase;color:#778;
+.gcap{font-size:0.56em;letter-spacing:1px;text-transform:uppercase;color:#778;
 font-family:'Orbitron',monospace;margin-top:2px;white-space:nowrap}
 .gpair{display:flex;flex-direction:column;align-items:center;flex:0 0 auto}
 .gdim{color:#667;font-size:0.8em}
-.gbar{flex:1 1 auto;min-width:36px;height:7px;border-radius:3px;background:#182137;
+.gbar{flex:0 0 100%;width:100%;height:5px;border-radius:3px;background:#182137;
 border:1px solid #24304d;overflow:hidden;position:relative}
 .gbar i{display:block;height:100%;background:linear-gradient(90deg,#00fff2,#39ff14);
 box-shadow:0 0 7px #00fff2;transition:width 1.2s cubic-bezier(0.4,0,0.2,1)}
 .gbar i.hot{background:linear-gradient(90deg,#ff9500,#ff0044);box-shadow:0 0 7px #ff0044}
-.gdots{display:flex;gap:3px;flex-wrap:wrap;flex:1 1 auto}
+.gdots{display:flex;gap:3px;flex-wrap:wrap;flex:0 0 100%;width:100%;min-height:8px}
 .gdot{width:8px;height:8px;border-radius:50%;background:#2a3450;border:1px solid #37436a}
 .gdot.loaded{background:var(--neon-green);border-color:var(--neon-green);box-shadow:0 0 6px var(--neon-green)}
 .gdot.missing{background:var(--neon-red);border-color:var(--neon-red);box-shadow:0 0 6px var(--neon-red)}
@@ -4425,7 +4461,8 @@ letter-spacing:0;white-space:pre;width:22ch;text-align:right}
 
 <div id="fleet-summary" style="margin:4px 0 14px 0;font-size:0.95em;color:#889">Loading fleet summary...</div>
 
-<div class=card id=glance-strip style="padding:9px 12px;margin:10px 0">
+<div class="monitor-glance-band">
+<div class=card id=glance-strip style="padding:9px 12px">
 <div id="ship-flow" class="ship-flow"><span class="gdim">shipping pipeline…</span></div>
 <div class="gstrip">
 <div class="gcell" id="ci-queue-body"><span class="gdim">CI queue…</span></div>
@@ -4434,14 +4471,15 @@ letter-spacing:0;white-space:pre;width:22ch;text-align:right}
 </div>
 </div>
 
-<div class=card id=monitors><p>Loading...</p></div>
-<div class=card id=fleet-hosts style="padding:12px 15px;margin:12px 0">
-<div id=fleet-row class=fleet-row><p style="grid-column:1/-1;color:#667;margin:0">Scanning fleet hosts...</p></div>
-</div>
-
 <div class=card id=runson-card>
 <h3>☁️ RunsOn CI</h3>
 <div id=runson-body><p>Loading...</p></div>
+</div>
+</div>
+
+<div class=card id=monitors><p>Loading...</p></div>
+<div class=card id=fleet-hosts style="padding:12px 15px;margin:12px 0">
+<div id=fleet-row class=fleet-row><p style="grid-column:1/-1;color:#667;margin:0">Scanning fleet hosts...</p></div>
 </div>
 
 <div class=card id=history>
