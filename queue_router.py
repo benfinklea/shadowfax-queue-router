@@ -4357,37 +4357,41 @@ text-transform:uppercase;color:#7a839c;margin-top:4px}
 .runson-gauge.dim{opacity:.45}
 /* RunsOn shares the glance band, so retain every datum while tightening its
    typography, gaps, and charts to the same glanceable density. */
-#runson-card{padding:9px 12px;min-width:0}
-#runson-card h3{font-size:.78em;margin:0 0 6px;letter-spacing:1.2px}
-#runson-card .runson-grid{gap:8px 12px;align-items:flex-start}
-#runson-card .runson-live{min-width:88px}
-#runson-card .runson-count{font-size:1.35em}
-#runson-card .runson-label{font-size:.55em;margin-top:2px}
-#runson-card .runson-runners{gap:3px;margin-top:3px}
-#runson-card .runson-runner{padding:1px 5px;font-size:.65em}
-#runson-card .runson-facts{gap:7px 12px;flex:1 1 330px}
-#runson-card .runson-fact b{font-size:.88em}
-#runson-card .runson-fact span{font-size:.64em}
-#runson-card .runson-flow{gap:7px}
+#runson-card{padding:8px 12px 9px;min-width:0}
+#runson-card h3{font-size:.78em;margin:0 0 5px;letter-spacing:1.2px}
+/* Two bands only (Ben, 2026-09-02: "7 pieces of data and 2 charts" must not stack four rows deep):
+   band 1 = live runners, jobs, trial clock, credits on one line;
+   band 2 = spend today/month with fuse bars as a column beside the two charts, chart captions folded into the title line. */
+#runson-card .runson-grid{display:flex;flex-wrap:wrap;gap:4px 16px;align-items:flex-start}
+#runson-card .runson-live{min-width:0;display:flex;flex-direction:column}
+#runson-card .runson-count{font-size:1.15em;line-height:1.05}
+#runson-card .runson-label{font-size:.52em;margin-top:2px;line-height:1.1}
+#runson-card .runson-runners{gap:3px;margin-top:2px}
+#runson-card .runson-runner{padding:0 5px;font-size:.6em}
+#runson-card .runson-flow{gap:5px}
 #runson-card .runson-flow-cell b{font-size:1.15em}
-#runson-card .runson-flow-cell span{font-size:.58em;margin-top:2px}
-#runson-card .runson-flow-arrow{font-size:1em;padding-bottom:9px}
-#runson-card .runson-budget{margin-top:6px;padding-top:6px}
-#runson-card .runson-budget-head{gap:12px;margin-bottom:4px}
-#runson-card .runson-spend{min-width:88px}
-#runson-card .runson-spend strong{font-size:.9em}
-#runson-card .runson-spend strong,#runson-card .runson-spend small{line-height:1.1}
-#runson-card .runson-spend small,#runson-card .runson-source{font-size:.6em}
-#runson-card .runson-visuals{grid-template-columns:minmax(180px,1.3fr) minmax(160px,1fr);gap:6px}
-#runson-card .runson-chart{padding:4px 6px}
-#runson-card .runson-chart-title{font-size:.55em;margin-bottom:1px}
-#runson-card .runson-chart svg{height:44px}
-#runson-card .runson-runway{font-size:.62em;margin-top:1px}
-#runson-card .runson-gauges{gap:6px;margin-top:5px}
-#runson-card .runson-gauge-label{font-size:.6em;margin-bottom:2px}
-#runson-card .runson-gauge-track{height:5px}
+#runson-card .runson-flow-cell span{font-size:.52em;margin-top:2px}
+#runson-card .runson-flow-arrow{font-size:.95em;padding-bottom:9px}
+#runson-card .runson-fact b{font-size:.92em;line-height:1.05}
+#runson-card .runson-fact span{font-size:.6em;line-height:1.1;display:block;margin-top:2px;white-space:nowrap}
+#runson-card .runson-budget{width:auto;margin:0;padding:0 8px 0 0;border:0;border-right:1px solid #252e47;display:grid;grid-template-columns:1fr;gap:2px;align-content:space-between;align-self:stretch}
+#runson-card .runson-spend:nth-child(1){order:1}#runson-card .runson-gauge:nth-child(1){order:2}
+#runson-card .runson-spend:nth-child(2){order:3}#runson-card .runson-gauge:nth-child(2){order:4}
+#runson-card .runson-gauge:nth-child(1){margin-bottom:4px}
+#runson-card .runson-spend{min-width:0}
+#runson-card .runson-spend strong{font-size:.92em;line-height:1.05}
+#runson-card .runson-spend small{font-size:.6em;line-height:1.1;display:block;margin-top:2px;white-space:nowrap}
+#runson-card .runson-gauges{display:contents}
+#runson-card .runson-gauge{min-width:72px}
+#runson-card .runson-gauge-label{display:none}
+#runson-card .runson-gauge-track{height:4px}
+#runson-card .runson-visuals{grid-template-columns:auto minmax(150px,1.3fr) minmax(130px,1fr);gap:6px;margin-top:6px}
+#runson-card .runson-chart{padding:3px 6px 4px}
+#runson-card .runson-chart-title{font-size:.55em;margin-bottom:1px;display:flex;justify-content:space-between;gap:8px;white-space:nowrap;overflow:hidden}
+#runson-card .runson-chart-title .runson-source,#runson-card .runson-chart-title .runson-runway{margin:0;font-size:1em;letter-spacing:.4px;text-transform:none;color:#6f7890;overflow:hidden;text-overflow:ellipsis}
+#runson-card .runson-chart svg{height:40px}
 @media(max-width:1279px){.monitor-glance-band{grid-template-columns:1fr}}
-@media(max-width:720px){.runson-visuals,#runson-card .runson-visuals{grid-template-columns:1fr}.runson-gauges,#runson-card .runson-gauges{grid-template-columns:1fr}.runson-source{margin-left:0}}
+@media(max-width:720px){.runson-visuals{grid-template-columns:1fr}#runson-card .runson-visuals{grid-template-columns:auto 1fr}#runson-card .runson-budget{grid-row:1/3}.runson-gauges,#runson-card .runson-gauges{grid-template-columns:1fr}.runson-source{margin-left:0}}
 .gstrip{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px;align-items:center}
 .gcell{display:grid;grid-template-columns:max-content max-content 1fr;align-items:center;align-content:center;gap:0 9px;
 padding:0 4px;border-left:2px solid #24304d;min-width:0}
@@ -5856,7 +5860,7 @@ function runsonDailySpendChart(rows) {
         + '<line x1="0" y1="68" x2="300" y2="68" stroke="#30394f"/>' + bars + '</svg>';
 }
 
-function runsonCreditsChart(runway, remaining) {
+function runsonCreditsChart(runway, remaining, compact) {
     const samples = ((runway || {}).samples || []).filter(p =>
         Number.isFinite(Number(p.credits)) && Number.isFinite(Date.parse(p.ts)));
     let svg = '<svg id="runson-credits-chart" viewBox="0 0 300 74" role="img" aria-label="Remaining AWS credits">';
@@ -5877,6 +5881,7 @@ function runsonCreditsChart(runway, remaining) {
         svg += '<line x1="0" y1="68" x2="300" y2="68" stroke="#424a5d" opacity=".35"/>';
     }
     svg += '</svg>';
+    if (compact) return svg;
     const projection = (runway || {}).projection_date;
     const caption = projection
         ? 'credits last until ~' + runsonEscape(projection) + ' at this pace'
@@ -5925,30 +5930,51 @@ function refreshRunsOn() {
             ? Number.NaN : Number(d.credits_remaining);
         const credits = Number.isFinite(creditsNumber) ? '$' + creditsNumber.toFixed(2) : 'n/a';
         const limits = d.budget_limits || {};
+        // Band 1: live runners, jobs, trial clock, credits on one line.
+        // Band 2: the spend column (today/month + fuse bars; the truth suite reads
+        // it by id) beside the two charts.
+        const dailyLimit = Number(limits.daily || 10), monthlyLimit = Number(limits.monthly_guard || 25);
         const budgetStrip = '<div class="runson-budget" id="runson-budget-strip">'
-            + '<div class="runson-budget-head">'
             + '<div class="runson-spend"><strong id="runson-spent-today">' + runsonMoney(d.spent_today)
-            + '</strong><small>Spent today</small></div>'
+            + '</strong><small>Spent today · $' + dailyLimit.toFixed(0) + ' fuse</small></div>'
             + '<div class="runson-spend"><strong id="runson-spent-month">' + runsonMoney(d.spent_month)
-            + '</strong><small>Spent this month</small></div>'
-            + '<div class="runson-source">' + runsonEscape(d.cost_source_label || 'n/a') + '</div></div>'
-            + '<div class="runson-visuals"><div class="runson-chart"><div class="runson-chart-title">Daily spend · 30 days</div>'
-            + runsonDailySpendChart(d.daily_spend) + '</div>'
-            + '<div class="runson-chart"><div class="runson-chart-title">Credits runway</div>'
-            + runsonCreditsChart(d.credits_runway, d.credits_remaining) + '</div></div>'
+            + '</strong><small>Spent this month · $' + monthlyLimit.toFixed(0) + ' guard</small></div>'
             + '<div class="runson-gauges" id="runson-budget-gauges">'
-            + runsonBudgetGauge('Daily fuse', d.spent_today, limits.daily || 10)
-            + runsonBudgetGauge('Monthly guard', d.spent_month, limits.monthly_guard || 25)
+            + runsonBudgetGauge('Daily fuse', d.spent_today, dailyLimit)
+            + runsonBudgetGauge('Monthly guard', d.spent_month, monthlyLimit)
             + '</div></div>';
+        // Band 2: the two charts, captions folded into their title lines.
+        const runwayCaption = (function(){
+            const projection = ((d.credits_runway || {}).projection_date);
+            return projection ? 'lasts until ~' + runsonEscape(projection) : '<span class="runson-na">runway n/a</span>';
+        })();
+        const visuals = '<div class="runson-visuals">' + budgetStrip
+            + '<div class="runson-chart"><div class="runson-chart-title"><span>Spend · 30d</span>'
+            + '<span class="runson-source">' + runsonEscape(d.cost_source_label || 'n/a') + '</span></div>'
+            + runsonDailySpendChart(d.daily_spend) + '</div>'
+            + '<div class="runson-chart"><div class="runson-chart-title"><span>Credits</span>'
+            + '<span class="runson-runway">' + runwayCaption + '</span></div>'
+            + runsonCreditsChart(d.credits_runway, d.credits_remaining, true) + '</div></div>';
         body.innerHTML = '<div class="runson-grid">'
             + '<div class="runson-live"><div class="runson-count' + (count === 0 ? ' zero' : '') + '">' + count + '</div>'
-            + '<div class="runson-label">live runners</div>' + runnerDetail + '</div>'
-            + '<div class="runson-facts">'
-            + '<div class="runson-fact"><b>' + Number(d.jobs_today || 0) + '</b><span>jobs today</span></div>'
+            + '<div class="runson-label">live runners</div>' + (count === 0 ? '' : runnerDetail) + '</div>'
+            + (function(){
+                var tried = Number(d.jobs_today || 0);
+                var doneKnown = (d.jobs_done !== null && d.jobs_done !== undefined);
+                var done = doneKnown ? Number(d.jobs_done) : null;
+                // Stranded = work was offered and none of it ran. That is a failure
+                // wearing a success-shaped number, so colour it red.
+                var stranded = doneKnown && tried > 0 && done === 0;
+                return '<div class="runson-flow' + (stranded ? ' runson-stranded' : '') + '">'
+                  + '<div class="runson-flow-cell"><b>' + tried + '</b><span>jobs tried</span></div>'
+                  + '<div class="runson-flow-arrow">&rarr;</div>'
+                  + '<div class="runson-flow-cell"><b>' + (doneKnown ? done : '?') + '</b><span>jobs done</span></div>'
+                  + '</div>';
+              })()
             + '<div class="runson-fact"><b>' + Number(d.trial_days_remaining || 0) + ' days</b><span>to $'
-            + Number(d.subscription_usd_per_year || 350) + '/year charge · ' + runsonEscape(d.trial_charge_date || '2026-09-12') + '</span></div>'
-            + '<div class="runson-fact"><b>' + credits + '</b><span>AWS credits remaining</span></div>'
-            + '</div>' + budgetStrip + '</div>';
+            + Number(d.subscription_usd_per_year || 350) + '/yr · ' + runsonEscape(d.trial_charge_date || '2026-09-30') + '</span></div>'
+            + '<div class="runson-fact"><b>' + credits + '</b><span>AWS credits left</span></div>'
+            + '</div>' + visuals;
     }).catch(() => {
         const body = document.getElementById('runson-body');
         if (body) body.innerHTML = '<p class="runson-warning">⚠ RunsOn panel failed to load</p>';
