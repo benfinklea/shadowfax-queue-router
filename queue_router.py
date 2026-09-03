@@ -1744,11 +1744,54 @@ ci_queue_cache_lock = threading.Lock()
 ci_queue_refresh_lock = threading.Lock()
 CI_QUEUE_CACHE_TTL = 2  # seconds - keep volatile counts inside the truth suite's +/-1 window
 
-def get_ci_queue_status():
+# Manual panel refreshes may bypass a top-level endpoint cache, but at most once
+# per endpoint per five seconds. The cache is still populated by the bypass so
+# normal timer polls and other dashboard tabs benefit from the fresh snapshot.
+FRESH_BYPASS_WINDOW = 5.0
+fresh_bypass_lock = threading.Lock()
+fresh_bypass_at = {}
+
+def _fresh_bypass(endpoint):
+    """Return (force_refresh, disposition) for this request's ?fresh=1."""
+    if request.args.get("fresh") != "1":
+        return False, None
+    now = time.monotonic()
+    with fresh_bypass_lock:
+        previous = fresh_bypass_at.get(endpoint, 0.0)
+        if now - previous < FRESH_BYPASS_WINDOW:
+            logger.info("fresh=1 rate-limited endpoint=%s; serving cache", endpoint)
+            return False, "rate-limited"
+        # Hold the endpoint closed while its upstream request is in flight. The
+        # completion timestamp is installed by _fresh_jsonify below.
+        fresh_bypass_at[endpoint] = float("inf")
+        request.environ["queue_router.fresh_endpoint"] = endpoint
+    logger.info("fresh=1 bypass endpoint=%s; fetching upstream", endpoint)
+    return True, "fetched"
+
+def _fresh_jsonify(data, disposition, endpoint=None):
+    if disposition == "fetched" and endpoint:
+        with fresh_bypass_lock:
+            fresh_bypass_at[endpoint] = time.monotonic()
+    response = jsonify(data)
+    if disposition:
+        response.headers["X-Fresh-Result"] = disposition
+    return response
+
+@app.after_request
+def _release_inflight_fresh_bypass(response):
+    """Recover the limiter after an unexpected endpoint error response."""
+    endpoint = request.environ.get("queue_router.fresh_endpoint")
+    if endpoint:
+        with fresh_bypass_lock:
+            if fresh_bypass_at.get(endpoint) == float("inf"):
+                fresh_bypass_at[endpoint] = time.monotonic()
+    return response
+
+def get_ci_queue_status(force_refresh=False):
     """Current GitHub Actions queue depth and job-level activity for armbrain."""
     now = time.time()
     with ci_queue_cache_lock:
-        if ci_queue_cache["data"] is not None and (now - ci_queue_cache["ts"]) < CI_QUEUE_CACHE_TTL:
+        if not force_refresh and ci_queue_cache["data"] is not None and (now - ci_queue_cache["ts"]) < CI_QUEUE_CACHE_TTL:
             return ci_queue_cache["data"]
 
     # Multiple page/API callers can arrive together after expiry. Only one may
@@ -1757,7 +1800,7 @@ def get_ci_queue_status():
     ci_queue_refresh_lock.acquire()
     now = time.time()
     with ci_queue_cache_lock:
-        if ci_queue_cache["data"] is not None and (now - ci_queue_cache["ts"]) < CI_QUEUE_CACHE_TTL:
+        if not force_refresh and ci_queue_cache["data"] is not None and (now - ci_queue_cache["ts"]) < CI_QUEUE_CACHE_TTL:
             ci_queue_refresh_lock.release()
             return ci_queue_cache["data"]
 
@@ -1871,7 +1914,9 @@ runson_cache = {"data": None, "ts": 0.0}
 runson_cache_lock = threading.Lock()
 runson_cost_cache_lock = threading.Lock()
 RUNSON_CACHE_TTL = 120  # seconds - AWS reads are slower and credentials are short-lived
-RUNSON_AWS_PROFILE = "armbrain-dashboard"  # permanent scoped read-only key (council 2026-08-30); "armbrain" login sessions expire ~12h
+RUNSON_AWS_PROFILE = "armbrain-readonly"  # fleet-runson-observer IAM user in the rebuilt account (council 2026-09-02); files under ~/.config/fleet/aws
+RUNSON_AWS_ACCOUNT_ID = "930358782508"  # rebuilt account resolved by that profile
+RUNSON_AWS_ENV = {**os.environ, "AWS_SHARED_CREDENTIALS_FILE": os.path.expanduser("~/.config/fleet/aws/armbrain-readonly.credentials"), "AWS_CONFIG_FILE": os.path.expanduser("~/.config/fleet/aws/armbrain-readonly.config")}
 RUNSON_AWS_TIMEOUT = 12
 RUNSON_STACK_NAME = "runs-on"
 RUNSON_WORKFLOW_JOBS_TABLE = "runs-on-workflow-jobs"
@@ -1893,7 +1938,7 @@ def _runson_aws_json(args, region):
     ]
     try:
         completed = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=RUNSON_AWS_TIMEOUT,
+            cmd, capture_output=True, text=True, timeout=RUNSON_AWS_TIMEOUT, env=RUNSON_AWS_ENV,
         )
     except subprocess.TimeoutExpired:
         logger.warning("RunsOn AWS %s call timed out", args[0])
@@ -1922,6 +1967,65 @@ def _runson_aws_json(args, region):
     except json.JSONDecodeError:
         logger.warning("RunsOn AWS %s returned invalid JSON", args[0])
         return None, "aws"
+
+
+def _runson_jobs_done_count(date_key, region):
+    """Count today's jobs that actually got a runner (job_id has runner_name set).
+
+    daily-activity-index only projects org_name/installation_id/repo_name/job_id
+    (verified 2026-09-03: filtering that index on runner_name fails with
+    ValidationException - the attribute isn't there to filter on). So this
+    queries the index for today's job_id list, then batch-gets those specific
+    items from the base table (keyed on job_id, type N) to check runner_name.
+    Returns (count, error) - error is None only on a fully successful count;
+    any AWS failure returns (None, <reason>) so a broken read can never look
+    like zero jobs ran.
+    """
+    job_ids = []
+    exclusive_start_key = None
+    while True:
+        args = [
+            "dynamodb", "query", "--table-name", RUNSON_WORKFLOW_JOBS_TABLE,
+            "--index-name", "daily-activity-index",
+            "--key-condition-expression", "created_at_date = :date",
+            "--expression-attribute-values", json.dumps({":date": {"S": date_key}}),
+            "--projection-expression", "job_id",
+        ]
+        if exclusive_start_key:
+            args += ["--exclusive-start-key", json.dumps(exclusive_start_key)]
+        page, error = _runson_aws_json(args, region)
+        if error:
+            return None, error
+        job_ids.extend(item["job_id"]["N"] for item in (page or {}).get("Items", []))
+        exclusive_start_key = (page or {}).get("LastEvaluatedKey")
+        if not exclusive_start_key:
+            break
+
+    done = 0
+    for i in range(0, len(job_ids), 100):
+        chunk = job_ids[i:i + 100]
+        request_items = {
+            RUNSON_WORKFLOW_JOBS_TABLE: {
+                "Keys": [{"job_id": {"N": jid}} for jid in chunk],
+                "ProjectionExpression": "job_id, runner_name",
+            }
+        }
+        for attempt in range(3):
+            resp, error = _runson_aws_json(
+                ["dynamodb", "batch-get-item", "--request-items", json.dumps(request_items)],
+                region,
+            )
+            if error:
+                return None, error
+            items = (resp or {}).get("Responses", {}).get(RUNSON_WORKFLOW_JOBS_TABLE, [])
+            done += sum(1 for it in items if "runner_name" in it)
+            unprocessed = (resp or {}).get("UnprocessedKeys") or {}
+            request_items = unprocessed
+            if not unprocessed:
+                break
+        else:
+            logger.warning("RunsOn jobs-done batch-get had unprocessed keys after 3 attempts")
+    return done, None
 
 def _record_runson_credit_sample(credits, sampled_at):
     """Persist a real Free Tier credit observation; anchors are inserted by init_db."""
@@ -2113,11 +2217,11 @@ def _runson_error_result(error):
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
 
-def get_runson_status():
+def get_runson_status(force_refresh=False):
     """RunsOn runners, daily jobs, trial fuse, and credits; cached and read-only."""
     now = time.time()
     with runson_cache_lock:
-        if runson_cache["data"] is not None and (now - runson_cache["ts"]) < RUNSON_CACHE_TTL:
+        if not force_refresh and runson_cache["data"] is not None and (now - runson_cache["ts"]) < RUNSON_CACHE_TTL:
             return runson_cache["data"]
 
     stack, stack_error = _runson_aws_json(
@@ -2161,6 +2265,17 @@ def get_runson_status():
                 ],
                 "us-east-2",
             )
+            # "tried" is every job RunsOn recorded today. "done" is the subset that
+            # actually got a machine. Without this split a bare job count reads as
+            # success while zero runners ever started - which misled Ben on
+            # 2026-09-01 while an AWS SCP was denying ec2:CreateFleet.
+            #
+            # daily-activity-index doesn't project runner_name (verified
+            # 2026-09-03: filtering on it there throws ValidationException), so
+            # this queries the index for today's job_ids (which it does
+            # project) and batch-gets those specific items from the base table
+            # instead - see _runson_jobs_done_count.
+            jobs_done_future = executor.submit(_runson_jobs_done_count, date_key, "us-east-2")
             credits_future = executor.submit(
                 _runson_aws_json,
                 ["freetier", "get-account-plan-state"],
@@ -2168,9 +2283,14 @@ def get_runson_status():
             )
             runners_data, runners_error = runners_future.result()
             jobs_data, jobs_error = jobs_future.result()
+            jobs_done_data, jobs_done_error = jobs_done_future.result()
             credits_data, credits_error = credits_future.result()
 
-        read_error = runners_error or jobs_error or credits_error
+        # Free Tier credits are optional: a denied/unavailable credits read must not blank the panel (council 2026-09-02).
+        if credits_error:
+            logger.warning("RunsOn credits read unavailable (%s); continuing without credits", credits_error)
+            credits_data = None
+        read_error = runners_error or jobs_error
         if read_error:
             result = _runson_error_result(read_error)
         else:
@@ -2211,13 +2331,16 @@ def get_runson_status():
                 logger.warning("RunsOn local cost cache unavailable: %s", type(e).__name__)
                 ce_costs = None
             costs = ce_costs or credit_costs
-            charge_date = datetime(2026, 9, 12).date()
+            charge_date = datetime(2026, 9, 30).date()
             result = {
                 "available": True,
                 "deployed": True,
                 "live_runners": len(runner_rows),
                 "runners": runner_rows,
                 "jobs_today": int((jobs_data or {}).get("Count", 0)),
+                # None (not 0) when the query failed - the UI renders "?" so a
+                # broken probe can never read as "zero jobs ran".
+                "jobs_done": jobs_done_data,
                 "trial_days_remaining": max(0, (charge_date - today_ct).days),
                 "trial_charge_date": charge_date.isoformat(),
                 "subscription_usd_per_year": 350,
@@ -2371,12 +2494,12 @@ def get_loaded_route_models():
             logger.debug(f"{box} model list unavailable: {e}")
     return loaded
 
-def get_model_route_health():
+def get_model_route_health(force_refresh=False):
     """Which 🔒 local fleet-gateway routes are live right now vs missing -
     the "is a model route silently gone" signal."""
     now = time.time()
     with route_health_cache_lock:
-        if route_health_cache["data"] is not None and (now - route_health_cache["ts"]) < ROUTE_HEALTH_CACHE_TTL:
+        if not force_refresh and route_health_cache["data"] is not None and (now - route_health_cache["ts"]) < ROUTE_HEALTH_CACHE_TTL:
             return route_health_cache["data"]
 
     routes_live = {name: False for name in LOCAL_GATEWAY_ROUTES}
@@ -2512,12 +2635,12 @@ def _get_runner_stats():
         logger.warning(f"runner stats failed: {e}")
     return result
 
-def get_fleet_stats():
+def get_fleet_stats(force_refresh=False):
     """Cached agents-per-box + runner busy/total. One cache for both halves so
     a dashboard refresh costs at most one SSH sweep + one gh call per minute."""
     now = time.time()
     with fleet_stats_cache_lock:
-        if fleet_stats_cache["data"] is not None and (now - fleet_stats_cache["ts"]) < FLEET_STATS_CACHE_TTL:
+        if not force_refresh and fleet_stats_cache["data"] is not None and (now - fleet_stats_cache["ts"]) < FLEET_STATS_CACHE_TTL:
             return fleet_stats_cache["data"]
     agents = {}
     with ThreadPoolExecutor(max_workers=len(AGENT_STAT_BOXES)) as ex:
@@ -2895,12 +3018,12 @@ def stats_window_start(host=None):
     return best
 
 
-def get_model_serving_stats():
+def get_model_serving_stats(force_refresh=False):
     """Per-box: tps_now, serving-time-only tps average today, requests served
     in the last hour/day/week. Read from sqlite, cached 30s."""
     now_t = time.time()
     with model_serving_cache_lock:
-        if model_serving_cache["data"] is not None and (now_t - model_serving_cache["ts"]) < MODEL_SERVING_CACHE_TTL:
+        if not force_refresh and model_serving_cache["data"] is not None and (now_t - model_serving_cache["ts"]) < MODEL_SERVING_CACHE_TTL:
             return model_serving_cache["data"]
 
     now = datetime.now()
@@ -3373,12 +3496,12 @@ pipeline_cache_lock = threading.Lock()
 pipeline_gh_failing_since = None
 pipeline_last_good = None
 
-def get_pipeline_status():
+def get_pipeline_status(force_refresh=False):
     """Shipping-pipeline snapshot for armbrain: issues -> PRs -> CI -> merged
     today -> deployed today. Read-only GitHub queries, cached 5 min."""
     now = time.time()
     with pipeline_cache_lock:
-        if pipeline_cache["data"] is not None and (now - pipeline_cache["ts"]) < PIPELINE_CACHE_TTL:
+        if not force_refresh and pipeline_cache["data"] is not None and (now - pipeline_cache["ts"]) < PIPELINE_CACHE_TTL:
             return pipeline_cache["data"]
 
     global pipeline_gh_failing_since, pipeline_last_good
@@ -3440,7 +3563,7 @@ def get_pipeline_status():
                 spark.append(count if count is not None else 0)
             spark.append(result.get("merged_today") or 0)
             result["merged_spark"] = spark
-            ci = get_ci_queue_status()
+            ci = get_ci_queue_status(force_refresh=force_refresh)
             result["ci_queued"] = ci.get("queued", 0) if ci.get("available") else None
             # The shipping strip is a workflow-run count, matching the queued
             # number and allowing an exact, bounded-cost GitHub verification.
@@ -3568,12 +3691,13 @@ def api_pipeline():
     # Pipeline metadata is relatively expensive and cached, but queue depth is
     # volatile. Overlay the short-lived CI snapshot so the strip does not keep
     # claiming a superseded running/queued count for the full pipeline TTL.
-    result = dict(get_pipeline_status())
+    force_refresh, disposition = _fresh_bypass("pipeline")
+    result = dict(get_pipeline_status(force_refresh=force_refresh))
     ci = get_ci_queue_status()
     if ci.get("available"):
         result["ci_queued"] = ci.get("queued", 0)
         result["ci_running"] = ci.get("in_progress", 0)
-    return jsonify(result)
+    return _fresh_jsonify(result, disposition, "pipeline")
 
 
 @app.route("/api/status", methods=["GET"])
@@ -3699,10 +3823,11 @@ def get_fleet():
     seconds - back-to-back/parallel polls (multiple tabs, fast refresh) hit
     the cache instead of opening a fresh ssh session per node per request.
     """
+    force_refresh, disposition = _fresh_bypass("fleet")
     now = time.time()
     with fleet_cache_lock:
-        if fleet_cache["data"] is not None and (now - fleet_cache["ts"]) < FLEET_CACHE_TTL:
-            return jsonify(fleet_cache["data"])
+        if not force_refresh and fleet_cache["data"] is not None and (now - fleet_cache["ts"]) < FLEET_CACHE_TTL:
+            return _fresh_jsonify(fleet_cache["data"], disposition, "fleet")
 
     results = {}
     with ThreadPoolExecutor(max_workers=len(FLEET_NODES)) as ex:
@@ -3717,17 +3842,21 @@ def get_fleet():
         fleet_cache["data"] = ordered
         fleet_cache["ts"] = time.time()
 
-    return jsonify(ordered)
+    return _fresh_jsonify(ordered, disposition, "fleet")
 
 @app.route("/api/ci_queue", methods=["GET"])
 def api_ci_queue():
     """Queued/running GitHub Actions counts for armbrain-io/armbrain (cached)."""
-    return jsonify(get_ci_queue_status())
+    force_refresh, disposition = _fresh_bypass("ci_queue")
+    return _fresh_jsonify(get_ci_queue_status(force_refresh=force_refresh), disposition, "ci_queue")
 
 @app.route("/api/runson", methods=["GET"])
 def api_runson():
     """RunsOn runner usage, trial fuse, and AWS credits (cached)."""
-    return jsonify(get_runson_status())
+    force_refresh, disposition = _fresh_bypass("runson")
+    result = dict(get_runson_status(force_refresh=force_refresh))
+    result["aws_account_id"] = RUNSON_AWS_ACCOUNT_ID
+    return _fresh_jsonify(result, disposition, "runson")
 
 @app.route("/api/reset_stats", methods=["POST", "DELETE"])
 def api_reset_stats():
@@ -3786,17 +3915,20 @@ def armbrain_logo():
 def api_model_serving():
     """Tokens/sec dials (now + today-while-serving) and requests served
     (hour/day/week) for the model boxes."""
-    return jsonify(get_model_serving_stats())
+    force_refresh, disposition = _fresh_bypass("model_serving")
+    return _fresh_jsonify(get_model_serving_stats(force_refresh=force_refresh), disposition, "model_serving")
 
 @app.route("/api/fleet_stats", methods=["GET"])
 def api_fleet_stats():
     """Compact stats bar: CLI agent sessions per box + CI runner busy/total."""
-    return jsonify(get_fleet_stats())
+    force_refresh, disposition = _fresh_bypass("fleet_stats")
+    return _fresh_jsonify(get_fleet_stats(force_refresh=force_refresh), disposition, "fleet_stats")
 
 @app.route("/api/model_routes", methods=["GET"])
 def api_model_routes():
     """Live/missing status for each 🔒 local fleet-gateway route (cached)."""
-    return jsonify(get_model_route_health())
+    force_refresh, disposition = _fresh_bypass("model_routes")
+    return _fresh_jsonify(get_model_route_health(force_refresh=force_refresh), disposition, "model_routes")
 
 @app.route("/api/vram-processes", methods=["GET"])
 def api_vram_processes():
@@ -4064,10 +4196,31 @@ h1::before{content:'◈ ';color:var(--neon-magenta)}
 h1::after{content:' ◈';color:var(--neon-magenta)}
 h3{margin-top:0;color:var(--neon-cyan);font-family:'Orbitron',monospace;font-size:1.1em;letter-spacing:2px;
 text-transform:uppercase;text-shadow:0 0 10px var(--neon-cyan)}
-.card{background:var(--bg-card);padding:20px;border-radius:4px;margin:20px 0;
+.card{background:var(--bg-card);padding:20px;border-radius:4px;margin:20px 0;position:relative;
 border:1px solid #1a2332;box-shadow:0 0 20px rgba(0,255,242,0.1),inset 0 0 60px rgba(0,0,0,0.3)}
 .card::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;
 background:linear-gradient(90deg,transparent,var(--neon-cyan),transparent)}
+.panel-refresh-surface{position:relative;min-width:0}
+.panel-refresh-btn{position:absolute;top:7px;right:8px;z-index:5;width:24px;height:24px;padding:0;
+display:inline-flex;align-items:center;justify-content:center;border-radius:50%;border:1px solid #2a5265;
+background:#0d1722;color:var(--neon-cyan);font:700 15px/1 'Orbitron',monospace;cursor:pointer;
+transition:border-color .18s,color .18s,box-shadow .18s,background .18s}
+.panel-refresh-btn:hover{border-color:var(--neon-cyan);box-shadow:0 0 9px rgba(0,255,242,.45);background:#102332}
+.panel-refresh-btn:focus-visible{outline:2px solid var(--neon-yellow);outline-offset:2px}
+.panel-refresh-btn:disabled{cursor:wait;opacity:.8}
+.panel-refresh-btn.refreshing{animation:panel-refresh-spin .7s linear infinite}
+.panel-refresh-btn.refresh-failed{color:var(--neon-red);border-color:var(--neon-red);background:#2b0d17;
+box-shadow:0 0 10px rgba(255,0,68,.6)}
+.panel-fetched{position:absolute;top:10px;right:40px;z-index:4;color:#667;font-size:.58em;
+letter-spacing:.4px;white-space:nowrap;text-transform:lowercase}
+.runson-account{color:#c7cee0;font:500 .72em 'Rajdhani',sans-serif;letter-spacing:.7px;
+text-shadow:none;text-transform:none;margin-left:8px}
+.panel-refresh-body{padding-right:34px}
+.glance-panel{height:100%;min-height:36px}
+.glance-panel>.panel-refresh-btn{top:50%;transform:translateY(-50%)}
+.glance-panel>.panel-refresh-btn.refreshing{animation:panel-refresh-spin-centered .7s linear infinite}
+@keyframes panel-refresh-spin{to{transform:rotate(360deg)}}
+@keyframes panel-refresh-spin-centered{to{transform:translateY(-50%) rotate(360deg)}}
 .online{color:var(--neon-green);font-weight:bold;text-shadow:var(--glow-green)}
 .offline{color:var(--neon-red);font-weight:bold;text-shadow:var(--glow-red);animation:pulse 1s infinite}
 /* MISMATCH (2026-07-30): amber, and it pulses like OFFLINE because it also needs
@@ -4308,16 +4461,16 @@ color:var(--neon-cyan);text-shadow:0 0 10px var(--neon-cyan)}
 .ship-num.warn{color:var(--neon-yellow);text-shadow:0 0 10px var(--neon-yellow)}
 .ship-num.hot{color:var(--neon-red);text-shadow:0 0 10px var(--neon-red)}
 .ship-num.stamp{font-size:1.05em;white-space:nowrap}
-.ship-cap{font-family:'Orbitron',monospace;font-size:0.56em;letter-spacing:1.5px;
-text-transform:uppercase;color:#7a839c;white-space:nowrap}
-.ship-sub{font-size:0.62em;color:#5d6478;white-space:nowrap}
+.ship-cap{font-family:'Orbitron',monospace;font-size:0.72em;letter-spacing:1.5px;
+text-transform:uppercase;color:#c7cee0;white-space:nowrap}
+.ship-sub{font-size:0.78em;color:#c7cee0;white-space:nowrap}
 .ship-arrow{display:flex;align-items:center;padding:0 9px;color:var(--neon-magenta);
 font-size:0.9em;text-shadow:0 0 8px var(--neon-magenta)}
 .ship-spark{display:flex;align-items:flex-end;gap:2px;height:11px;margin-top:3px}
 .ship-spark i{width:5px;background:var(--neon-cyan);box-shadow:0 0 4px var(--neon-cyan);
 border-radius:1px 1px 0 0;min-height:1px}
 .ship-updated{align-self:center;margin-left:9px;padding:3px 7px;border:1px solid #2a3450;
-border-radius:999px;color:#758097;font-size:0.62em;white-space:nowrap}
+border-radius:999px;color:#c7cee0;font-size:0.78em;white-space:nowrap}
 .ship-updated.stale{color:var(--neon-yellow);border-color:rgba(255,255,0,0.55);
 background:rgba(255,255,0,0.06);box-shadow:0 0 7px rgba(255,255,0,0.16)}
 .monitor-glance-band{display:grid;grid-template-columns:minmax(720px,1.25fr) minmax(500px,.75fr);
@@ -4328,28 +4481,28 @@ gap:10px;align-items:start;margin:10px 0}
 .runson-count{font-family:'Orbitron',monospace;font-size:2em;font-weight:700;line-height:1;
 color:var(--neon-green);text-shadow:var(--glow-green)}
 .runson-count.zero{color:#778;text-shadow:none}
-.runson-label{font-family:'Orbitron',monospace;font-size:0.62em;letter-spacing:1.3px;
-text-transform:uppercase;color:#7a839c;margin-top:4px}
+.runson-label{font-family:'Orbitron',monospace;font-size:0.78em;letter-spacing:1.3px;
+text-transform:uppercase;color:#c7cee0;margin-top:4px}
 .runson-runners{display:flex;gap:6px;flex-wrap:wrap;margin-top:7px}
 .runson-runner{border:1px solid #2a3450;border-radius:999px;padding:3px 8px;color:#aab2c4;font-size:0.78em}
 .runson-facts{display:flex;gap:22px;flex-wrap:wrap;align-items:center}
 .runson-fact b{display:block;font-family:'Orbitron',monospace;color:var(--neon-cyan);font-size:1.15em}
-.runson-fact span{color:#778;font-size:0.75em}
+.runson-fact span{color:#c7cee0;font-size:0.85em}
 .runson-warning{color:var(--neon-yellow);margin:0;font-family:'Rajdhani',sans-serif}
 .runson-budget{width:100%;margin-top:15px;padding-top:13px;border-top:1px solid #27304a}
 .runson-budget-head{display:flex;gap:24px;align-items:flex-end;flex-wrap:wrap;margin-bottom:10px}
 .runson-spend{min-width:128px}
 .runson-spend strong{display:block;font:700 1.35em 'Orbitron',monospace;color:var(--neon-cyan)}
-.runson-spend small,.runson-source{color:#778;font-size:.72em}
+.runson-spend small,.runson-source{color:#c7cee0;font-size:.85em}
 .runson-source{margin-left:auto;text-transform:uppercase;letter-spacing:.8px}
-.runson-na{color:#596174!important;text-shadow:none!important}
+.runson-na{color:#c7cee0!important;text-shadow:none!important}
 .runson-visuals{display:grid;grid-template-columns:minmax(260px,1.3fr) minmax(220px,1fr);gap:14px}
 .runson-chart{border:1px solid #252e47;border-radius:6px;padding:8px 9px;background:rgba(8,12,24,.35);min-width:0}
-.runson-chart-title{font:600 .66em 'Orbitron',monospace;color:#8992aa;letter-spacing:1px;text-transform:uppercase;margin-bottom:4px}
+.runson-chart-title{font:600 .8em 'Orbitron',monospace;color:#c7cee0;letter-spacing:1px;text-transform:uppercase;margin-bottom:4px}
 .runson-chart svg{display:block;width:100%;height:74px;overflow:visible}
 .runson-bar{fill:#39d7ff;opacity:.75}.runson-bar.zero{opacity:.5}.runson-bar.missing{fill:#424a5d;opacity:.35}
 .runson-credit-line{fill:none;stroke:#39ff14;stroke-width:2;filter:drop-shadow(0 0 3px rgba(57,255,20,.5))}
-.runson-credit-dot{fill:#39ff14}.runson-runway{color:#8c96aa;font-size:.76em;margin-top:4px}
+.runson-credit-dot{fill:#39ff14}.runson-runway{color:#c7cee0;font-size:.88em;margin-top:4px}
 .runson-gauges{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px}
 .runson-gauge-label{display:flex;justify-content:space-between;color:#8992aa;font-size:.72em;margin-bottom:4px}
 .runson-gauge-track{height:7px;background:#20283c;border-radius:999px;overflow:hidden}
@@ -4365,30 +4518,30 @@ text-transform:uppercase;color:#7a839c;margin-top:4px}
 #runson-card .runson-grid{display:flex;flex-wrap:wrap;gap:4px 16px;align-items:flex-start}
 #runson-card .runson-live{min-width:0;display:flex;flex-direction:column}
 #runson-card .runson-count{font-size:1.15em;line-height:1.05}
-#runson-card .runson-label{font-size:.52em;margin-top:2px;line-height:1.1}
+#runson-card .runson-label{font-size:.68em;margin-top:2px;line-height:1.1}
 #runson-card .runson-runners{gap:3px;margin-top:2px}
 #runson-card .runson-runner{padding:0 5px;font-size:.6em}
 #runson-card .runson-flow{gap:5px}
 #runson-card .runson-flow-cell b{font-size:1.15em}
-#runson-card .runson-flow-cell span{font-size:.52em;margin-top:2px}
+#runson-card .runson-flow-cell span{font-size:.68em;margin-top:2px}
 #runson-card .runson-flow-arrow{font-size:.95em;padding-bottom:9px}
 #runson-card .runson-fact b{font-size:.92em;line-height:1.05}
-#runson-card .runson-fact span{font-size:.6em;line-height:1.1;display:block;margin-top:2px;white-space:nowrap}
+#runson-card .runson-fact span{font-size:.72em;line-height:1.1;display:block;margin-top:2px;white-space:nowrap}
 #runson-card .runson-budget{width:auto;margin:0;padding:0 8px 0 0;border:0;border-right:1px solid #252e47;display:grid;grid-template-columns:1fr;gap:2px;align-content:space-between;align-self:stretch}
 #runson-card .runson-spend:nth-child(1){order:1}#runson-card .runson-gauge:nth-child(1){order:2}
 #runson-card .runson-spend:nth-child(2){order:3}#runson-card .runson-gauge:nth-child(2){order:4}
 #runson-card .runson-gauge:nth-child(1){margin-bottom:4px}
 #runson-card .runson-spend{min-width:0}
 #runson-card .runson-spend strong{font-size:.92em;line-height:1.05}
-#runson-card .runson-spend small{font-size:.6em;line-height:1.1;display:block;margin-top:2px;white-space:nowrap}
+#runson-card .runson-spend small{font-size:.72em;line-height:1.1;display:block;margin-top:2px;white-space:nowrap}
 #runson-card .runson-gauges{display:contents}
 #runson-card .runson-gauge{min-width:72px}
 #runson-card .runson-gauge-label{display:none}
 #runson-card .runson-gauge-track{height:4px}
 #runson-card .runson-visuals{grid-template-columns:auto minmax(150px,1.3fr) minmax(130px,1fr);gap:6px;margin-top:6px}
 #runson-card .runson-chart{padding:3px 6px 4px}
-#runson-card .runson-chart-title{font-size:.55em;margin-bottom:1px;display:flex;justify-content:space-between;gap:8px;white-space:nowrap;overflow:hidden}
-#runson-card .runson-chart-title .runson-source,#runson-card .runson-chart-title .runson-runway{margin:0;font-size:1em;letter-spacing:.4px;text-transform:none;color:#6f7890;overflow:hidden;text-overflow:ellipsis}
+#runson-card .runson-chart-title{font-size:.7em;margin-bottom:1px;display:flex;justify-content:space-between;gap:8px;white-space:nowrap;overflow:hidden}
+#runson-card .runson-chart-title .runson-source,#runson-card .runson-chart-title .runson-runway{margin:0;font-size:1em;letter-spacing:.4px;text-transform:none;color:#c7cee0;overflow:hidden;text-overflow:ellipsis}
 #runson-card .runson-chart svg{height:40px}
 @media(max-width:1279px){.monitor-glance-band{grid-template-columns:1fr}}
 @media(max-width:720px){.runson-visuals{grid-template-columns:1fr}#runson-card .runson-visuals{grid-template-columns:auto 1fr}#runson-card .runson-budget{grid-row:1/3}.runson-gauges,#runson-card .runson-gauges{grid-template-columns:1fr}.runson-source{margin-left:0}}
@@ -4441,6 +4594,20 @@ margin-bottom:8px;display:flex;justify-content:space-between;align-items:center}
 color:#889;display:flex;justify-content:space-between;font-family:'Orbitron',monospace}
 .vram-tooltip-footer .sum-val{color:var(--neon-green)}
 .vram-tooltip-footer .free-val{color:var(--neon-cyan)}
+/* A job COUNT with zero live runners means RunsOn accepted work and could not
+   start a machine - which reads as success on a bare number. Ben was misled by
+   exactly this on 2026-09-01, so the stranded case is coloured and spelled out. */
+.runson-flow{display:flex;align-items:center;gap:14px}
+.runson-flow-cell{display:flex;flex-direction:column;align-items:center}
+.runson-flow-cell b{font-size:1.9em;line-height:1;font-family:'Orbitron',monospace}
+.runson-flow-cell span{font-size:0.85em;color:#c7cee0;letter-spacing:1px;text-transform:uppercase;margin-top:4px;white-space:nowrap}
+.runson-flow-arrow{font-size:1.5em;color:#4b5563;line-height:1;padding-bottom:14px}
+/* Tried > 0 with done == 0 means RunsOn accepted work and no machine ever started.
+   That is a failure that reads as success on a bare count - Ben was misled by
+   exactly this on 2026-09-01 while an AWS SCP denied ec2:CreateFleet. */
+.runson-flow.runson-stranded .runson-flow-cell:last-child b{color:var(--neon-red);text-shadow:0 0 8px #ff004488}
+.runson-flow.runson-stranded .runson-flow-cell:last-child span{color:var(--neon-red)}
+.runson-flow.runson-stranded .runson-flow-arrow{color:var(--neon-red)}
 /* Last-updated stamp: proves the page is live. If this stops ticking, the
    dashboard has gone stale - which is exactly the failure it exists to show. */
 .hdr-wrap{position:relative}
@@ -4467,26 +4634,32 @@ letter-spacing:0;white-space:pre;width:22ch;text-align:right}
 
 <div class="monitor-glance-band">
 <div class=card id=glance-strip style="padding:9px 12px">
-<div id="ship-flow" class="ship-flow"><span class="gdim">shipping pipeline…</span></div>
+<div class="panel-refresh-surface">
+<button type="button" class="panel-refresh-btn" data-panel="Shipping pipeline" title="Refresh this panel" aria-label="Refresh Shipping pipeline panel" onclick="refreshPanel(this, 'refreshShipFlow')">&#x21bb;</button>
+<div id="ship-flow" class="ship-flow panel-refresh-body"><span class="gdim">shipping pipeline…</span></div>
+</div>
 <div class="gstrip">
-<div class="gcell" id="ci-queue-body"><span class="gdim">CI queue…</span></div>
-<div class="gcell" id="route-health-body"><span class="gdim">routes…</span></div>
-<div class="gcell" id="fleet-stats-body"><span class="gdim">agents…</span></div>
+<div class="panel-refresh-surface glance-panel"><button type="button" class="panel-refresh-btn" data-panel="CI queue" title="Refresh this panel" aria-label="Refresh CI queue panel" onclick="refreshPanel(this, 'refreshCiQueue')">&#x21bb;</button><div class="gcell panel-refresh-body" id="ci-queue-body"><span class="gdim">CI queue…</span></div></div>
+<div class="panel-refresh-surface glance-panel"><button type="button" class="panel-refresh-btn" data-panel="Route health" title="Refresh this panel" aria-label="Refresh Route health panel" onclick="refreshPanel(this, 'refreshRouteHealth')">&#x21bb;</button><div class="gcell panel-refresh-body" id="route-health-body"><span class="gdim">routes…</span></div></div>
+<div class="panel-refresh-surface glance-panel"><button type="button" class="panel-refresh-btn" data-panel="Fleet stats" title="Refresh this panel" aria-label="Refresh Fleet stats panel" onclick="refreshPanel(this, 'refreshFleetStats')">&#x21bb;</button><div class="gcell panel-refresh-body" id="fleet-stats-body"><span class="gdim">agents…</span></div></div>
 </div>
 </div>
 
 <div class=card id=runson-card>
-<h3>☁️ RunsOn CI</h3>
+<button type="button" class="panel-refresh-btn" data-panel="RunsOn CI" title="Refresh this panel" aria-label="Refresh RunsOn CI panel" onclick="refreshPanel(this, 'refreshRunsOn')">&#x21bb;</button>
+<h3>☁️ RunsOn CI <span class="runson-account" id="runson-account">AWS account 930358782508</span></h3>
 <div id=runson-body><p>Loading...</p></div>
 </div>
 </div>
 
-<div class=card id=monitors><p>Loading...</p></div>
+<div class="card panel-refresh-surface" id="monitors-panel"><button type="button" class="panel-refresh-btn" data-panel="Queue and GPU status" title="Refresh this panel" aria-label="Refresh Queue and GPU status panel" onclick="refreshPanel(this, 'refresh')">&#x21bb;</button><div id=monitors class=panel-refresh-body><p>Loading...</p></div></div>
 <div class=card id=fleet-hosts style="padding:12px 15px;margin:12px 0">
+<button type="button" class="panel-refresh-btn" data-panel="Fleet hosts" title="Refresh this panel" aria-label="Refresh Fleet hosts panel" onclick="refreshPanel(this, 'refreshFleet')">&#x21bb;</button>
 <div id=fleet-row class=fleet-row><p style="grid-column:1/-1;color:#667;margin:0">Scanning fleet hosts...</p></div>
 </div>
 
 <div class=card id=history>
+<button type="button" class="panel-refresh-btn" data-panel="Historical metrics" title="Refresh this panel" aria-label="Refresh Historical metrics panel" onclick="refreshPanel(this, 'refreshHistory')">&#x21bb;</button>
 <h3>📈 Historical Metrics</h3>
 <div class="time-range">
 <button onclick="setRange('hour')" id="btn-hour" class="active">Last Hour</button>
@@ -4498,6 +4671,7 @@ letter-spacing:0;white-space:pre;width:22ch;text-align:right}
 </div>
 
 <div class=card id=energy>
+<button type="button" class="panel-refresh-btn" data-panel="Energy by machine" title="Refresh this panel" aria-label="Refresh Energy by machine panel" onclick="refreshPanel(this, 'refreshEnergy')">&#x21bb;</button>
 <h3>⚡ Energy &amp; Cost — by Machine</h3>
 <div id="energy-by-machine"><p>Loading...</p></div>
 <p style="margin-top:12px;color:#666;font-size:0.8em">GPU power only (nvidia-smi) at PEC time-of-use rates. Excludes CPU/PSU overhead; Macs report no wattage.</p>
@@ -4514,6 +4688,7 @@ letter-spacing:0;white-space:pre;width:22ch;text-align:right}
 </div>
 
 <div class=card id=energy-fleet>
+<button type="button" class="panel-refresh-btn" data-panel="Fleet energy" title="Refresh this panel" aria-label="Refresh Fleet energy panel" onclick="refreshPanel(this, 'refreshEnergy')">&#x21bb;</button>
 <h3>⚡ Fleet Energy &amp; Cost — All Machines</h3>
 <div id="energy-fleet-body"><p>Loading...</p></div>
 </div>
@@ -5905,7 +6080,9 @@ function refreshRunsOn() {
     fetch('/api/runson').then(r => r.json()).then(d => {
         const card = document.getElementById('runson-card');
         const body = document.getElementById('runson-body');
+        const account = document.getElementById('runson-account');
         if (!card || !body) return;
+        if (account && d.aws_account_id) account.textContent = 'AWS account ' + d.aws_account_id;
         if (d.deployed === false) {
             card.style.display = 'none';
             return;
@@ -6191,16 +6368,94 @@ document.addEventListener('visibilitychange', () => {
 // and turns amber then red as it ages, so a dashboard that has stopped updating
 // SAYS SO instead of quietly showing hours-old numbers.
 let lastUpdateMs = 0;
+let activePanelRefresh = null;
 (function stampSuccessfulApiCalls() {
     const nativeFetch = window.fetch.bind(window);
     window.fetch = function (input, init) {
-        const url = (typeof input === 'string') ? input : (input && input.url) || '';
-        return nativeFetch(input, init).then(res => {
+        const panelRefresh = activePanelRefresh;
+        let requestedInput = input;
+        let url = (typeof input === 'string') ? input : (input && input.url) || '';
+        if (panelRefresh && url.indexOf('/api/') !== -1) {
+            const freshUrl = new URL(url, window.location.href);
+            freshUrl.searchParams.set('fresh', '1');
+            requestedInput = (typeof input === 'string')
+                ? freshUrl.pathname + freshUrl.search + freshUrl.hash
+                : new Request(freshUrl.href, input);
+            url = freshUrl.href;
+        }
+        const request = nativeFetch(requestedInput, init);
+        if (panelRefresh) {
+            panelRefresh.requests.push(request.then(res => {
+                if (!res.ok) throw new Error('HTTP ' + res.status + ' for ' + url);
+                if (res.headers.get('X-Fresh-Result') !== 'rate-limited') panelRefresh.fetched = true;
+                return res;
+            }));
+        }
+        return request.then(res => {
             if (res && res.ok && url.indexOf('/api/') !== -1) lastUpdateMs = Date.now();
             return res;
         });
     };
 })();
+
+function finishPanelRefresh(button, ok, fetched) {
+    button.disabled = false;
+    button.classList.remove('refreshing');
+    button.setAttribute('aria-busy', 'false');
+    if (ok && fetched) {
+        const surface = button.closest('.panel-refresh-surface') || button.parentElement;
+        let stamp = surface && surface.querySelector('.panel-fetched');
+        if (surface && !stamp) {
+            stamp = document.createElement('span');
+            stamp.className = 'panel-fetched';
+            surface.appendChild(stamp);
+        }
+        if (stamp) stamp.textContent = 'fetched ' + new Date().toLocaleTimeString([], {hour12:false});
+        renderLastUpdated();
+        return;
+    }
+    if (ok) return;
+    button.classList.add('refresh-failed');
+    setTimeout(() => button.classList.remove('refresh-failed'), 900);
+}
+
+function refreshPanel(button, loaderName) {
+    const loaders = {
+        refresh: refresh,
+        refreshFleet: refreshFleet,
+        refreshShipFlow: refreshShipFlow,
+        refreshCiQueue: refreshCiQueue,
+        refreshRouteHealth: refreshRouteHealth,
+        refreshFleetStats: refreshFleetStats,
+        refreshHistory: refreshHistory,
+        refreshEnergy: refreshEnergy,
+        refreshRunsOn: refreshRunsOn
+    };
+    const loader = loaders[loaderName];
+    button.disabled = true;
+    button.classList.remove('refresh-failed');
+    button.classList.add('refreshing');
+    button.setAttribute('aria-busy', 'true');
+    const context = {requests: [], fetched: false};
+    activePanelRefresh = context;
+    try {
+        loader();
+    } catch (err) {
+        activePanelRefresh = null;
+        console.error('[dashboard] ' + loaderName + ' manual refresh failed:', err);
+        finishPanelRefresh(button, false, false);
+        return;
+    }
+    activePanelRefresh = null;
+    if (!context.requests.length) {
+        finishPanelRefresh(button, false, false);
+        return;
+    }
+    Promise.all(context.requests).then(
+        () => finishPanelRefresh(button, true, context.fetched),
+        () => finishPanelRefresh(button, false, false)
+    );
+}
 
 function renderLastUpdated() {
     const el = document.getElementById('last-updated');
