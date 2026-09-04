@@ -670,7 +670,7 @@ console.log(JSON.stringify({
         ok = all(k in r for k in (
             "live_runners", "runners", "jobs_today", "trial_days_remaining", "credits_remaining",
             "cost_source", "cost_source_label", "spent_today", "spent_month", "daily_spend",
-            "credits_runway", "budget_limits", "jobs_done_error", "credits_error",
+            "credits_runway", "budget_limits", "jobs_done_error", "credits_error", "cost_error",
         )) and len(r.get("daily_spend") or []) == 30
         instrument = "AWS data schema"
     else:
@@ -690,6 +690,18 @@ console.log(JSON.stringify({
          {"credits_error": None},
          "credits read clean" if not credits_error
          else f"credits read failing ({credits_error}); credits_remaining is null because of this, not because there is no data")
+
+    # Second 136p instance: a Cost Explorer failure used to collapse into
+    # cost_source="credits" with no reason, so a denied ce:GetCostAndUsage, a CE that
+    # was never enabled, and a local sqlite failure all looked the same. This path runs
+    # once per six hours because CE calls cost money - a silent fallback here could sit
+    # unnoticed for a long time.
+    cost_error = r.get("cost_error")
+    emit("PASS" if not cost_error else "FAIL", "runson.cost_read",
+         {"cost_error": cost_error, "cost_source": r.get("cost_source")},
+         {"cost_error": None},
+         "cost read clean" if not cost_error
+         else f"cost read failing ({cost_error}); cost_source fell back to {r.get('cost_source')} because of this, not by preference")
 
     source = (ROOT / "queue_router.py").read_text()
     fallback_contract = (
@@ -711,9 +723,9 @@ try:
     q._runson_aws_json = lambda args, region: (None, 'access_denied')
     now = datetime(2026, 8, 30, 21, 10, tzinfo=timezone.utc)
     credits = q._runson_credit_budget_data(now, now.astimezone(ZoneInfo('America/Chicago')).date())
-    ce = q._runson_ce_cost_data(now.astimezone(ZoneInfo('America/Chicago')).date(), '000000000000')
+    ce, ce_error = q._runson_ce_cost_data(now.astimezone(ZoneInfo('America/Chicago')).date(), '000000000000')
     costs = ce or credits
-    print(json.dumps({'ce': ce, 'source': 'cost_explorer' if ce else 'credits',
+    print(json.dumps({'ce': ce, 'ce_error': ce_error, 'source': 'cost_explorer' if ce else 'credits',
                       'label': 'AWS Cost Explorer' if ce else 'net of credits',
                       'today': costs['spent_today'], 'month': costs['spent_month']}))
 finally:
@@ -732,6 +744,8 @@ finally:
         and fallback_result.get("label") == "net of credits"
         and close(fallback_result.get("today"), .62, .0001)
         and close(fallback_result.get("month"), .62, .0001)
+        # ledger 136p: the fallback must carry its reason, not just happen silently
+        and fallback_result.get("ce_error") == "access_denied"
     )
     if fallback_crashed:
         emit(

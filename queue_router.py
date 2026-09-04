@@ -2127,7 +2127,15 @@ def _runson_credit_budget_data(now_utc, today_ct):
     }
 
 def _runson_ce_cost_data_unlocked(today_ct, account_id):
-    """Probe CE once per six-hour cache window, then optionally read budget actuals."""
+    """Probe CE once per six-hour cache window, then optionally read budget actuals.
+
+    Returns (data, error). Every failure path carries a REASON (ledger 136p): the
+    old code returned a bare None from all three of them, so a denied
+    ce:GetCostAndUsage, a Cost Explorer that was never enabled, and a local sqlite
+    failure were indistinguishable to a reader - all three simply became
+    cost_source="credits". This path runs once per six hours because CE calls cost
+    money, which is exactly how a silent fallback here could sit unnoticed.
+    """
     cache_key = "ce_daily_unblended"
     now_utc = datetime.now(timezone.utc)
     with sqlite3.connect(CONFIG["db_path"]) as conn:
@@ -2139,7 +2147,12 @@ def _runson_ce_cost_data_unlocked(today_ct, account_id):
         try:
             fetched = datetime.fromisoformat(cached[1].replace("Z", "+00:00"))
             if (now_utc - fetched).total_seconds() < RUNSON_COST_CACHE_TTL:
-                return json.loads(cached[2]) if cached[0] == "available" else None
+                if cached[0] == "available":
+                    return json.loads(cached[2]), None
+                # The reason is cached alongside the failure, so a reader inside the
+                # six-hour window still learns WHY, not just that there is no data.
+                cached_reason = (json.loads(cached[2]) or {}).get("error")
+                return None, cached_reason or "unavailable"
         except (TypeError, ValueError, json.JSONDecodeError):
             pass
 
@@ -2161,9 +2174,10 @@ def _runson_ce_cost_data_unlocked(today_ct, account_id):
         with sqlite3.connect(CONFIG["db_path"]) as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO runson_cost_cache(cache_key,status,fetched_at,payload) VALUES (?,?,?,?)",
-                (cache_key, "unavailable", now_utc.isoformat(), "{}"),
+                (cache_key, "unavailable", now_utc.isoformat(),
+                 json.dumps({"error": ce_error}, separators=(",", ":"))),
             )
-        return None
+        return None, ce_error
 
     daily_map = {}
     for period in (ce_data or {}).get("ResultsByTime", []):
@@ -2214,7 +2228,7 @@ def _runson_ce_cost_data_unlocked(today_ct, account_id):
             "INSERT OR REPLACE INTO runson_cost_cache(cache_key,status,fetched_at,payload) VALUES (?,?,?,?)",
             (cache_key, "available", now_utc.isoformat(), json.dumps(result, separators=(",", ":"))),
         )
-    return result
+    return result, None
 
 def _runson_ce_cost_data(today_ct, account_id):
     # Serialize the persistent-cache probe so concurrent browsers cannot turn
@@ -2352,10 +2366,10 @@ def _runson_fetch():
             stack_id = ((stack or {}).get("Stacks") or [{}])[0].get("StackId") or ""
             account_match = re.match(r"^arn:aws:cloudformation:[^:]+:(\d+):", stack_id)
             try:
-                ce_costs = _runson_ce_cost_data(today_ct, account_match.group(1) if account_match else None)
+                ce_costs, cost_error = _runson_ce_cost_data(today_ct, account_match.group(1) if account_match else None)
             except sqlite3.Error as e:
                 logger.warning("RunsOn local cost cache unavailable: %s", type(e).__name__)
-                ce_costs = None
+                ce_costs, cost_error = None, f"cost_cache_{type(e).__name__}"
             costs = ce_costs or credit_costs
             charge_date = datetime(2026, 9, 30).date()
             result = {
@@ -2378,6 +2392,9 @@ def _runson_fetch():
                 "credits_unit": credits.get("unit") or "USD",
                 "cost_source": "cost_explorer" if ce_costs else "credits",
                 "cost_source_label": "AWS Cost Explorer" if ce_costs else "net of credits",
+                # cost_source alone says the fallback happened, never why. Paired with
+                # the reason, a denied read is distinguishable from an unconfigured one.
+                "cost_error": cost_error or None,
                 "spent_today": costs.get("spent_today"),
                 "spent_month": costs.get("spent_month"),
                 "daily_spend": costs.get("daily_spend", []),
