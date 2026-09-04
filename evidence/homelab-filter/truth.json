@@ -1,0 +1,13 @@
+{
+  "source": "scratch Flask /api/local_runners?fresh=1 using normal CI installation token; independent fresh gh api --paginate --slurp",
+  "pages": 2,
+  "total": 147,
+  "excluded_cloud": 147,
+  "filtered_counts": {
+    "online": 0,
+    "busy": 0,
+    "idle": 0
+  },
+  "online_matches": true,
+  "no_cloud_names": true
+}

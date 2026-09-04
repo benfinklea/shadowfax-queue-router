@@ -3905,6 +3905,22 @@ local_runners_cache = {"data": None, "ts": 0.0}
 local_runners_cache_lock = threading.Lock()
 
 
+def _local_runner_host(runner):
+    # Specific machine labels take priority over the shared gate label.
+    hosts = tuple(FLEET_IPS) + ('fellowship-gate',)
+    labels = {label.lower() for label in runner['labels']}
+    for host in hosts:
+        if host != 'fellowship-gate' and host in labels:
+            return host
+    name = runner['name'].lower()
+    for host in hosts:
+        if re.search(r'(^|[^a-z0-9])' + re.escape(host) + r'($|[^a-z0-9])', name):
+            return host
+    if 'fellowship-gate' in labels:
+        return 'fellowship-gate'
+    return runner['name']
+
+
 def get_local_runners(force_refresh=False):
     with local_runners_cache_lock:
         if not force_refresh and local_runners_cache['data'] is not None and time.monotonic() - local_runners_cache['ts'] < LOCAL_RUNNERS_CACHE_TTL:
@@ -3915,26 +3931,41 @@ def get_local_runners(force_refresh=False):
             token = get_gh_ci_token()
             if not token:
                 raise ValueError('CI token unavailable')
-            runners, page = [], 1
-            while True:
+            runners, excluded_cloud = [], 0
+            url = f'https://api.github.com/repos/{GITHUB_CI_REPO}/actions/runners?per_page=100'
+            while url:
                 response = requests.get(
-                    f'https://api.github.com/repos/{GITHUB_CI_REPO}/actions/runners',
+                    url,
                     headers={'Authorization': f'Bearer {token}', 'Accept': 'application/vnd.github+json'},
-                    params={'per_page': 100, 'page': page}, timeout=15)
+                    timeout=15)
                 if response.status_code in (403, 404):
                     result['error'] = 'no permission to read runners'
                     break
                 response.raise_for_status()
-                batch = response.json()['runners']
-                runners.extend({'name': r['name'], 'labels': [label['name'] for label in r['labels']],
-                                'status': r['status'], 'busy': r['busy']} for r in batch)
-                if len(batch) < 100:
-                    online = [r for r in runners if r['status'] == 'online']
-                    result.update(available=True, error=None, runners=runners,
-                                  online=len(online), busy=sum(r['busy'] for r in online),
-                                  idle=sum(not r['busy'] for r in online))
-                    break
-                page += 1
+                for r in response.json()['runners']:
+                    labels = [label['name'] for label in r['labels']]
+                    if r['name'].startswith('runs-on--') or any('runs-on=' in label for label in labels):
+                        excluded_cloud += 1
+                        continue
+                    runner = {'name': r['name'], 'labels': labels,
+                              'status': r['status'], 'busy': r['busy']}
+                    runner['host'] = _local_runner_host(runner)
+                    runners.append(runner)
+                url = response.links.get('next', {}).get('url')
+            else:
+                hosts = {}
+                for runner in runners:
+                    host = hosts.setdefault(runner['host'], {'host': runner['host'],
+                                            'online': 0, 'busy': 0, 'idle': 0, 'runners': []})
+                    host['runners'].append(runner)
+                    if runner['status'] == 'online':
+                        host['online'] += 1
+                        host['busy' if runner['busy'] else 'idle'] += 1
+                result.update(available=True, error=None, runners=runners,
+                              excluded_cloud=excluded_cloud,
+                              hosts=[hosts[name] for name in sorted(hosts)],
+                              **{key: sum(host[key] for host in hosts.values())
+                                 for key in ('online', 'busy', 'idle')})
         except Exception:
             logger.exception('Could not establish local runner inventory')
         local_runners_cache.update(data=result, ts=time.monotonic())
@@ -6834,9 +6865,12 @@ function refreshLocalRunners() {
         body.innerHTML = '<div class="runner-facts">' + ['online', 'busy', 'idle'].map(k =>
             '<div class="runson-fact"><b>' + Number(d[k]) + '</b><span>' + k + '</span></div>').join('') + '</div>'
             + '<details class="runson-runners-details"><summary>show ' + d.runners.length + ' runners</summary>'
-            + d.runners.map(r => '<div class="local-runner">' + runsonEscape(r.name) + ' · '
-                + runsonEscape(r.labels.join(', ')) + ' · ' + runsonEscape(r.status)
-                + ' · ' + (r.busy ? 'busy' : 'idle') + '</div>').join('') + '</details>'
+            + (d.hosts || []).map(h => '<div class="local-runner-host"><b>' + runsonEscape(h.host)
+                + '</b> · ' + Number(h.online) + ' online · ' + Number(h.busy) + ' busy · ' + Number(h.idle) + ' idle'
+                + h.runners.map(r => '<div class="local-runner">' + runsonEscape(r.name) + ' · '
+                    + runsonEscape(r.labels.join(', ')) + ' · ' + runsonEscape(r.status)
+                    + ' · ' + (r.busy ? 'busy' : 'idle') + '</div>').join('') + '</div>').join('') + '</details>'
+            + '<p class="runson-label">Excluded cloud runners: ' + Number(d.excluded_cloud) + '</p>'
             + '<p class="runson-label">' + (d.jobs_today == null ? 'Jobs today: n/a · ' + runsonEscape(d.jobs_today_reason) : Number(d.jobs_today) + ' jobs today') + '</p>';
     }).catch(() => { document.getElementById('local-runners-body').innerHTML = '<p>Could not establish local runners</p>'; });
 }

@@ -15,7 +15,7 @@ client = q.app.test_client()
 # Check paging, counts, cache, and permission denial without inventing live counts.
 runner = dict(name='farthing-test', labels=[{'name':'fellowship-gate'}, {'name':'ARM64'}], status='online', busy=True)
 with patch.object(q, 'get_gh_ci_token', return_value='test'), patch.object(q.requests, 'get') as get:
-    get.side_effect = [Mock(status_code=200, json=lambda:{'runners':[runner]*100}), Mock(status_code=200, json=lambda:{'runners':[]})]
+    get.side_effect = [Mock(status_code=200, links={'next': {'url': 'https://api.github.com/repos/test/actions/runners?per_page=100&page=2'}}, json=lambda:{'runners':[runner]*100}), Mock(status_code=200, links={}, json=lambda:{'runners':[]})]
     known = q.get_local_runners(True)
     assert known['online'] == known['busy'] == 100 and known['idle'] == 0
     assert q.get_local_runners() == known and get.call_count == 2
