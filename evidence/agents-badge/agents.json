@@ -1,0 +1,149 @@
+[
+  {
+    "window": "issue-7032",
+    "session": "codex",
+    "kind": "codex-lane",
+    "target": {
+      "repo": "armbrain-io/armbrain",
+      "issue": 7032,
+      "number": 7032
+    },
+    "live": false,
+    "square": "fleet",
+    "started_at": null
+  },
+  {
+    "window": "issue-7061",
+    "session": "codex",
+    "kind": "codex-lane",
+    "target": {
+      "repo": "armbrain-io/armbrain",
+      "issue": 7061,
+      "number": 7061
+    },
+    "live": false,
+    "square": "fleet",
+    "started_at": null
+  },
+  {
+    "window": "issue-272-fp",
+    "session": "codex",
+    "kind": "codex-lane",
+    "target": {
+      "repo": "armbrain-io/fleet-planning",
+      "issue": 272,
+      "number": 272
+    },
+    "live": false,
+    "square": "fleet",
+    "started_at": null
+  },
+  {
+    "window": "WORK-strip-order",
+    "session": "council",
+    "kind": "worker",
+    "target": null,
+    "live": true,
+    "square": "fleet",
+    "started_at": "2026-09-04T21:22:54.622670+00:00"
+  },
+  {
+    "window": "WORK-shepherd-6609",
+    "session": "council",
+    "kind": "shepherd",
+    "target": {
+      "repo": "armbrain-io/armbrain",
+      "pr": 6609,
+      "number": 6609
+    },
+    "live": false,
+    "square": "fleet",
+    "started_at": null
+  },
+  {
+    "window": "WORK-shepherd-6610",
+    "session": "council",
+    "kind": "shepherd",
+    "target": {
+      "repo": "armbrain-io/armbrain",
+      "pr": 6610,
+      "number": 6610
+    },
+    "live": true,
+    "square": "in line",
+    "started_at": "2026-09-04T20:15:02.392670+00:00",
+    "title": "fix(hq): enable tenant-scoped Competitive Radar for Customer Zero"
+  },
+  {
+    "window": "WORK-agents-badge",
+    "session": "council",
+    "kind": "worker",
+    "target": null,
+    "live": true,
+    "square": "fleet",
+    "started_at": "2026-09-04T21:17:00.562670+00:00"
+  },
+  {
+    "window": "WORK-pippen-revive-2107",
+    "session": "pippen",
+    "kind": "worker",
+    "target": null,
+    "live": false,
+    "square": "fleet",
+    "started_at": null
+  },
+  {
+    "window": "LANE-GARDENER",
+    "session": "rangers",
+    "kind": "ranger",
+    "target": null,
+    "live": true,
+    "square": "fleet",
+    "started_at": "2026-09-04T12:00:07.212670+00:00"
+  },
+  {
+    "window": "LANE-TICKET-MINER",
+    "session": "rangers",
+    "kind": "ranger",
+    "target": null,
+    "live": true,
+    "square": "fleet",
+    "started_at": "2026-09-04T18:07:08.302670+00:00"
+  },
+  {
+    "window": "LANE-SCOUT",
+    "session": "rangers",
+    "kind": "ranger",
+    "target": null,
+    "live": true,
+    "square": "fleet",
+    "started_at": "2026-09-04T11:56:19.352670+00:00"
+  },
+  {
+    "window": "LANE-PROMPT-FORGE",
+    "session": "rangers",
+    "kind": "ranger",
+    "target": null,
+    "live": false,
+    "square": "fleet",
+    "started_at": null
+  },
+  {
+    "window": "LANE-CONNECTOR-RANGER",
+    "session": "rangers",
+    "kind": "ranger",
+    "target": null,
+    "live": false,
+    "square": "fleet",
+    "started_at": null
+  },
+  {
+    "window": "LANE-CZ-RANGER",
+    "session": "rangers",
+    "kind": "ranger",
+    "target": null,
+    "live": false,
+    "square": "fleet",
+    "started_at": null
+  }
+]
