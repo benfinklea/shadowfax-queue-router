@@ -3729,7 +3729,7 @@ def _get_green_waiting(token):
 
     prs = gh_json(["pr", "list", "--repo", GITHUB_CI_REPO, "--state", "open",
                    "--limit", "100", "--search", "sort:created-asc", "--json",
-                   "number,title,isDraft,reviewDecision,mergeable,labels"])
+                   "number,title,isDraft,reviewDecision,mergeable,mergeStateStatus,labels"])
     owner, name = GITHUB_CI_REPO.split("/")
     query = '''query($owner:String!,$name:String!){
       repository(owner:$owner,name:$name){mergeQueue(branch:"main"){
@@ -3744,13 +3744,15 @@ def _get_green_waiting(token):
     queued = {entry["pullRequest"]["number"] for entry in queue["entries"]["nodes"]}
     # Drafts are unfinished; unapproved PRs still need review; non-MERGEABLE
     # (including UNKNOWN) PRs have not established merge readiness.
+    # Only CLEAN establishes green checks; BLOCKED and UNSTABLE are not green.
     # Queued PRs are already being fed into the line, so are not waiting.
     # do-not-merge explicitly forbids merging; needs-repair needs fixes;
     # hold intentionally pauses work; blocked-on-ben awaits Ben's decision.
     held = {"do-not-merge", "needs-repair", "hold", "blocked-on-ben"}
     return [{"number": pr["number"], "title": pr["title"]} for pr in prs
             if not pr["isDraft"] and pr["reviewDecision"] == "APPROVED"
-            and pr["mergeable"] == "MERGEABLE" and pr["number"] not in queued
+            and pr["mergeable"] == "MERGEABLE" and pr["mergeStateStatus"] == "CLEAN"
+            and pr["number"] not in queued
             and not held.intersection(label["name"].lower() for label in pr["labels"])]
 
 
@@ -4736,10 +4738,6 @@ font-size:0.9em;text-shadow:0 0 8px var(--neon-magenta)}
 .ship-spark{display:flex;align-items:flex-end;gap:2px;height:11px;margin-top:3px}
 .ship-spark i{width:5px;background:var(--neon-cyan);box-shadow:0 0 4px var(--neon-cyan);
 border-radius:1px 1px 0 0;min-height:1px}
-.ship-updated{align-self:center;margin-left:9px;padding:3px 7px;border:1px solid #2a3450;
-border-radius:999px;color:#c7cee0;font-size:0.78em;white-space:nowrap}
-.ship-updated.stale{color:var(--neon-yellow);border-color:rgba(255,255,0,0.55);
-background:rgba(255,255,0,0.06);box-shadow:0 0 7px rgba(255,255,0,0.16)}
 .monitor-glance-band{display:grid;grid-template-columns:minmax(720px,1.25fr) minmax(500px,.75fr);
 gap:10px;align-items:start;margin:10px 0}
 .monitor-glance-band>.card{margin:0}
@@ -5183,14 +5181,6 @@ function refreshShipFlow() {
             const t = new Date(d.last_deploy_at);
             stamp = t.toLocaleString('en-US', {month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZone: 'America/Chicago'});
         }
-        const generated = d.generated_at ? new Date(d.generated_at) : null;
-        const generatedValid = generated && !Number.isNaN(generated.getTime());
-        const updatedTime = generatedValid
-            ? generated.toLocaleTimeString('en-US', {hour: 'numeric', minute: '2-digit', second: '2-digit', timeZone: 'America/Chicago'})
-            : '--';
-        const stale = generatedValid && (Date.now() - generated.getTime() > 10 * 60 * 1000);
-        const degradedNote = d.degraded ? ' (GitHub read failing - showing last good)' : '';
-        const updatedChip = '<div class="ship-updated' + (stale ? ' stale' : '') + '">updated ' + updatedTime + ' CT' + degradedNote + '</div>';
         el.innerHTML =
             '<div class="ship-label"><img src="/armbrain-logo.svg" alt="Armbrain" class="ship-logo" title="Armbrain - the product this pipeline ships">SHIPPING</div>' +
             shipStage(d.issues_open, 'issues open', '', '', null, HELP.issues) + ARROW +
@@ -5200,8 +5190,7 @@ function refreshShipFlow() {
             shipStage(d.green_waiting, 'green waiting', greenCls, greenSub, null, HELP.greenWaiting) + ARROW +
             '<div class="ship-stage" title="' + HELP.lastdep.replace(/"/g, '') + '"><div class="ship-num stamp">' + stamp + '</div>'
               + '<div class="ship-cap">last deploy (CT)</div>'
-              + (d.last_deploy_sha ? '<div class="ship-sub">⎇ ' + d.last_deploy_sha + '</div>' : '') + '</div>'
-              + updatedChip;
+              + (d.last_deploy_sha ? '<div class="ship-sub">⎇ ' + d.last_deploy_sha + '</div>' : '') + '</div>';
     }).catch(() => {
         const el = document.getElementById('ship-flow');
         if (el && !el.querySelector('.ship-stage')) el.innerHTML = '<span class="gdim">shipping pipeline failed to load.</span>';
@@ -5583,7 +5572,7 @@ const HELP = {
     prs:       'PULL REQUESTS OPEN - finished work waiting to be reviewed and merged.',
     ciqr:      'CI QUEUED / RUNNING - automated test runs waiting to start, and runs happening now. A growing queued number means you are short on runners.',
     merged:    'MERGED TODAY - pull requests that landed in the main branch today. The little bars are the last seven days, so you can see whether today is normal.',
-    greenWaiting: 'GREEN WAITING - approved pull requests with every test passing that are not in the merge line yet. Zero is good. If this grows, the line is not being fed.',
+    greenWaiting: 'GREEN WAITING - approved pull requests with every required test passing that are not in the merge line yet. Zero is good. If this grows, the line is not being fed.',
     lastdep:   'LAST DEPLOY - when the most recent release went out, in Central Time, and the short code identifying exactly which version it was.',
     maxutil:   'The busiest this graphics card got today, as a percentage.',
 };

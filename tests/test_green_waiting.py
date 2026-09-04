@@ -15,7 +15,7 @@ class GreenWaitingTest(unittest.TestCase):
             return qr._get_green_waiting('test-token')
 
     def test_exclusions_and_oldest_order(self):
-        base = dict(isDraft=False, reviewDecision='APPROVED', mergeable='MERGEABLE', labels=[])
+        base = dict(isDraft=False, reviewDecision='APPROVED', mergeable='MERGEABLE', mergeStateStatus='CLEAN', labels=[])
         prs = [dict(base, number=i, title=f'PR {i}') for i in range(1, 12)]
         prs[1]['isDraft'] = True
         prs[2]['reviewDecision'] = 'REVIEW_REQUIRED'
@@ -25,6 +25,13 @@ class GreenWaitingTest(unittest.TestCase):
             pr['labels'] = [{'name': label}]
         queue = {'entries': {'nodes': [{'pullRequest': {'number': 10}}], 'pageInfo': {'hasNextPage': False}}}
         self.assertEqual(self.read(prs, queue), [{'number': 1, 'title': 'PR 1'}, {'number': 11, 'title': 'PR 11'}])
+
+    def test_only_clean_checks_are_green(self):
+        prs = [dict(number=i, title=state, isDraft=False, reviewDecision='APPROVED',
+                    mergeable='MERGEABLE', mergeStateStatus=state, labels=[])
+               for i, state in enumerate(['CLEAN', 'BLOCKED', 'UNSTABLE', 'UNKNOWN', 'BEHIND'])]
+        queue = {'entries': {'nodes': [], 'pageInfo': {'hasNextPage': False}}}
+        self.assertEqual(self.read(prs, queue), [{'number': 0, 'title': 'CLEAN'}])
 
     def test_missing_or_truncated_queue_is_not_zero(self):
         for queue in [None, {'entries': {'nodes': [], 'pageInfo': {'hasNextPage': True}}}]:

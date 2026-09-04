@@ -29,6 +29,9 @@ with sync_playwright() as p:
     stages = page.locator('.ship-cap').all_text_contents()
     assert 'green waiting' in stages and 'deployed today' not in stages, stages
     assert page.locator('.ship-arrow').count() == len(stages) - 1
+    assert 'updated' not in page.locator('#ship-flow').inner_text().lower()
+    assert page.locator('.ship-updated').count() == 0
+    assert 'every required test passing' in page.locator('.ship-stage').filter(has=page.locator('.ship-cap', has_text='green waiting')).get_attribute('title')
     out.joinpath('shipping.html').write_text(page.locator('#ship-flow').evaluate('(el)=>el.outerHTML'))
     page.locator('#ship-flow').screenshot(path=str(out / 'shipping.png'))
     checks = []

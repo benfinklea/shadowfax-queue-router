@@ -351,7 +351,7 @@ def check_green_waiting(d) -> None:
         # closed/drafted/held since the cached snapshot are also detected.
         fields = " ".join(
             f'p{p["number"]}:pullRequest(number:{p["number"]})'
-            '{state isDraft reviewDecision mergeable labels(first:100){nodes{name} pageInfo{hasNextPage}}}'
+            '{state isDraft reviewDecision mergeable mergeStateStatus labels(first:100){nodes{name} pageInfo{hasNextPage}}}'
             for p in waiting)
         query = ('{repository(owner:"armbrain-io",name:"armbrain"){' + fields +
                  ' mergeQueue(branch:"main"){entries(first:100){nodes{pullRequest{number}} pageInfo{hasNextPage}}}}}')
@@ -365,13 +365,14 @@ def check_green_waiting(d) -> None:
             current = live.get(f'p{pr["number"]}')
             if (not current or current["state"] != "OPEN" or current["isDraft"]
                     or current["reviewDecision"] != "APPROVED" or current["mergeable"] != "MERGEABLE"
+                    or current["mergeStateStatus"] != "CLEAN"
                     or pr["number"] in queued or current["labels"]["pageInfo"]["hasNextPage"]
                     or {x["name"].lower() for x in current["labels"]["nodes"]}
                     & {"do-not-merge", "needs-repair", "hold", "blocked-on-ben"}):
                 invalid.append(pr["number"])
         emit("FAIL" if invalid else "PASS", "pipeline.green_waiting.live",
              waiting, {"invalid_prs": invalid, "queued": sorted(queued)},
-             "live OPEN + not draft + APPROVED + MERGEABLE + not held + not queued; cache churn may fail")
+             "live OPEN + not draft + APPROVED + MERGEABLE + CLEAN + not held + not queued; cache churn may fail")
     except Exception as exc:
         emit("FAIL", "pipeline.green_waiting.live", waiting, "could not establish", str(exc))
 
