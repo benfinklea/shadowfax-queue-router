@@ -1,0 +1,71 @@
+[
+  {
+    "level": "PASS",
+    "signal": "pipeline.queue.count",
+    "dashboard": 2,
+    "instrument": 2,
+    "detail": ""
+  },
+  {
+    "level": "PASS",
+    "signal": "pipeline.merged_today.count",
+    "dashboard": 31,
+    "instrument": 31,
+    "detail": ""
+  },
+  {
+    "level": "PASS",
+    "signal": "pipeline.green_waiting.count",
+    "dashboard": 0,
+    "instrument": 0,
+    "detail": ""
+  },
+  {
+    "level": "PASS",
+    "signal": "pipeline.queue.live",
+    "dashboard": {
+      "queue_depth": 2,
+      "queue_prs": [
+        {
+          "number": 7062,
+          "title": "fix(hq): exclude demo fixtures and guard Northwind seeding",
+          "state": "AWAITING_CHECKS"
+        },
+        {
+          "number": 6610,
+          "title": "fix(hq): enable tenant-scoped Competitive Radar for Customer Zero",
+          "state": "AWAITING_CHECKS"
+        }
+      ]
+    },
+    "instrument": {
+      "queue_depth": 2,
+      "queue_prs": [
+        {
+          "number": 7062,
+          "title": "fix(hq): exclude demo fixtures and guard Northwind seeding",
+          "state": "AWAITING_CHECKS"
+        },
+        {
+          "number": 6610,
+          "title": "fix(hq): enable tenant-scoped Competitive Radar for Customer Zero",
+          "state": "AWAITING_CHECKS"
+        }
+      ]
+    },
+    "detail": "live main merge queue in front-entry order; cache churn may fail"
+  },
+  {
+    "level": "PASS",
+    "signal": "pipeline.green_waiting.live",
+    "dashboard": [],
+    "instrument": {
+      "invalid_prs": [],
+      "queued": [
+        6610,
+        7062
+      ]
+    },
+    "detail": "live OPEN + not draft + APPROVED + MERGEABLE + CLEAN + not held + no open review gate + not queued; cache churn may fail"
+  }
+]

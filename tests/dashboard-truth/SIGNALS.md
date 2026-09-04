@@ -35,7 +35,8 @@ The suite treats the dashboard as a claim and reads the underlying system again 
 | Shipping: merged-rate box colour | `/api/pipeline.merged_last_hour` integer count | pure renderer fixtures assert 0=pulsing red, 1=red, 2=yellow, and 3/7=green; live box binding uses `merged_last_hour` |
 | Shipping: last merge time | newest `merged_at` among recently closed PRs | direct pulls REST exact timestamp |
 | Shipping: merged seven-day spark | seven Central-Time daily merge buckets | seven-integer shape plus GitHub source availability |
-| Shipping: green waiting | oldest 100 open PRs, approved + mergeable, not draft, held, or in the main GraphQL merge queue; same 45-second pipeline cache | count equals list length; re-read each listed PR and queue live; DOM has green waiting and no deployed-today square |
+| Shipping: green waiting | oldest 100 open PRs, approved + mergeable, not draft, held (including gate-review or galadriel-review), or in the main GraphQL merge queue; same 45-second pipeline cache | count equals list length; re-read each listed PR and queue live; DOM asserts issues open → prs open → ci q/run → green waiting → in line → merged today → last deploy (CT) literally |
+| Shipping: in line | same main GraphQL merge queue snapshot as green waiting; queue_depth and ordered queue_prs with entry states | count equals list length; re-read ordered numbers and states live; DOM checks 0 red, 1 yellow, 2 green and any UNMERGEABLE red with stuck subtitle |
 | Pipeline deployment compatibility fields (not rendered as a square) | production `push`/`workflow_dispatch` runs of `gateway-deploy.yml` | retained deployment counts and seven-day spark schema |
 | Pipeline: deploy seven-day spark (API only) | successful production deploy workflow runs | seven-integer shape plus GitHub source availability |
 | Shipping: last deploy time/SHA | latest successful `deploy` job on main | direct runs and jobs REST, exact SHA/time |

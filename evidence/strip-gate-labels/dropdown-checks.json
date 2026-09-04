@@ -1,0 +1,20 @@
+[
+  {
+    "key": "green-waiting",
+    "rows": 0,
+    "links": "PASS",
+    "refresh": "PASS"
+  },
+  {
+    "key": "in-line",
+    "rows": 2,
+    "links": "PASS",
+    "refresh": "PASS"
+  },
+  {
+    "key": "merged-today",
+    "rows": 31,
+    "links": "PASS",
+    "refresh": "PASS"
+  }
+]

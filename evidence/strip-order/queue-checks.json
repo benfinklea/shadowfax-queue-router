@@ -1,0 +1,63 @@
+[
+  {
+    "entries": [],
+    "class": "hot",
+    "subtitle": []
+  },
+  {
+    "entries": [
+      {
+        "number": 42,
+        "state": "AWAITING_CHECKS"
+      }
+    ],
+    "class": "warn",
+    "subtitle": [
+      "#42"
+    ]
+  },
+  {
+    "entries": [
+      {
+        "number": 42,
+        "state": "AWAITING_CHECKS"
+      },
+      {
+        "number": 7,
+        "state": "QUEUED"
+      }
+    ],
+    "class": "ok",
+    "subtitle": [
+      "#42"
+    ]
+  },
+  {
+    "entries": [
+      {
+        "number": 42,
+        "state": "AWAITING_CHECKS"
+      },
+      {
+        "number": 7,
+        "state": "UNMERGEABLE"
+      }
+    ],
+    "class": "hot",
+    "subtitle": [
+      "#7 stuck"
+    ]
+  },
+  {
+    "entries": [
+      {
+        "number": 7,
+        "state": "UNMERGEABLE"
+      }
+    ],
+    "class": "hot",
+    "subtitle": [
+      "#7 stuck"
+    ]
+  }
+]

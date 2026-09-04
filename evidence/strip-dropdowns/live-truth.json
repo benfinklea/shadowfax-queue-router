@@ -1,0 +1,65 @@
+[
+  {
+    "level": "PASS",
+    "signal": "pipeline.queue.count",
+    "dashboard": 1,
+    "instrument": 1,
+    "detail": ""
+  },
+  {
+    "level": "PASS",
+    "signal": "pipeline.merged_today.count",
+    "dashboard": 30,
+    "instrument": 30,
+    "detail": ""
+  },
+  {
+    "level": "PASS",
+    "signal": "pipeline.green_waiting.count",
+    "dashboard": 1,
+    "instrument": 1,
+    "detail": ""
+  },
+  {
+    "level": "PASS",
+    "signal": "pipeline.queue.live",
+    "dashboard": {
+      "queue_depth": 1,
+      "queue_prs": [
+        {
+          "number": 6948,
+          "title": "fix(gates): classify blocking reviews by SHA in the human-decision receipt",
+          "state": "AWAITING_CHECKS"
+        }
+      ]
+    },
+    "instrument": {
+      "queue_depth": 1,
+      "queue_prs": [
+        {
+          "number": 6948,
+          "title": "fix(gates): classify blocking reviews by SHA in the human-decision receipt",
+          "state": "AWAITING_CHECKS"
+        }
+      ]
+    },
+    "detail": "live main merge queue in front-entry order; cache churn may fail"
+  },
+  {
+    "level": "PASS",
+    "signal": "pipeline.green_waiting.live",
+    "dashboard": [
+      {
+        "number": 6840,
+        "title": "fix(billing): restore checkout after beta closes (#6782)"
+      }
+    ],
+    "instrument": {
+      "invalid_prs": [],
+      "queued": [
+        6948
+      ]
+    },
+    "detail": "live OPEN + not draft + APPROVED + MERGEABLE + CLEAN + not held + not queued; cache churn may fail"
+  }
+]
