@@ -41,7 +41,7 @@ GET_SCHEMAS = {
     "pipeline": {"available", "repo", "generated_at"},
     "status": {"targets", "recent_jobs"}, "fleet": set(FLEET),
     "ci_queue": {"available", "queued", "in_progress", "repo"},
-    "runson": {"available", "deployed", "generated_at"},
+    "runson": {"available", "deployed", "generated_at", "gate_shards", "gate_shards_source", "gate_shards_error"},
     "model_serving": set(), "fleet_stats": {"agents", "runners"},
     "model_routes": {"available", "routes"}, "vram-processes": set(),
     "logs": {"jobs"}, "energy": {"base_per_kwh", "by_machine", "fleet", "note"},
@@ -527,6 +527,25 @@ def check_local_sources() -> None:
         emit("WARN", "fleet_stats.runners_total", "unavailable", "GitHub runner API unavailable")
 
 
+def check_runson_gate() -> None:
+    claim = api.get("runson", {}).get("gate_shards")
+    cp = run(["gh", "variable", "list", "-R", "armbrain-io/armbrain", "--json", "name,value"], timeout=30)
+    expected = None
+    detail = "direct gh variable list -R armbrain-io/armbrain"
+    if cp.returncode == 0:
+        try:
+            variables = {row["name"]: str(row.get("value", "")).strip().lower() for row in json.loads(cp.stdout)}
+            value = variables.get("RUNSON_GATE_SHARDS")
+            expected = {"on": "on", "true": "on", "off": "off", "false": "off"}.get(value)
+        except (KeyError, TypeError, json.JSONDecodeError):
+            pass
+    matches = expected is not None and claim == expected
+    emit("PASS" if matches else "FAIL", "runson.gate_shards",
+         {"gate_shards": claim, "source": api.get("runson", {}).get("gate_shards_source"),
+          "error": api.get("runson", {}).get("gate_shards_error")},
+         {"RUNSON_GATE_SHARDS": expected}, detail if cp.returncode == 0 else cp.stderr.strip()[:200])
+
+
 def check_rendering() -> None:
     try:
         code, body = http("/")
@@ -598,6 +617,46 @@ console.log(JSON.stringify({
                 handle.write("\n".join(scripts)); handle.flush()
                 node_ok = run(["node", "--check", handle.name], timeout=10).returncode == 0
         emit("PASS" if node_ok else "FAIL", "page.javascript_syntax", node_ok, "node --check")
+
+        merge_probe = None
+        merge_start = page.find("function mergedRateClass(")
+        merge_end = page.find("function refreshShipFlow()", merge_start)
+        if merge_start >= 0 and merge_end > merge_start:
+            fixture_js = page[merge_start:merge_end] + "\nconsole.log(JSON.stringify([0,1,2,3,7].map(mergedRateClass)));\n"
+            with tempfile.NamedTemporaryFile("w", suffix=".js") as handle:
+                handle.write(fixture_js); handle.flush()
+                probe = run(["node", handle.name], timeout=10)
+            if probe.returncode == 0:
+                try:
+                    merge_probe = json.loads(probe.stdout.strip())
+                except json.JSONDecodeError:
+                    pass
+        expected_classes = ["merge-red merge-pulse", "merge-red", "merge-yellow", "merge-green", "merge-green"]
+        threshold_ok = merge_probe == expected_classes
+        emit("PASS" if threshold_ok else "FAIL", "page.merged_rate.thresholds",
+             merge_probe, {"0": expected_classes[0], "1": expected_classes[1], "2": expected_classes[2],
+                           "3": expected_classes[3], "7": expected_classes[4]})
+        live_count = api.get("pipeline", {}).get("merged_last_hour")
+        live_class = None
+        if isinstance(live_count, int) and merge_probe:
+            live_class = expected_classes[min(live_count, 3)]
+        binding_ok = (
+            live_class is not None
+            and "mergedRateClass(d.merged_last_hour)" in page
+            and "ship-stage ' + (stageCls || '')" in page
+        )
+        emit("PASS" if binding_ok else "FAIL", "page.merged_rate.class_binding",
+             {"merged_last_hour": live_count, "expected_class": live_class},
+             "merged box class is derived from merged_last_hour")
+
+        integer_tps_ok = (
+            "Math.round(s.tps_now)" in page
+            and "Math.round(peak)" in page
+            and "Math.round(s.tps_avg_today)" in page
+            and "Math.round(max) + unit" in page
+        )
+        emit("PASS" if integer_tps_ok else "FAIL", "page.tps.integer_readouts",
+             integer_tps_ok, "now, peak today, average, and gauge limit use Math.round")
         for fn in ("refresh", "refreshFleet", "refreshHistory", "refreshEnergy", "refreshCiQueue", "refreshShipFlow", "refreshRunsOn", "refreshRouteHealth", "refreshFleetStats", "refreshModelServing"):
             found = f"function {fn}(" in page
             emit("PASS" if found else "FAIL", f"page.renderer.{fn}", found, "renderer declared")
@@ -609,6 +668,15 @@ console.log(JSON.stringify({
             "google-chrome", "--headless", "--no-sandbox", "--disable-gpu",
             "--virtual-time-budget=26000", "--dump-dom", BASE + "/",
         ], timeout=60)
+        gate = api.get("runson", {}).get("gate_shards")
+        expected_glow = "glow-" + (gate if gate in ("on", "off") else "unknown")
+        card_tag = re.search(r'<div[^>]*id="runson-card"[^>]*>', chrome.stdout)
+        shard_text_match = re.search(r'<span id="runson-shard-state">(.*?)</span>', chrome.stdout, re.S)
+        shard_text = html.unescape(re.sub(r"<[^>]+>", "", shard_text_match.group(1))).strip() if shard_text_match else ""
+        glow_ok = bool(card_tag and expected_glow in card_tag.group(0) and shard_text and "loading" not in shard_text.lower())
+        emit("PASS" if glow_ok else "FAIL", "runson.gate_shards.glow",
+             {"card": card_tag.group(0) if card_tag else None, "notice": shard_text},
+             {"class": expected_glow, "notice": "resolved shard state"}, "headless rendered DOM")
         match = re.search(
             r'<div id="loaded-models-pippin"[^>]*>(.*?)</div>',
             chrome.stdout, re.S,
@@ -817,6 +885,7 @@ def run_truth_pass():
     check_gpu()
     check_models()
     check_pipeline()
+    check_runson_gate()
     check_local_sources()
     check_rendering()
     return [r for r in results if r["level"] == "FAIL"]
