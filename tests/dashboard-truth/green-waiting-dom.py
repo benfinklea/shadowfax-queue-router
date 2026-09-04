@@ -33,6 +33,7 @@ with sync_playwright() as p:
     assert 'updated' not in page.locator('#ship-flow').inner_text().lower()
     assert page.locator('.ship-updated').count() == 0
     assert 'every required test passing' in page.locator('.ship-stage').filter(has=page.locator('.ship-cap', has_text='green waiting')).get_attribute('title')
+    assert 'no open review gate' in page.locator('.ship-stage').filter(has=page.locator('.ship-cap', has_text='green waiting')).get_attribute('title')
     logo = 'data:image/svg+xml;base64,' + base64.b64encode((root / 'armbrain-logo.svg').read_bytes()).decode()
     page.locator('.ship-logo').evaluate('(el, src) => { el.src = src; }', logo)
     page.wait_for_function('document.querySelector(".ship-logo").complete')

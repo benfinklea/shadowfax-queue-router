@@ -1,0 +1,178 @@
+{
+  "available": true,
+  "repo": "armbrain-io/armbrain",
+  "generated_at": "2026-09-04T21:25:16.169739+00:00",
+  "green_waiting_prs": [],
+  "queue_prs": [
+    {
+      "number": 7062,
+      "title": "fix(hq): exclude demo fixtures and guard Northwind seeding",
+      "state": "AWAITING_CHECKS"
+    },
+    {
+      "number": 6610,
+      "title": "fix(hq): enable tenant-scoped Competitive Radar for Customer Zero",
+      "state": "AWAITING_CHECKS"
+    }
+  ],
+  "queue_depth": 2,
+  "green_waiting": 0,
+  "issues_open": 341,
+  "prs_open": 129,
+  "merged_today_prs": [
+    {
+      "number": 6948,
+      "title": "fix(gates): classify blocking reviews by SHA in the human-decision receipt"
+    },
+    {
+      "number": 7047,
+      "title": "fix(gates): end grandfathering and take the head arrival time from GitHub's clock (ledger 136q-d, 136q-e)"
+    },
+    {
+      "number": 6609,
+      "title": "feat(briefings): morning briefing v15 - bottom line first, fires and dos above the fold, guide last"
+    },
+    {
+      "number": 7046,
+      "title": "ci(gate): cap RunsOn gate shard fan-out at the AWS vCPU quota (#7044, ledger 136t)"
+    },
+    {
+      "number": 6597,
+      "title": "fix(onboarding): new signups are fractional CMOs, and the first move is their client notes (activation path, PR 2)"
+    },
+    {
+      "number": 7041,
+      "title": "fix(gates): gateway review-provenance stops trusting review.commit_id (#7038, ledger 136q)"
+    },
+    {
+      "number": 6927,
+      "title": "fix(briefings): classify ClickUp sprint fetch failure as degraded and map cancelled status (#6924)"
+    },
+    {
+      "number": 6581,
+      "title": "copy(hq): simplify mind setup onboarding language (#6566)"
+    },
+    {
+      "number": 7037,
+      "title": "fix(gates): stop trusting review.commit_id as proof of what was reviewed (ledger 136q)"
+    },
+    {
+      "number": 6580,
+      "title": "fix(hq): simplify connector copy (#6565)"
+    },
+    {
+      "number": 6931,
+      "title": "fix(ci): tests-green must not treat a cancelled hq-bundle as failure"
+    },
+    {
+      "number": 6477,
+      "title": "feat(network): preview imports, quality gate filter, and batch undo (#5815)"
+    },
+    {
+      "number": 6464,
+      "title": "fix(scheduled-operations): surface automatic disables"
+    },
+    {
+      "number": 6462,
+      "title": "fix(stripe): alert ops on chargebacks (#6399)"
+    },
+    {
+      "number": 6442,
+      "title": "fix(evals): verify check-run publisher before carry-forward (#6409)"
+    },
+    {
+      "number": 7028,
+      "title": "fix(business-os): require preview, confirm, and undo for quarter-transition writes (#6972)"
+    },
+    {
+      "number": 7001,
+      "title": "fix(mcp): clarify store memory persistence receipt"
+    },
+    {
+      "number": 6895,
+      "title": "fix(decision-desk): dedupe provenance bodies"
+    },
+    {
+      "number": 6899,
+      "title": "fix(onboarding): clarify password setup link (#6874)"
+    },
+    {
+      "number": 6713,
+      "title": "feat(network): add demo tenant allowlist (#6708)"
+    },
+    {
+      "number": 6437,
+      "title": "fix: validate provider vectors before persistence (#6396)"
+    },
+    {
+      "number": 6982,
+      "title": "fix(settings): show briefing delivery email (#6943)"
+    },
+    {
+      "number": 7003,
+      "title": "fix(mcp): lead connector output with capabilities (#6969)"
+    },
+    {
+      "number": 6999,
+      "title": "fix: verify managed briefing recipients (#6644)"
+    },
+    {
+      "number": 6882,
+      "title": "fix(briefings): clarify destinations and client scope (#6881)"
+    },
+    {
+      "number": 6989,
+      "title": "fix(prospects): add card follow-up actions"
+    },
+    {
+      "number": 6988,
+      "title": "fix(settings): show Claude connection status"
+    },
+    {
+      "number": 6983,
+      "title": "fix(mcp): frame stale recency answers (#6964)"
+    },
+    {
+      "number": 7009,
+      "title": "chore(ops): update declared runner inventory caps (frodo=6, gandalf=12)"
+    },
+    {
+      "number": 6806,
+      "title": "fix(decision-desk): hide unsupported recommendations (#6798)"
+    },
+    {
+      "number": 6893,
+      "title": "fix(decision-desk): preserve options and custom drafts (#6860)"
+    }
+  ],
+  "merged_today": 31,
+  "merged_last_hour": 1,
+  "last_merge_at": "2026-09-04T21:22:33Z",
+  "merged_spark": [
+    42,
+    64,
+    48,
+    83,
+    67,
+    47,
+    31
+  ],
+  "ci_queued": 8,
+  "ci_running": 0,
+  "deploys_spark": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    6
+  ],
+  "deploys_ok_today": 6,
+  "deploys_failed_today": 0,
+  "deploys_in_flight": 1,
+  "deploy_started_min": 81,
+  "last_deploy_at": "2026-09-04T19:17:07Z",
+  "last_deploy_sha": "5d90ba9f8",
+  "degraded": false
+}

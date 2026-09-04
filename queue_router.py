@@ -3780,7 +3780,8 @@ def _get_shipping_readiness(token):
     # Queued PRs are already being fed into the line, so are not waiting.
     # do-not-merge explicitly forbids merging; needs-repair needs fixes;
     # hold intentionally pauses work; blocked-on-ben awaits Ben's decision.
-    held = {"do-not-merge", "needs-repair", "hold", "blocked-on-ben"}
+    # gate-review and galadriel-review await an open review gate.
+    held = {"do-not-merge", "needs-repair", "hold", "blocked-on-ben", "gate-review", "galadriel-review"}
     waiting = [{"number": pr["number"], "title": pr["title"]} for pr in prs
             if not pr["isDraft"] and pr["reviewDecision"] == "APPROVED"
             and pr["mergeable"] == "MERGEABLE" and pr["mergeStateStatus"] == "CLEAN"
@@ -5675,7 +5676,7 @@ const HELP = {
     ciqr:      'CI QUEUED / RUNNING - automated test runs waiting to start, and runs happening now. A growing queued number means you are short on runners.',
     merged:    'MERGED TODAY - pull requests that landed in the main branch today. The little bars are the last seven days, so you can see whether today is normal.',
     inLine: 'IN LINE - pull requests the merge queue is testing right now. Two is full and good. Zero means nothing is being merged.',
-    greenWaiting: 'GREEN WAITING - approved pull requests with every required test passing that are not in the merge line yet. Zero is good. If this grows, the line is not being fed.',
+    greenWaiting: 'GREEN WAITING - approved pull requests with every required test passing and no open review gate that are not in the merge line yet. Zero is good. If this grows, the line is not being fed.',
     lastdep:   'LAST DEPLOY - when the most recent release went out, in Central Time, and the short code identifying exactly which version it was.',
     maxutil:   'The busiest this graphics card got today, as a percentage.',
 };

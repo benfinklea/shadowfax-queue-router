@@ -16,13 +16,15 @@ class GreenWaitingTest(unittest.TestCase):
 
     def test_exclusions_and_oldest_order(self):
         base = dict(isDraft=False, reviewDecision='APPROVED', mergeable='MERGEABLE', mergeStateStatus='CLEAN', labels=[])
-        prs = [dict(base, number=i, title=f'PR {i}') for i in range(1, 12)]
+        prs = [dict(base, number=i, title=f'PR {i}') for i in range(1, 14)]
         prs[1]['isDraft'] = True
         prs[2]['reviewDecision'] = 'REVIEW_REQUIRED'
         prs[3]['mergeable'] = 'CONFLICTING'
         prs[4]['mergeable'] = 'UNKNOWN'
         for pr, label in zip(prs[5:9], ['do-not-merge', 'needs-repair', 'hold', 'blocked-on-ben']):
             pr['labels'] = [{'name': label}]
+        prs[11]['labels'] = [{'name': 'gate-review'}]
+        prs[12]['labels'] = [{'name': 'galadriel-review'}]
         queue = {'entries': {'nodes': [{'state': 'QUEUED', 'pullRequest': {'number': 10, 'title': 'PR 10'}}], 'pageInfo': {'hasNextPage': False}}}
         self.assertEqual(self.read(prs, queue)[0], [{'number': 1, 'title': 'PR 1'}, {'number': 11, 'title': 'PR 11'}])
 

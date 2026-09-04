@@ -1,0 +1,20 @@
+{
+  "level": "FAIL",
+  "signal": "pipeline.green_waiting.live",
+  "dashboard": [
+    {
+      "number": 6840,
+      "title": "Deliberately reinserted gated PR"
+    }
+  ],
+  "instrument": {
+    "invalid_prs": [
+      6840
+    ],
+    "queued": [
+      6610,
+      7062
+    ]
+  },
+  "detail": "live OPEN + not draft + APPROVED + MERGEABLE + CLEAN + not held + no open review gate + not queued; cache churn may fail"
+}

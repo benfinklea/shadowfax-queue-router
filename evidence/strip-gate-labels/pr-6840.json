@@ -1,0 +1,21 @@
+{
+  "labels": [
+    {
+      "id": "LA_kwDORj4a9s8AAAACyBNLEQ",
+      "name": "gate-review",
+      "description": "Blocks merge until a coordinator confirms the gate label set",
+      "color": "B60205"
+    },
+    {
+      "id": "LA_kwDORj4a9s8AAAACypSIxQ",
+      "name": "galadriel-review",
+      "description": "",
+      "color": "ededed"
+    }
+  ],
+  "mergeStateStatus": "CLEAN",
+  "mergeable": "MERGEABLE",
+  "number": 6840,
+  "reviewDecision": "APPROVED",
+  "state": "OPEN"
+}

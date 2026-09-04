@@ -388,11 +388,11 @@ def check_green_waiting(d) -> None:
                     or current["mergeStateStatus"] != "CLEAN"
                     or pr["number"] in queued or current["labels"]["pageInfo"]["hasNextPage"]
                     or {x["name"].lower() for x in current["labels"]["nodes"]}
-                    & {"do-not-merge", "needs-repair", "hold", "blocked-on-ben"}):
+                    & {"do-not-merge", "needs-repair", "hold", "blocked-on-ben", "gate-review", "galadriel-review"}):
                 invalid.append(pr["number"])
         emit("FAIL" if invalid else "PASS", "pipeline.green_waiting.live",
              waiting, {"invalid_prs": invalid, "queued": sorted(queued)},
-             "live OPEN + not draft + APPROVED + MERGEABLE + CLEAN + not held + not queued; cache churn may fail")
+             "live OPEN + not draft + APPROVED + MERGEABLE + CLEAN + not held + no open review gate + not queued; cache churn may fail")
     except Exception as exc:
         emit("FAIL", "pipeline.green_waiting.live", waiting, "could not establish", str(exc))
         emit("FAIL", "pipeline.queue.live", queue_prs, "could not establish", str(exc))
