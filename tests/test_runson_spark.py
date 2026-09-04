@@ -38,6 +38,18 @@ class RunnerHistoryTest(unittest.TestCase):
         raw = qr._record_runson_runners(4, self.now + timedelta(seconds=1))
         self.assertEqual([p['n'] for p in raw], [3, 4])
 
+    def test_warm_timer_accounts_for_fetch_duration(self):
+        # A 25-second fetch must leave 35 seconds until the next minute tick.
+        with patch.object(qr.time, 'monotonic', side_effect=[0, 0, 60, 85]), \
+             patch.object(qr.time, 'sleep', side_effect=[None, InterruptedError]) as sleep, \
+             patch.object(qr, '_runson_should_warm', return_value=True), \
+             patch.object(qr, '_runson_fetch', return_value={"available": False}) as fetch, \
+             patch.object(qr, '_runson_store'):
+            with self.assertRaises(InterruptedError):
+                qr.runson_warm_loop()
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], [60, 35])
+        fetch.assert_called_once()
+
     def test_payload_and_independent_truth_check_detect_tampering(self):
         spec = importlib.util.spec_from_file_location('truth', Path(__file__).parent / 'dashboard-truth/truth_suite.py')
         truth = importlib.util.module_from_spec(spec)

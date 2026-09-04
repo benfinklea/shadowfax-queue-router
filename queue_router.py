@@ -1939,11 +1939,8 @@ RUNSON_WARM_INTERVAL = 60   # seconds between background warm passes
 # dashboard would be roughly 980 passes a day of billed reads for nobody. After this
 # long with no reader the loop idles, and the next reader re-arms it.
 RUNSON_WARM_IDLE_AFTER = 20 * 60  # seconds
-# A warm pass only pays for itself if the snapshot would otherwise go stale before
-# the next one. Without this the loop refetched every 60s even right after a reader's
-# own background refresh had just landed - a full ~4,600-row DynamoDB pass per minute
-# for a snapshot that was already good (caught in review, Elrond 2026-09-04).
-RUNSON_WARM_MIN_AGE = RUNSON_CACHE_TTL - RUNSON_WARM_INTERVAL
+# Watched dashboards now need one real observation every minute for the runner
+# sparkline, even when the 120-second API snapshot is still fresh.
 runson_last_read_at = 0.0
 RUNSON_AWS_PROFILE = "armbrain-readonly"  # fleet-runson-observer IAM user in the rebuilt account (council 2026-09-02); files under ~/.config/fleet/aws
 RUNSON_AWS_ACCOUNT_ID = "930358782508"  # rebuilt account resolved by that profile

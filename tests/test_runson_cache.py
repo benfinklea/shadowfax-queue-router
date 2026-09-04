@@ -234,20 +234,8 @@ class ReviewFindingsTest(unittest.TestCase):
             qr.runson_cache["data"] = {"available": True, "marker": "cached"}
             qr.runson_cache["ts"] = time.time() - age_seconds
 
-    def test_warm_min_age_leaves_room_before_the_snapshot_goes_stale(self):
-        """The threshold has to be TTL minus one warm interval, or the cache expires
-        between passes and readers start seeing stale=True on a watched dashboard."""
-        self.assertEqual(qr.RUNSON_WARM_MIN_AGE, qr.RUNSON_CACHE_TTL - qr.RUNSON_WARM_INTERVAL)
-        self.assertGreater(qr.RUNSON_WARM_MIN_AGE, 0)
-
-    def test_a_fresh_snapshot_is_not_refetched_by_the_warm_loop(self):
-        """~4,600 billed DynamoDB rows a minute for a snapshot that was already good."""
-        self.seed(age_seconds=5)
-        self.assertLess(qr._runson_snapshot_age(), qr.RUNSON_WARM_MIN_AGE)
-
-    def test_an_aging_snapshot_is_refetched_by_the_warm_loop(self):
-        self.seed(age_seconds=qr.RUNSON_WARM_MIN_AGE + 5)
-        self.assertGreaterEqual(qr._runson_snapshot_age(), qr.RUNSON_WARM_MIN_AGE)
+    def test_runner_history_sampling_uses_a_sixty_second_timer(self):
+        self.assertEqual(qr.RUNSON_WARM_INTERVAL, 60)
 
     def test_snapshot_age_of_an_empty_cache_is_infinite(self):
         with qr.runson_cache_lock:
