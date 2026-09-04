@@ -2306,6 +2306,13 @@ def _runson_fetch():
         if jobs_done_error:
             logger.warning("RunsOn jobs_done unavailable: %s", jobs_done_error)
         # Free Tier credits are optional: a denied/unavailable credits read must not blank the panel (council 2026-09-02).
+        # But "must not blank the panel" is not "must be invisible". Swallowing the read
+        # into None left credits_remaining=null, which is indistinguishable from "no
+        # credits data yet" - so a live IAM denial (fleet-runson-observer lacks
+        # freetier:GetAccountPlanState, still denying on every pass 2026-09-04) showed up
+        # nowhere except the service log, and council nearly retired the card to fix it
+        # on the grounds that "the payload shows no denied field". It could not. The
+        # error now rides in the payload the way jobs_done_error already does.
         if credits_error:
             logger.warning("RunsOn credits read unavailable (%s); continuing without credits", credits_error)
             credits_data = None
@@ -2365,6 +2372,9 @@ def _runson_fetch():
                 "trial_charge_date": charge_date.isoformat(),
                 "subscription_usd_per_year": 350,
                 "credits_remaining": credit_amount,
+                # Paired with the value, so a null credits_remaining can be told apart
+                # from a denied read - the same contract jobs_done/jobs_done_error uses.
+                "credits_error": credits_error or None,
                 "credits_unit": credits.get("unit") or "USD",
                 "cost_source": "cost_explorer" if ce_costs else "credits",
                 "cost_source_label": "AWS Cost Explorer" if ce_costs else "net of credits",

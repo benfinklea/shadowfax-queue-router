@@ -284,3 +284,35 @@ class TruthSuiteTimeoutTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CreditsErrorVisibilityTest(unittest.TestCase):
+    """A denied credits read must be visible in the payload, not only in the log.
+
+    The handler swallows a denied Free Tier read so the panel never blanks
+    (council 2026-09-02). That is right. But it left `credits_remaining: null`,
+    which reads identically to "no credits data yet" - so a live IAM gap
+    (fleet-runson-observer lacks freetier:GetAccountPlanState) was invisible to
+    every instrument, and on 2026-09-04 council came within one message of
+    retiring the card for it on the grounds that the payload showed no denial.
+    It could not. These pin the contract that fixes that.
+    """
+
+    def test_the_payload_carries_credits_error_next_to_the_value(self):
+        import pathlib
+        source = (pathlib.Path(__file__).resolve().parent.parent / "queue_router.py").read_text()
+        self.assertIn('"credits_error": credits_error or None,', source)
+        # It has to sit with credits_remaining, or a reader can get the value
+        # without the reason it is null.
+        value_at = source.index('"credits_remaining": credit_amount,')
+        error_at = source.index('"credits_error": credits_error or None,')
+        self.assertLess(abs(error_at - value_at), 400,
+                        "credits_error drifted away from credits_remaining")
+
+    def test_the_truth_suite_fails_on_a_denied_credits_read(self):
+        import pathlib
+        suite = (pathlib.Path(__file__).resolve().parent / "dashboard-truth" / "truth_suite.py").read_text()
+        self.assertIn('"runson.credits_read"', suite)
+        self.assertIn('credits_error = r.get("credits_error")', suite)
+        self.assertIn('"credits_error"', suite.split("credits_runway")[1][:200],
+                      "credits_error is not in the render_state required-key list")

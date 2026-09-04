@@ -670,7 +670,7 @@ console.log(JSON.stringify({
         ok = all(k in r for k in (
             "live_runners", "runners", "jobs_today", "trial_days_remaining", "credits_remaining",
             "cost_source", "cost_source_label", "spent_today", "spent_month", "daily_spend",
-            "credits_runway", "budget_limits", "jobs_done_error",
+            "credits_runway", "budget_limits", "jobs_done_error", "credits_error",
         )) and len(r.get("daily_spend") or []) == 30
         instrument = "AWS data schema"
     else:
@@ -678,6 +678,19 @@ console.log(JSON.stringify({
         ok = r.get("error") == "credentials" and "creds expired" in text and "aws login" in text
         instrument = "expired credentials must be explicit and actionable"
     emit("PASS" if ok else "FAIL", "runson.render_state", r, instrument)
+
+    # A denied credits read used to be visible only in the service log: the handler
+    # swallows it to None so the panel never blanks, which left credits_remaining=null -
+    # indistinguishable from "no credits data yet". That silence nearly got a live IAM
+    # gap retired as stale on 2026-09-04 (fleet-runson-observer lacks
+    # freetier:GetAccountPlanState). The read now reports itself.
+    credits_error = r.get("credits_error")
+    emit("PASS" if not credits_error else "FAIL", "runson.credits_read",
+         {"credits_error": credits_error, "credits_remaining": r.get("credits_remaining")},
+         {"credits_error": None},
+         "credits read clean" if not credits_error
+         else f"credits read failing ({credits_error}); credits_remaining is null because of this, not because there is no data")
+
     source = (ROOT / "queue_router.py").read_text()
     fallback_contract = (
         '"cost_source": "cost_explorer" if ce_costs else "credits"' in source
