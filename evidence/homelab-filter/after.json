@@ -1,0 +1,12 @@
+{
+  "available": true,
+  "error": null,
+  "jobs_today": null,
+  "jobs_today_reason": "Repository runner inventory does not report jobs today",
+  "runners": [],
+  "excluded_cloud": 147,
+  "hosts": [],
+  "online": 0,
+  "busy": 0,
+  "idle": 0
+}
