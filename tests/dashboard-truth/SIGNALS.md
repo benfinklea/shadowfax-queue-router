@@ -11,7 +11,7 @@ The suite treats the dashboard as a claim and reads the underlying system again 
 | `GET /api/fleet` (six named nodes) | SSH CPU/RAM/temp probe | HTTP/schema; ping, TCP/22, SSH hostname; dashboard `up` follows the primary SSH path |
 | `GET /api/pipeline` | cached GitHub reads | HTTP/schema; direct `gh api` GraphQL and Actions REST; `generated_at` younger than 10 minutes |
 | `GET /api/ci_queue` | Actions workflow runs for `armbrain-io/armbrain`, last 48h; runner/job detail is ancillary | direct Actions REST with the identical repo/window/status scope, ±1 churn |
-| `GET /api/runson` | read-only AWS CLI, profile `armbrain` | schema; live data fields, or explicit actionable `credentials` / `aws login` state |
+| `GET /api/runson` | read-only AWS CLI, profile `armbrain`; GitHub Actions variable with completed-test-job fallback | schema; live data fields, or explicit actionable `credentials` / `aws login` state; `gate_shards` agrees with direct `gh variable list -R armbrain-io/armbrain` |
 | `GET /api/model_serving` | 60-second llama.cpp counter samples plus gateway spend log | direct serving `/metrics`; route presence for gateway-derived boxes; sanity/range checks |
 | `GET /api/fleet_stats` | direct process counts and GitHub org runners | total equals per-box sum; runner fleet aggregate equals per-box aggregate |
 | `GET /api/model_routes` | gateway `/v1/models`, config topology, resident-model endpoints | authenticated direct gateway `/v1/models` exact per-route live state |
@@ -32,6 +32,7 @@ The suite treats the dashboard as a claim and reads the underlying system again 
 | Shipping: issues open, PRs open | GitHub repository search | one direct GraphQL query, ±1 churn |
 | Shipping: CI queued/running | Actions run count (queued) and active job count (running, from first 12 runs) | direct REST counts, ±1 churn |
 | Shipping: merged today, merged in last 60m | PR merge timestamps; day boundary is Central Time | direct GraphQL counts, ±1 churn |
+| Shipping: merged-rate box colour | `/api/pipeline.merged_last_hour` integer count | pure renderer fixtures assert 0=pulsing red, 1=red, 2=yellow, and 3/7=green; live box binding uses `merged_last_hour` |
 | Shipping: last merge time | newest `merged_at` among recently closed PRs | direct pulls REST exact timestamp |
 | Shipping: merged seven-day spark | seven Central-Time daily merge buckets | seven-integer shape plus GitHub source availability |
 | Shipping: deployed today, failures, in flight | production `push`/`workflow_dispatch` runs of `gateway-deploy.yml` | direct Actions workflow runs and nonnegative typed counts |
@@ -53,6 +54,7 @@ The suite treats the dashboard as a claim and reads the underlying system again 
 | Loaded model identity | serving `/props`; Gandalf llama-swap `/running` | exact normalized model filename; no alias/fuzzy identity match |
 | Pippin loaded-model memory | resident `llama-server` RSS from guarded SSH process probe | headless DOM after two 12-second refresh intervals must show `RSS <number> GB` or dimmed `RSS n/a`, never `measuring…` |
 | Tokens/sec now, peak, average | direct llama.cpp `/metrics` counters or gateway spend log | live counters/source continuity and numeric sanity; current display is a 60-second delta |
+| Tokens/sec integer presentation | TPS now, today peak, average, and gauge limit | every rendered TPS readout uses `Math.round`, including peak and gauge limit |
 | Requests served 1h/24h/7d; serving minutes | counter burst estimates or gateway spend log | typed model-serving schema and direct source continuity |
 | Model route chips: live/loaded/idle/missing, box, model | gateway `/v1/models`, live config, serving resident set | exact live route membership from gateway; identity tests cover resident model |
 | Route-health summary and dots | route rows | recompute live/loaded/missing counts from `/api/model_routes` rows |
@@ -60,8 +62,9 @@ The suite treats the dashboard as a claim and reads the underlying system again 
 | History sparks (GPU, CPU, temp, VRAM, RAM, swap, queue) | `metrics_history` by selected range | direct SQLite hour row counts and each plotted column present |
 | Energy by machine and fleet (day/week/month) | trapezoidal integration of GPU watt history and PEC rates | fleet aggregate equals sum of per-machine displayed results |
 | RunsOn live runners/type/age, jobs today, trial days/date, credits | CloudFormation, EC2, DynamoDB, Free Tier APIs | required live schema, or loud exact expired-credentials message (accepted pass state) |
+| RunsOn shard-state notice and card glow | `RUNSON_GATE_SHARDS` Actions variable (`on`/`off`), with explicit workflow-job fallback or unknown error | direct `gh variable list`; headless DOM class and resolved notice match the API state |
 | Static inventory table and API endpoint card | HTML constants | page HTTP 200 and required container IDs |
 | All cards and polling/render functions | inline HTML/JavaScript | required containers/functions present and JavaScript passes `node --check` |
 | Control buttons (wake/reboot/shutdown/power limit/clear swap/reset) | declared Flask routes and JS handlers | static contract only; hourly checker remains read-only |
 
-The inventory contains 19 API route contracts (14 read-only request forms plus 5 mutating contracts) and 56 rendered signal groups, for **75 enumerated signals/groups**. Per-box/per-route expansion produces one result line for each concrete live signal.
+The inventory contains 19 API route contracts (14 read-only request forms plus 5 mutating contracts) and 59 rendered signal groups, for **78 enumerated signals/groups**. Per-box/per-route expansion produces one result line for each concrete live signal.

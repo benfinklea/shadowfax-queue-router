@@ -1912,6 +1912,9 @@ def get_ci_queue_status(force_refresh=False):
 
 runson_cache = {"data": None, "ts": 0.0}
 runson_cache_lock = threading.Lock()
+runson_gate_cache = {"data": None, "ts": 0.0}
+runson_gate_cache_lock = threading.Lock()
+RUNSON_GATE_CACHE_TTL = 60
 # Single-flight gate for the AWS refresh. A cold refresh is ~25-30s of serial work
 # (describe-stacks, then thousands of DynamoDB job rows through CLI subprocesses,
 # then Cost Explorer), so two concurrent readers must never both start one.
@@ -2459,6 +2462,72 @@ def _runson_annotate(data, ts):
     """Return a copy tagged with its age. The cached dict itself is shared - never mutate it."""
     age = max(0.0, time.time() - ts)
     return {**data, "cache_age_seconds": round(age, 1), "stale": age >= RUNSON_CACHE_TTL}
+
+
+def _runson_gate_shards_fetch():
+    """Read the shard gate without ever treating an absent signal as off."""
+    result = {"gate_shards": "unknown", "gate_shards_source": None, "gate_shards_error": None}
+    token = get_gh_ci_token()
+    if not token:
+        result["gate_shards_error"] = "GitHub token unavailable"
+        return result
+    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
+    variable_url = "https://api.github.com/repos/armbrain-io/armbrain/actions/variables/RUNSON_GATE_SHARDS"
+    try:
+        response = requests.get(variable_url, headers=headers, timeout=8)
+        if response.ok:
+            value = str(response.json().get("value", "")).strip().lower()
+            normalized = {"on": "on", "true": "on", "off": "off", "false": "off"}.get(value)
+            if normalized:
+                result.update(gate_shards=normalized, gate_shards_source="actions_variable")
+            else:
+                result["gate_shards_error"] = f"RUNSON_GATE_SHARDS has unexpected value: {value or '<empty>'}"
+            return result
+        if response.status_code not in (403, 404):
+            result["gate_shards_error"] = f"RUNSON_GATE_SHARDS read failed: HTTP {response.status_code}"
+            return result
+
+        # Some service tokens cannot read Actions variables. In that case only,
+        # inspect the newest completed test job and use its explicit runner label.
+        runs_url = "https://api.github.com/repos/armbrain-io/armbrain/actions/workflows/255384592/runs"
+        runs_response = requests.get(
+            runs_url, params={"status": "completed", "per_page": 10}, headers=headers, timeout=8
+        )
+        runs_response.raise_for_status()
+        completed_tests = []
+        for run in runs_response.json().get("workflow_runs", []):
+            jobs_response = requests.get(run["jobs_url"], params={"per_page": 100}, headers=headers, timeout=8)
+            jobs_response.raise_for_status()
+            for job in jobs_response.json().get("jobs", []):
+                name = str(job.get("name", "")).strip().lower()
+                if job.get("status") != "completed" or not (name == "test" or name.startswith("test (")):
+                    continue
+                completed_tests.append(job)
+        if completed_tests:
+            latest = max(completed_tests, key=lambda job: job.get("completed_at") or "")
+            labels = [str(label) for label in (latest.get("labels") or [])]
+            if any("runs-on=" in label for label in labels):
+                result.update(gate_shards="on", gate_shards_source="workflow_test_job")
+            elif any("fellowship-gate" in label for label in labels):
+                result.update(gate_shards="off", gate_shards_source="workflow_test_job")
+            else:
+                result["gate_shards_error"] = "latest completed test job has no shard-state runner label"
+            return result
+        result["gate_shards_error"] = "no completed test job found in workflow 255384592"
+    except Exception as exc:
+        result["gate_shards_error"] = f"shard state read failed: {type(exc).__name__}: {exc}"
+    return result
+
+
+def get_runson_gate_shards():
+    now = time.time()
+    with runson_gate_cache_lock:
+        cached, ts = runson_gate_cache["data"], runson_gate_cache["ts"]
+        if cached is not None and now - ts < RUNSON_GATE_CACHE_TTL:
+            return dict(cached)
+        fetched = _runson_gate_shards_fetch()
+        runson_gate_cache.update(data=fetched, ts=time.time())
+        return dict(fetched)
 
 
 def get_runson_status(force_refresh=False):
@@ -4006,6 +4075,7 @@ def api_runson():
     """RunsOn runner usage, trial fuse, and AWS credits (cached)."""
     force_refresh, disposition = _fresh_bypass("runson")
     result = dict(get_runson_status(force_refresh=force_refresh))
+    result.update(get_runson_gate_shards())
     result["aws_account_id"] = RUNSON_AWS_ACCOUNT_ID
     return _fresh_jsonify(result, disposition, "runson")
 
@@ -4606,6 +4676,12 @@ padding-right:12px;white-space:nowrap}
 .ship-stage{background:rgba(255,255,255,0.025);border:1px solid #1e2942;border-radius:7px;
 padding:7px 14px;min-width:92px;text-align:center;display:flex;flex-direction:column;
 align-items:center;justify-content:center;gap:2px}
+.ship-stage.merge-green{border-color:rgba(57,255,20,.8);background:rgba(57,255,20,.09)}
+.ship-stage.merge-yellow{border-color:rgba(255,255,0,.8);background:rgba(255,255,0,.09)}
+.ship-stage.merge-red{border-color:rgba(255,0,68,.85);background:rgba(255,0,68,.09)}
+.ship-stage.merge-pulse{animation:merge-rate-pulse 4s ease-in-out infinite}
+@keyframes merge-rate-pulse{0%,100%{opacity:1}50%{opacity:.75}}
+@media(prefers-reduced-motion:reduce){.ship-stage.merge-pulse{animation:none}}
 .ship-num{font-family:'Orbitron',monospace;font-size:1.5em;font-weight:700;line-height:1;
 color:var(--neon-cyan);text-shadow:0 0 10px var(--neon-cyan)}
 .ship-num.ok{color:var(--neon-green);text-shadow:0 0 10px var(--neon-green)}
@@ -4662,6 +4738,10 @@ text-transform:uppercase;color:#c7cee0;margin-top:4px}
 /* RunsOn shares the glance band, so retain every datum while tightening its
    typography, gaps, and charts to the same glanceable density. */
 #runson-card{padding:8px 12px 9px;min-width:0}
+#runson-card.glow-on{border-color:var(--neon-green);box-shadow:0 0 18px rgba(57,255,20,.35),inset 0 0 35px rgba(57,255,20,.05)}
+#runson-card.glow-off{border-color:var(--neon-red);box-shadow:0 0 18px rgba(255,0,68,.35),inset 0 0 35px rgba(255,0,68,.05)}
+#runson-card.glow-unknown{border-color:#596274;box-shadow:none}
+#runson-shard-state{display:block;margin-top:2px;color:#c7cee0;font:500 .78em 'Rajdhani',sans-serif;letter-spacing:.4px;text-transform:none}
 #runson-card h3{font-size:.78em;margin:0 0 5px;letter-spacing:1.2px}
 /* Two bands only (Ben, 2026-09-02: "7 pieces of data and 2 charts" must not stack four rows deep):
    band 1 = live runners, jobs, trial clock, credits on one line;
@@ -4798,7 +4878,7 @@ letter-spacing:0;white-space:pre;width:22ch;text-align:right}
 
 <div class=card id=runson-card>
 <button type="button" class="panel-refresh-btn" data-panel="RunsOn CI" title="Refresh this panel" aria-label="Refresh RunsOn CI panel" onclick="refreshPanel(this, 'refreshRunsOn')">&#x21bb;</button>
-<h3>☁️ RunsOn CI <span class="runson-account" id="runson-account">AWS account 930358782508</span></h3>
+<h3>☁️ RunsOn CI <span class="runson-account" id="runson-account">AWS account 930358782508</span><span id="runson-shard-state">Shard state unknown: loading</span></h3>
 <div id=runson-body><p>Loading...</p></div>
 </div>
 </div>
@@ -5009,11 +5089,20 @@ function sparkHtml(vals) {
         '<i style="height:' + Math.max(1, Math.round((v / peak) * 11)) + 'px"></i>').join('') + '</div>';
 }
 
-function shipStage(num, cap, cls, sub, spark, help) {
-    return '<div class="ship-stage"' + (help ? ' title="' + help.replace(/"/g, '') + '"' : '') + '><div class="ship-num ' + (cls || '') + '">' + num + '</div>'
+function shipStage(num, cap, cls, sub, spark, help, stageCls) {
+    return '<div class="ship-stage ' + (stageCls || '') + '"' + (help ? ' title="' + help.replace(/"/g, '') + '"' : '') + '><div class="ship-num ' + (cls || '') + '">' + num + '</div>'
          + '<div class="ship-cap">' + cap + '</div>'
          + (sub ? '<div class="ship-sub">' + sub + '</div>' : '')
          + (spark ? sparkHtml(spark) : '') + '</div>';
+}
+
+function mergedRateClass(count) {
+    // Ben's 3 / 1.5 / 0 thresholds become 3+ / 2 / 1 / 0 for integer merge counts.
+    const n = Number(count);
+    if (n >= 3) return 'merge-green';
+    if (n >= 2) return 'merge-yellow';
+    if (n >= 1) return 'merge-red';
+    return 'merge-red merge-pulse';
 }
 
 // The development pipeline as a left-to-right flow: what is queued, what is in
@@ -5038,10 +5127,10 @@ function refreshShipFlow() {
         if (d.deploys_in_flight) deploySub = d.deploys_in_flight + ' in flight' + (d.deploy_started_min !== null && d.deploy_started_min !== undefined ? ' · ' + d.deploy_started_min + 'm' : '');
         else if (d.deploys_failed_today) deploySub = d.deploys_failed_today + ' failed';
         else if (d.deploys_ok_today) deploySub = 'all landed';
-        let mergedSub = '';
+        let mergedSub = d.merged_last_hour !== null && d.merged_last_hour !== undefined ? '60m: ' + d.merged_last_hour : '';
         if (d.last_merge_at) {
             const t = new Date(d.last_merge_at).toLocaleTimeString('en-US', {hour:'numeric', minute:'2-digit', timeZone:'America/Chicago'}).toLowerCase().replace(' ','');
-            mergedSub = 'Last: ' + t + (d.merged_last_hour !== null && d.merged_last_hour !== undefined ? ' · 60m: ' + d.merged_last_hour : '');
+            mergedSub = 'Last: ' + t + (mergedSub ? ' · ' + mergedSub : '');
         }
         let stamp = '--';
         if (d.last_deploy_at) {
@@ -5061,7 +5150,7 @@ function refreshShipFlow() {
             shipStage(d.issues_open, 'issues open', '', '', null, HELP.issues) + ARROW +
             shipStage(d.prs_open, 'prs open', '', '', null, HELP.prs) + ARROW +
             shipStage(ciNum, 'ci q/run', ciCls, '', null, HELP.ciqr) + ARROW +
-            shipStage(d.merged_today, 'merged today', 'ok', mergedSub, d.merged_spark, HELP.merged) + ARROW +
+            shipStage(d.merged_today, 'merged today', 'ok', mergedSub, d.merged_spark, HELP.merged, mergedRateClass(d.merged_last_hour)) + ARROW +
             shipStage(d.deploys_ok_today, 'deployed today', d.deploys_failed_today ? 'hot' : '', deploySub, d.deploys_spark, HELP.deployed) + ARROW +
             '<div class="ship-stage" title="' + HELP.lastdep.replace(/"/g, '') + '"><div class="ship-num stamp">' + stamp + '</div>'
               + '<div class="ship-cap">last deploy (CT)</div>'
@@ -5503,7 +5592,7 @@ function renderGauge(value, min, max, label, unit, showLimit, size, reverseColor
         color = getNormalColor(percent);
     }
 
-    const displayValue = value !== null ? (showLimit ? Math.round(value) + '/' + max + unit : Math.round(value) + unit) : '--';
+    const displayValue = value !== null ? (showLimit ? Math.round(value) + '/' + Math.round(max) + unit : Math.round(value) + unit) : '--';
 
     // Conic gradient: green 0-70%, yellow 70-90%, red 90-100% (or reversed)
     let gradient;
@@ -5689,7 +5778,7 @@ function updateGauge(id, value, min, max, unit, showLimit, colorFn) {
     const percent = ((clampedValue - min) / (max - min)) * 100;
     const angle = -90 + (percent * 1.8);
     const color = colorFn(percent);
-    const displayValue = showLimit ? Math.round(value) + '/' + max + unit : Math.round(value) + unit;
+    const displayValue = showLimit ? Math.round(value) + '/' + Math.round(max) + unit : Math.round(value) + unit;
 
     const key = Math.round(angle * 10) + ':' + color + ':' + displayValue;
     if (gauge.dataset.lastVal === key) return;  // unchanged - skip the write
@@ -6232,7 +6321,16 @@ function refreshRunsOn() {
         const card = document.getElementById('runson-card');
         const body = document.getElementById('runson-body');
         const account = document.getElementById('runson-account');
+        const shardState = document.getElementById('runson-shard-state');
         if (!card || !body) return;
+        card.classList.remove('glow-on', 'glow-off', 'glow-unknown');
+        const gate = d.gate_shards === 'on' || d.gate_shards === 'off' ? d.gate_shards : 'unknown';
+        card.classList.add('glow-' + gate);
+        if (shardState) {
+            shardState.textContent = gate === 'on' ? 'Shards on RunsOn'
+                : (gate === 'off' ? 'Shards on home lab'
+                : 'Shard state unknown: ' + (d.gate_shards_error || 'no clean signal'));
+        }
         if (account && d.aws_account_id) account.textContent = 'AWS account ' + d.aws_account_id;
         if (d.deployed === false) {
             card.style.display = 'none';
