@@ -3739,6 +3739,166 @@ def get_target_status(target_name, target_config, fast=False):
     return result
 
 
+# Agent mapping: issue lanes stay at issues open until an open PR references
+# their issue, then prs open. Shepherds follow queued > running head > ready
+# (the strip's approved/CLEAN/unheld predicate) > prs open. Non-armbrain lanes,
+# closed targets, rangers and unmatched workers belong to fleet, not this strip.
+AGENTS_CACHE_TTL = 60
+agents_cache = {"data": None, "ts": 0.0}
+agents_cache_lock = threading.Lock()
+
+
+def _agent_windows():
+    """Read Ben's default tmux server; count windows, including pane root workers."""
+    cp = subprocess.run(["tmux", "-S", f"/tmp/tmux-{os.getuid()}/default",
+                         "list-windows", "-a", "-F",
+                         "#{session_name}\t#{window_name}\t#{pane_pid}"],
+                        capture_output=True, text=True, timeout=10, check=True)
+    children, processes = {}, {}
+    boot = time.time() - float(Path('/proc/uptime').read_text().split()[0])
+    ticks = os.sysconf('SC_CLK_TCK')
+    for path in Path('/proc').glob('[0-9]*/stat'):
+        try:
+            raw = path.read_text()
+            fields = raw[raw.rfind(')') + 2:].split()
+            pid = int(path.parent.name)
+            comm = raw[raw.find('(') + 1:raw.rfind(')')]
+            # comm may be truncated; executable basename identifies native Codex.
+            try:
+                exe = Path(os.readlink(path.parent / 'exe')).name
+            except OSError:
+                exe = comm
+            processes[pid] = (fields[0] not in ('Z', 'X') and
+                              (comm in ('claude', 'codex', 'node') or
+                               exe in ('claude', 'codex', 'node')),
+                              boot + int(fields[19]) / ticks)
+            children.setdefault(int(fields[1]), []).append(pid)
+        except (OSError, ValueError, IndexError):
+            continue  # A process exiting during the census is ordinary.
+    rows = []
+    for line in cp.stdout.splitlines():
+        session, window, root = line.split('\t')
+        issue = re.fullmatch(r'issue-(\d+)(-fp)?', window) if session == 'codex' else None
+        shepherd = re.fullmatch(r'WORK-shepherd-(\d+)', window)
+        if window.endswith('-MAIN'):
+            continue
+        if issue:
+            kind = 'codex-lane'
+            target = {'repo': 'armbrain-io/fleet-planning' if issue[2] else GITHUB_CI_REPO,
+                      'issue': int(issue[1]), 'number': int(issue[1])}
+        elif shepherd:
+            kind = 'shepherd'
+            target = {'repo': GITHUB_CI_REPO, 'pr': int(shepherd[1]), 'number': int(shepherd[1])}
+        elif window.startswith('WORK-'):
+            kind, target = 'worker', None
+            pr_slug = re.search(r'(?:^|-)pr-(\d+)(?:-|$)', window)
+            if pr_slug:
+                target = {'repo': GITHUB_CI_REPO, 'pr': int(pr_slug[1]), 'number': int(pr_slug[1])}
+        elif session == 'rangers' and window.startswith('LANE-'):
+            kind, target = 'ranger', None
+        else:
+            continue
+        pending, seen, starts = [int(root)], set(), []
+        while pending:
+            pid = pending.pop()
+            if pid in seen:
+                continue
+            seen.add(pid)
+            worker, started = processes.get(pid, (False, None))
+            if worker:
+                starts.append(started)
+            pending.extend(children.get(pid, []))
+        rows.append({'window': window, 'session': session, 'kind': kind,
+                     'target': target, 'live': bool(starts), 'square': 'fleet',
+                     'started_at': datetime.fromtimestamp(min(starts), timezone.utc).isoformat() if starts else None})
+    return rows
+
+
+def _agents_gh(args):
+    # gh uses the service user's existing auth; no writes or label-based counts.
+    cp = subprocess.run(['gh', *args], capture_output=True, text=True,
+                        timeout=30, check=True)
+    data = json.loads(cp.stdout)
+    if isinstance(data, dict) and data.get('errors'):
+        raise ValueError('Could not establish GitHub agent targets')
+    return data
+
+
+def _agent_prs(repo):
+    # Paginate rather than silently dropping an issue's PR beyond the first 100.
+    pages = _agents_gh(['api', '--paginate', '--slurp',
+                       f'repos/{repo}/pulls?state=open&per_page=100'])
+    return [pr for page in pages for pr in page]
+
+
+def _map_agents(rows):
+    prs_by_repo, pr_states = {}, {}
+    for row in rows:
+        target = row['target']
+        if not row['live'] or not target:
+            continue
+        repo, number = target['repo'], target['number']
+        try:
+            if 'issue' in target:
+                issue = _agents_gh(['api', f'repos/{repo}/issues/{number}'])
+                row['title'] = issue['title']
+                if repo not in prs_by_repo:
+                    prs_by_repo[repo] = _agent_prs(repo)
+                reference = re.compile(rf'(?<![\w/])(?:#{number}|issue-{number})(?![\w-])')
+                matches = [pr for pr in prs_by_repo[repo]
+                           if reference.search(pr['title'] + '\n' + (pr['body'] or ''))]
+                row['linked_prs'] = [pr['number'] for pr in matches]
+                if repo == GITHUB_CI_REPO and (issue['state'] == 'open' or matches):
+                    row['square'] = 'prs open' if matches else 'issues open'
+            else:
+                key = (repo, number)
+                if key not in pr_states:
+                    pr = _agents_gh(['pr', 'view', str(number), '--repo', repo, '--json',
+                                    'title,state,headRefOid,isDraft,reviewDecision,mergeable,mergeStateStatus,labels'])
+                    owner, name = repo.split('/')
+                    query = 'query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){mergeQueueEntry{id}}}}'
+                    queue = _agents_gh(['api', 'graphql', '-f', 'query=' + query,
+                                        '-f', 'owner=' + owner, '-f', 'name=' + name,
+                                        '-F', 'number=' + str(number)])
+                    pr['mergeQueueEntry'] = queue['data']['repository']['pullRequest']['mergeQueueEntry']
+                    square = 'fleet'
+                    if pr['state'] == 'OPEN':
+                        runs = _agents_gh(['api', f'repos/{repo}/actions/runs?head_sha={pr["headRefOid"]}&status=in_progress&per_page=1'])
+                        held = {'do-not-merge', 'needs-repair', 'hold', 'blocked-on-ben'}
+                        ready = (not pr['isDraft'] and pr['reviewDecision'] == 'APPROVED'
+                                 and pr['mergeable'] == 'MERGEABLE' and pr['mergeStateStatus'] == 'CLEAN'
+                                 and not held.intersection(label['name'].lower() for label in pr['labels']))
+                        square = ('in line' if pr['mergeQueueEntry'] else 'ci q/run' if runs['total_count']
+                                  else 'green waiting' if ready else 'prs open')
+                    pr_states[key] = (pr['title'], square)
+                row['title'], row['square'] = pr_states[key]
+        except Exception as exc:
+            # A failed read must not masquerade as zero agents or a known square.
+            row['square'] = None
+            row['mapping_error'] = 'Could not establish target state from GitHub'
+            logger.warning('Agent target read failed for %s #%s: %s', repo, number, type(exc).__name__)
+    return rows
+
+
+def get_agents(force_refresh=False):
+    with agents_cache_lock:
+        if not force_refresh and agents_cache['data'] is not None and time.monotonic() - agents_cache['ts'] < AGENTS_CACHE_TTL:
+            return agents_cache['data']
+        rows = _map_agents(_agent_windows())
+        agents_cache.update(data=rows, ts=time.monotonic())
+        return rows
+
+
+@app.route('/api/agents', methods=['GET'])
+def api_agents():
+    fresh, disposition = _fresh_bypass('agents')
+    try:
+        return _fresh_jsonify(get_agents(fresh), disposition, 'agents')
+    except Exception:
+        logger.exception('Could not establish live tmux agents')
+        return _fresh_jsonify({'error': 'Could not establish live tmux agents'}, disposition, 'agents'), 503
+
+
 # ── Shipping pipeline snapshot (ported forward from bak-20260725; Gemini fleet monitor consumes /api/pipeline) ──
 PIPELINE_CACHE_TTL = 45  # seconds - must match CI_QUEUE_CACHE_TTL so ci_running measurement scope is consistent
 pipeline_cache = {"data": None, "ts": 0.0}
@@ -4784,6 +4944,15 @@ align-items:center;justify-content:center;gap:2px}
 .ship-toggle{position:absolute;right:2px;top:1px;border:0;background:none;color:#c7cee0;cursor:pointer;padding:3px}
 .ship-dropdown{position:absolute;top:100%;right:0;z-index:20;background:#111827;border:1px solid #364563;border-radius:5px;padding:7px;min-width:240px;max-height:280px;overflow:auto;text-align:left;box-shadow:0 5px 15px #0008}
 .ship-dropdown[hidden]{display:none}
+.ship-stage{position:relative}
+.ship-stage.has-agents{padding-top:25px}
+.ship-stage.has-agents .ship-toggle{top:22px}
+.ship-agent-chip{position:absolute;top:3px;right:4px;border:1px solid #457687;border-radius:8px;background:#18303d;color:#c9f5ff;font-size:11px;line-height:16px;padding:0 5px;cursor:pointer}
+.ship-agent-chip:focus-visible{outline:2px solid var(--neon-cyan)}
+.ship-agents{padding-bottom:6px;margin-bottom:5px;border-bottom:1px solid #364563}
+.ship-agent-row{font-size:12px;white-space:nowrap;padding:3px 0}
+.ship-agent-row a{color:var(--neon-cyan)}
+.ship-fleet{font-size:12px;color:#c7cee0;margin:-3px 0 9px}
 .ship-pr{display:flex;gap:8px;white-space:nowrap;font-size:12px;padding:4px 0;color:#c7cee0}
 .ship-pr a{color:var(--neon-cyan)}
 .ship-pr .ship-sub{font-size:inherit}
@@ -4987,6 +5156,7 @@ letter-spacing:0;white-space:pre;width:22ch;text-align:right}
 <div class="panel-refresh-surface">
 <button type="button" class="panel-refresh-btn" data-panel="Shipping pipeline" title="Refresh this panel" aria-label="Refresh Shipping pipeline panel" onclick="refreshPanel(this, 'refreshShipFlow')">&#x21bb;</button>
 <div id="ship-flow" class="ship-flow panel-refresh-body"><span class="gdim">shipping pipeline…</span></div>
+<div id="ship-fleet" class="ship-fleet" aria-live="polite">🤖 working: checking agents…</div>
 </div>
 <div class="gstrip">
 <div class="panel-refresh-surface glance-panel"><button type="button" class="panel-refresh-btn" data-panel="CI queue" title="Refresh this panel" aria-label="Refresh CI queue panel" onclick="refreshPanel(this, 'refreshCiQueue')">&#x21bb;</button><div class="gcell panel-refresh-body" id="ci-queue-body"><span class="gdim">CI queue…</span></div></div>
@@ -5209,6 +5379,7 @@ function sparkHtml(vals) {
 }
 
 let openShipDropdown = null;
+let shipAgents = null;
 function shipEscape(value) {
     return String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
@@ -5222,25 +5393,55 @@ function shipShortTitle(title) {
 }
 function toggleShipDropdown(key) {
     openShipDropdown = openShipDropdown === key ? null : key;
-    document.querySelectorAll('.ship-toggle').forEach(button => {
+    document.querySelectorAll('.ship-toggle, .ship-agent-chip').forEach(button => {
         const open = button.dataset.dropdown === openShipDropdown;
         button.setAttribute('aria-expanded', String(open));
-        button.textContent = open ? '▴' : '▾';
+        if (button.classList.contains('ship-toggle')) button.textContent = open ? '▴' : '▾';
         document.getElementById(button.getAttribute('aria-controls')).hidden = !open;
     });
 }
-function shipDropdown(key, prs) {
+function shipAgentRows(agents) {
+    if (!agents.length) return '';
+    return '<div class="ship-agents"><strong>agents</strong>' + agents.map(agent => {
+        const target = agent.target;
+        const link = target ? '<a href="https://github.com/' + shipEscape(target.repo) + '/' + (target.pr ? 'pull' : 'issues') + '/' + Number(target.number) + '" target="_blank" rel="noopener noreferrer">#' + Number(target.number) + '</a>' : '';
+        return '<div class="ship-agent-row">' + shipEscape(agent.session + ' ' + agent.window) + ' → ' + link
+            + ' <span>' + shipEscape(Array.from(agent.title || '').slice(0, 15).join('')) + '</span></div>';
+    }).join('') + '</div>';
+}
+function shipFleetRow() {
+    const el = document.getElementById('ship-fleet');
+    if (!el) return;
+    if (!shipAgents) { el.textContent = '🤖 working: could not establish live agents'; return; }
+    const live = shipAgents.filter(a => a.live);
+    const standing = live.filter(a => a.kind === 'ranger');
+    const onStrip = live.filter(a => a.square && a.square !== 'fleet');
+    const other = live.filter(a => a.square === 'fleet' && a.kind !== 'ranger');
+    const unknown = live.filter(a => !a.square);
+    el.textContent = '🤖 working: ' + onStrip.length + ' on the strip, ' + standing.length + ' standing lanes'
+        + (other.length ? ', ' + other.length + ' other fleet workers' : '')
+        + (unknown.length ? ', ' + unknown.length + ' target state unknown' : '');
+    el.title = standing.map(a => a.window.replace(/^LANE-/, '').toLowerCase()).join(', ')
+        + (other.length ? '; other fleet: ' + other.map(a => a.session + ':' + a.window).join(', ') : '');
+}
+function shipDropdown(key, prs, agents) {
     const open = openShipDropdown === key;
     return '<button type="button" class="ship-toggle" data-dropdown="' + key + '" aria-label="Toggle ' + key.replaceAll('-', ' ') + ' PRs" aria-controls="ship-list-' + key + '" aria-expanded="' + open + '" onclick="toggleShipDropdown(this.dataset.dropdown)">' + (open ? '▴' : '▾') + '</button>'
         + '<div class="ship-dropdown" id="ship-list-' + key + '"' + (open ? '' : ' hidden') + '>'
+        + shipAgentRows(agents)
         + prs.map(pr => '<div class="ship-pr" data-pr-number="' + pr.number + '"><a href="https://github.com/armbrain-io/armbrain/pull/' + pr.number + '" target="_blank" rel="noopener">#' + pr.number + '</a><span>' + shipEscape(shipShortTitle(pr.title)) + '</span>'
             + (key === 'in-line' ? '<span class="ship-sub ' + (pr.state === 'UNMERGEABLE' ? 'hot' : '') + '">' + (pr.state === 'UNMERGEABLE' ? 'stuck' : 'testing') + '</span>' : '') + '</div>').join('') + '</div>';
 }
 function shipStage(num, cap, cls, sub, spark, help, stageCls, dropdownKey, prs) {
-    return '<div class="ship-stage ' + (stageCls || '') + '"' + (help ? ' title="' + help.replace(/"/g, '') + '"' : '') + '><div class="ship-num ' + (cls || '') + '">' + num + '</div>'
+    const agents = (shipAgents || []).filter(a => a.live && a.square === cap);
+    const key = dropdownKey || cap.replaceAll(' ', '-').replaceAll('/', '-');
+    const chip = agents.length ? '<button type="button" class="ship-agent-chip" data-dropdown="' + key
+        + '" aria-label="' + agents.length + ' agents on ' + cap + '" aria-controls="ship-list-' + key
+        + '" aria-expanded="' + (openShipDropdown === key) + '" onclick="toggleShipDropdown(this.dataset.dropdown)">🤖 ' + agents.length + '</button>' : '';
+    return '<div class="ship-stage ' + (stageCls || '') + (agents.length ? ' has-agents' : '') + '" data-square="' + cap + '"' + (help ? ' title="' + help.replace(/"/g, '') + '"' : '') + '>' + chip + '<div class="ship-num ' + (cls || '') + '">' + num + '</div>'
          + '<div class="ship-cap">' + cap + '</div>'
          + (sub ? '<div class="ship-sub">' + sub + '</div>' : '')
-         + (spark ? sparkHtml(spark) : '') + (dropdownKey ? shipDropdown(dropdownKey, prs) : '') + '</div>';
+         + (spark ? sparkHtml(spark) : '') + (dropdownKey || agents.length ? shipDropdown(key, prs || [], agents) : '') + '</div>';
 }
 
 function mergedRateClass(count) {
@@ -5255,7 +5456,12 @@ function mergedRateClass(count) {
 // The development pipeline as a left-to-right flow: what is queued, what is in
 // flight, what actually shipped. Ben asked for this shape specifically.
 function refreshShipFlow() {
-    fetch('/api/pipeline').then(r => r.json()).then(d => {
+    return Promise.all([
+        fetch('/api/pipeline').then(r => r.json()),
+        fetch('/api/agents').then(r => { if (!r.ok) throw new Error('agents unavailable'); return r.json(); }).catch(() => null)
+    ]).then(([d, agents]) => {
+        shipAgents = Array.isArray(agents) ? agents : null;
+        shipFleetRow();
         const el = document.getElementById('ship-flow');
         if (!el) return;
         if (!d.available) {

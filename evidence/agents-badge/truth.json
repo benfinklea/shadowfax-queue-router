@@ -1,0 +1,72 @@
+{
+  "checked_at": "2026-09-04T21:25:19.103723+00:00",
+  "source": "Scratch Flask API on gandalf; live tmux and fresh read-only GitHub queries",
+  "live_count": 6,
+  "fresh_tmux_live_count": 6,
+  "live_windows": [
+    [
+      "council",
+      "WORK-agents-badge"
+    ],
+    [
+      "council",
+      "WORK-shepherd-6610"
+    ],
+    [
+      "council",
+      "WORK-strip-order"
+    ],
+    [
+      "rangers",
+      "LANE-GARDENER"
+    ],
+    [
+      "rangers",
+      "LANE-SCOUT"
+    ],
+    [
+      "rangers",
+      "LANE-TICKET-MINER"
+    ]
+  ],
+  "per_square": {
+    "in line": 1
+  },
+  "target_checks": [
+    {
+      "target": {
+        "repo": "armbrain-io/armbrain",
+        "pr": 6610,
+        "number": 6610
+      },
+      "expected": "in line",
+      "github": {
+        "state": "OPEN",
+        "headRefOid": "a3872ab52662e02318f73954e8b6930c87c60573",
+        "isDraft": false,
+        "reviewDecision": "APPROVED",
+        "mergeable": "UNKNOWN",
+        "mergeStateStatus": "UNKNOWN",
+        "labels": {
+          "nodes": [
+            {
+              "name": "\ud83e\udd16 ai-active"
+            },
+            {
+              "name": "automerge"
+            },
+            {
+              "name": "gate-review"
+            }
+          ]
+        },
+        "mergeQueueEntry": {
+          "id": "MQE_lQDORj4a9s8AAAABB2ZL184AA6lLzgK-MXE"
+        }
+      },
+      "running": 0
+    }
+  ],
+  "dom": "PASS: exact counts, chip toggles, agent section first, safe new-window links, six-square fixtures, zero and unavailable",
+  "runtime_errors": []
+}
