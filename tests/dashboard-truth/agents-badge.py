@@ -98,7 +98,7 @@ styles = '\n'.join(re.findall(r'<style>(.*?)</style>', html, re.S))
 counts = Counter(a['square'] for a in agents if a['live'] and a['square'] != 'fleet')
 with sync_playwright() as p:
     browser = p.chromium.launch(headless=True)
-    page = browser.new_page(viewport={'width':1600, 'height':420})
+    page = browser.new_page(viewport={'width':1440, 'height':420})
     errors = []
     page.on('pageerror', lambda error: errors.append(str(error)))
     page.set_content('<style>' + styles + '</style><div id="capture"><div id="ship-flow" class="ship-flow"></div><div id="ship-fleet" class="ship-fleet"></div></div>')
@@ -108,8 +108,9 @@ with sync_playwright() as p:
     page.evaluate('refreshShipFlow()')
     for stage in page.locator('[data-square]').all():
         square = stage.get_attribute('data-square')
-        chip = stage.locator('.ship-agent-chip')
-        assert chip.count() == int(counts[square] > 0)
+        chip = page.locator('.ship-arrow[data-square-left="' + square + '"]')
+        assert chip.count() == 1
+        assert chip.inner_text() == ('🤖 ' + str(counts[square]) if counts[square] else '🤖')
         if counts[square]:
             assert chip.inner_text() == f'🤖 {counts[square]}'
             chip.click()
@@ -121,19 +122,17 @@ with sync_playwright() as p:
                 assert link.get_attribute('href').startswith('https://github.com/armbrain-io/')
             chip.click()
     logo = 'data:image/svg+xml;base64,' + base64.b64encode((ROOT / 'armbrain-logo.svg').read_bytes()).decode()
-    page.locator('.ship-logo').evaluate('(el,src)=>{el.src=src}', logo)
-    page.wait_for_function('document.querySelector(".ship-logo").complete')
     page.locator('#capture').screenshot(path=str(OUT / 'shipping.png'))
-    if page.locator('.ship-agent-chip').count():
-        page.locator('.ship-agent-chip').first.click()
+    if page.locator('.ship-arrow').count():
+        page.locator('.ship-arrow').first.click()
         page.screenshot(path=str(OUT / 'agents-dropdown.png'))
     # Controlled cases supplement (and never replace) the live evidence above.
     fixtures = [dict(window='issue-12', session='codex', kind='codex-lane', live=True, square=square,
                      target=dict(repo=q.GITHUB_CI_REPO, issue=12, number=12), title='<script>very long malicious title')
                 for square in ['issues open','prs open','ci q/run','green waiting','in line','merged today']]
     page.evaluate('(rows)=>{window.agents=rows;return refreshShipFlow()}', fixtures)
-    assert page.locator('.ship-agent-chip').count() == 6
-    for chip in page.locator('.ship-agent-chip').all():
+    assert page.locator('.ship-arrow').count() == 6
+    for chip in page.locator('.ship-arrow').all():
         # Close any preserved open dropdown before exercising the chip.
         page.evaluate('openShipDropdown=null')
         chip.click()
@@ -144,7 +143,7 @@ with sync_playwright() as p:
         assert len(panel.locator('.ship-agent-row span').inner_text()) == 15
         assert panel.evaluate('(el)=>el.firstElementChild.className') == 'ship-agents'
     page.evaluate('window.agents=[];refreshShipFlow()')
-    assert page.locator('.ship-agent-chip').count() == 0
+    assert page.locator('.ship-arrow.empty').count() == 6
     assert page.locator('#ship-fleet').inner_text() == '🤖 working: 0 on the strip, 0 standing lanes'
     page.evaluate('window.agents=null;refreshShipFlow()')
     assert 'could not establish' in page.locator('#ship-fleet').inner_text()

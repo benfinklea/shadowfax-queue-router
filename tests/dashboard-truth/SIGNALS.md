@@ -70,3 +70,11 @@ The suite treats the dashboard as a claim and reads the underlying system again 
 | Control buttons (wake/reboot/shutdown/power limit/clear swap/reset) | declared Flask routes and JS handlers | static contract only; hourly checker remains read-only |
 
 The inventory contains 19 API route contracts (14 read-only request forms plus 5 mutating contracts) and 59 rendered signal groups, for **78 enumerated signals/groups**. Per-box/per-route expansion produces one result line for each concrete live signal.
+
+### CI/CD layout (2026-09-04)
+
+Run `tests/dashboard-truth/cicd-layout.py` with the Playwright Python environment against the scratch import. It re-reads `/api/agents`, compares each right-pointing robot arrow to live agents whose square is immediately left, checks dropdowns, and verifies zero and unavailable states. Fleet agents remain in the population line. Order remains issues open → prs open → ci q/run → green waiting → in line → merged today → last deploy (CT): six workflow squares plus the existing deploy tile.
+
+At 1440 px every stage must share one top coordinate and fit the viewport. CI/CD is an Orbitron header above the full-width strip. AWS and HOME LAB sit below. The queued/runs and LOADED glance blocks are removed; the fleet stats block remains. AWS retains account, shard notice/glow, runner and job facts; its credits/today/month facts share one horizontal row with fuse/guard captions and an explicit credits-unavailable reason. Spend and credits charts are absent.
+
+`/api/local_runners` uses the CI service installation token to paginate the repository runners endpoint, caches successes and errors for 60 seconds, and supports the existing throttled manual refresh. Online/busy/idle are counts of online runners; the expander includes every registered runner, labels, status and busy flag. The inventory endpoint does not supply jobs today, so that field is explicitly unavailable rather than substituting repository-wide workflow runs. HTTP 403/404 produces “no permission to read runners” with no fabricated counts. Controlled available/permission captures supplement the live capture and are named as fixtures. The suite checks pagination, caching and both permission status codes.

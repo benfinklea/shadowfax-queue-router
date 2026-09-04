@@ -1,0 +1,194 @@
+[
+  {
+    "window": "issue-7032",
+    "session": "codex",
+    "kind": "codex-lane",
+    "target": {
+      "repo": "armbrain-io/armbrain",
+      "issue": 7032,
+      "number": 7032
+    },
+    "live": false,
+    "square": "fleet",
+    "started_at": null
+  },
+  {
+    "window": "issue-7061",
+    "session": "codex",
+    "kind": "codex-lane",
+    "target": {
+      "repo": "armbrain-io/armbrain",
+      "issue": 7061,
+      "number": 7061
+    },
+    "live": false,
+    "square": "fleet",
+    "started_at": null
+  },
+  {
+    "window": "issue-272-fp",
+    "session": "codex",
+    "kind": "codex-lane",
+    "target": {
+      "repo": "armbrain-io/fleet-planning",
+      "issue": 272,
+      "number": 272
+    },
+    "live": false,
+    "square": "fleet",
+    "started_at": null
+  },
+  {
+    "window": "issue-7064",
+    "session": "codex",
+    "kind": "codex-lane",
+    "target": {
+      "repo": "armbrain-io/armbrain",
+      "issue": 7064,
+      "number": 7064
+    },
+    "live": true,
+    "square": "issues open",
+    "started_at": "2026-09-04T21:55:08.933391+00:00",
+    "title": "RANGER: measured A/B of voyage-context-4 vs voyage-4-large on transcript retrieval (no switch without a number)",
+    "linked_prs": []
+  },
+  {
+    "window": "issue-7054",
+    "session": "codex",
+    "kind": "codex-lane",
+    "target": {
+      "repo": "armbrain-io/armbrain",
+      "issue": 7054,
+      "number": 7054
+    },
+    "live": false,
+    "square": "fleet",
+    "started_at": null
+  },
+  {
+    "window": "issue-7049",
+    "session": "codex",
+    "kind": "codex-lane",
+    "target": {
+      "repo": "armbrain-io/armbrain",
+      "issue": 7049,
+      "number": 7049
+    },
+    "live": false,
+    "square": "fleet",
+    "started_at": null
+  },
+  {
+    "window": "issue-7033",
+    "session": "codex",
+    "kind": "codex-lane",
+    "target": {
+      "repo": "armbrain-io/armbrain",
+      "issue": 7033,
+      "number": 7033
+    },
+    "live": false,
+    "square": "fleet",
+    "started_at": null
+  },
+  {
+    "window": "issue-6955",
+    "session": "codex",
+    "kind": "codex-lane",
+    "target": {
+      "repo": "armbrain-io/armbrain",
+      "issue": 6955,
+      "number": 6955
+    },
+    "live": false,
+    "square": "fleet",
+    "started_at": null
+  },
+  {
+    "window": "WORK-shepherd-6615",
+    "session": "council",
+    "kind": "shepherd",
+    "target": {
+      "repo": "armbrain-io/armbrain",
+      "pr": 6615,
+      "number": 6615
+    },
+    "live": true,
+    "square": "prs open",
+    "started_at": "2026-09-04T21:40:02.543391+00:00",
+    "title": "fix(briefings): give unanswered-email items a real Gmail thread link"
+  },
+  {
+    "window": "WORK-cicd-layout",
+    "session": "council",
+    "kind": "worker",
+    "target": null,
+    "live": true,
+    "square": "fleet",
+    "started_at": "2026-09-04T22:12:34.363391+00:00"
+  },
+  {
+    "window": "WORK-pippen-revive-2107",
+    "session": "pippen",
+    "kind": "worker",
+    "target": null,
+    "live": false,
+    "square": "fleet",
+    "started_at": null
+  },
+  {
+    "window": "LANE-GARDENER",
+    "session": "rangers",
+    "kind": "ranger",
+    "target": null,
+    "live": true,
+    "square": "fleet",
+    "started_at": "2026-09-04T12:00:07.213391+00:00"
+  },
+  {
+    "window": "LANE-TICKET-MINER",
+    "session": "rangers",
+    "kind": "ranger",
+    "target": null,
+    "live": true,
+    "square": "fleet",
+    "started_at": "2026-09-04T18:07:08.303391+00:00"
+  },
+  {
+    "window": "LANE-SCOUT",
+    "session": "rangers",
+    "kind": "ranger",
+    "target": null,
+    "live": true,
+    "square": "fleet",
+    "started_at": "2026-09-04T11:56:19.353391+00:00"
+  },
+  {
+    "window": "LANE-PROMPT-FORGE",
+    "session": "rangers",
+    "kind": "ranger",
+    "target": null,
+    "live": false,
+    "square": "fleet",
+    "started_at": null
+  },
+  {
+    "window": "LANE-CONNECTOR-RANGER",
+    "session": "rangers",
+    "kind": "ranger",
+    "target": null,
+    "live": false,
+    "square": "fleet",
+    "started_at": null
+  },
+  {
+    "window": "LANE-CZ-RANGER",
+    "session": "rangers",
+    "kind": "ranger",
+    "target": null,
+    "live": false,
+    "square": "fleet",
+    "started_at": null
+  }
+]

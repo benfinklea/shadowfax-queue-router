@@ -1,0 +1,1093 @@
+{
+  "viewport": 1440,
+  "stage_rects": [
+    {
+      "y": 188,
+      "right": 197.5625
+    },
+    {
+      "y": 188,
+      "right": 390.140625
+    },
+    {
+      "y": 188,
+      "right": 582.703125
+    },
+    {
+      "y": 188,
+      "right": 775.28125
+    },
+    {
+      "y": 188,
+      "right": 967.84375
+    },
+    {
+      "y": 188,
+      "right": 1160.421875
+    },
+    {
+      "y": 188,
+      "right": 1353
+    }
+  ],
+  "agents_available": true,
+  "per_square": {
+    "issues open": 1,
+    "prs open": 2,
+    "fleet": 4
+  },
+  "local_runners": {
+    "available": true,
+    "error": null,
+    "jobs_today": null,
+    "jobs_today_reason": "Repository runner inventory does not report jobs today",
+    "runners": [
+      {
+        "name": "runs-on--i-003bce90908eb957e--003c5e48-8",
+        "labels": [
+          "runs-on=33859861446/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-00539667b8ecc5562--22971b43-3",
+        "labels": [
+          "runs-on=33839359597/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-008a3bb2ac5cd56c6--f1a577d8-e",
+        "labels": [
+          "runs-on=33924441387/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": true
+      },
+      {
+        "name": "runs-on--i-00b00858e2098587c--0bb95715-b",
+        "labels": [
+          "runs-on=33839359597/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-00cb8b2eff55a2bd2--4cd2613c-d",
+        "labels": [
+          "runs-on=33839359597/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-00faaff6908b814ff--d1e45d9b-6",
+        "labels": [
+          "runs-on=33924441387/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": true
+      },
+      {
+        "name": "runs-on--i-0108b0601d36ace31--ad834740-3",
+        "labels": [
+          "runs-on=33924441387/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": true
+      },
+      {
+        "name": "runs-on--i-0110069f32c0fc50f--b6538612-5",
+        "labels": [
+          "runs-on=33924441387/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-011a03d17bebbdce8--531adf1d-2",
+        "labels": [
+          "runs-on=33859861446/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-011b9a8c21d31cfee--f43b9bb1-7",
+        "labels": [
+          "runs-on=33924076781/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": true
+      },
+      {
+        "name": "runs-on--i-012f4f8e1f2815e92--d60acb6f-c",
+        "labels": [
+          "runs-on=33923942158/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": true
+      },
+      {
+        "name": "runs-on--i-01442f69fd9991f62--72dbfdc4-5",
+        "labels": [
+          "runs-on=33924441387/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": true
+      },
+      {
+        "name": "runs-on--i-017287af89347b52e--2ce56a6b-c",
+        "labels": [
+          "runs-on=33839359597/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-0174d36ee076148cc--5eaa1f2d-c",
+        "labels": [
+          "runs-on=33859859334/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-01b5946ad934c6f1e--a928c0d9-a",
+        "labels": [
+          "runs-on=33839359597/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-01bfb5fc30e5ec991--8ec1b70d-3",
+        "labels": [
+          "runs-on=33924441387/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": true
+      },
+      {
+        "name": "runs-on--i-01dcad15de4d4d91d--cd7614fc-e",
+        "labels": [
+          "runs-on=33924441387/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": true
+      },
+      {
+        "name": "runs-on--i-01dd2215c525a9a1f--4ebec344-c",
+        "labels": [
+          "runs-on=33859861446/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-01dfac22fdd27f344--2979cd0d-1",
+        "labels": [
+          "runs-on=33839359597/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-01ead24812f52d10b--e99fe705-d",
+        "labels": [
+          "runs-on=33922567344/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": true
+      },
+      {
+        "name": "runs-on--i-02907d547474503d0--d6559fd3-5",
+        "labels": [
+          "runs-on=33839359597/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-02a4886930d6dd9e6--920ac88e-f",
+        "labels": [
+          "runs-on=33859859334/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-02b93e886fa6b503b--a92aa520-9",
+        "labels": [
+          "runs-on=33918060775/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-02c09f110c97f5db3--5f6a9bd8-3",
+        "labels": [
+          "runs-on=33924076781/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": true
+      },
+      {
+        "name": "runs-on--i-02d85141ab6b7a01f--bd953607-b",
+        "labels": [
+          "runs-on=33923942158/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": true
+      },
+      {
+        "name": "runs-on--i-02efb72ca64c8e45d--fa939539-f",
+        "labels": [
+          "runs-on=33924441387/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-02f6bd94c041002ce--6c353546-f",
+        "labels": [
+          "runs-on=33924441387/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-031ba3bf57e1d89b2--33ebc182-5",
+        "labels": [
+          "runs-on=33923828945/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": true
+      },
+      {
+        "name": "runs-on--i-034a7147e387b09ae--04ec4d9d-2",
+        "labels": [
+          "runs-on=33859861446/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-034fec0ceab5f0d9c--1e082724-2",
+        "labels": [
+          "runs-on=33923828945/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": true
+      },
+      {
+        "name": "runs-on--i-038b880cc857b7206--de46fbe7-6",
+        "labels": [
+          "runs-on=33859861446/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-03a197fea3a5191ca--7db3281b-1",
+        "labels": [
+          "runs-on=33839359597/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-03b540db3bc17c153--abeb8da3-1",
+        "labels": [
+          "runs-on=33924076781/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": true
+      },
+      {
+        "name": "runs-on--i-03c05b48f7d997c7a--53f3d0d9-f",
+        "labels": [
+          "runs-on=33839359597/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-03e6c4289d5de61d9--c90e8b11-a",
+        "labels": [
+          "runs-on=33924076781/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": true
+      },
+      {
+        "name": "runs-on--i-042d4291451c7dfe1--2402b9d2-3",
+        "labels": [
+          "runs-on=33924076781/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": true
+      },
+      {
+        "name": "runs-on--i-042e4480aad1ec18c--8468b686-0",
+        "labels": [
+          "runs-on=33839359597/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-04694843a1647afbe--edf64904-8",
+        "labels": [
+          "runs-on=33859861446/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-048c983a3c6a4814e--875ab1e5-2",
+        "labels": [
+          "runs-on=33918060775/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-0492b3d6aecf8c460--f8617672-7",
+        "labels": [
+          "runs-on=33822610141/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-04ce34b775b4033a7--2df9ec70-b",
+        "labels": [
+          "runs-on=33859859334/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-04d02f94c9f22d7d6--2a73316f-c",
+        "labels": [
+          "runs-on=33924441387/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-05154dd4910dc2582--54a4f311-3",
+        "labels": [
+          "runs-on=33859861446/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-0551242040d695f95--44c90cc0-9",
+        "labels": [
+          "runs-on=33924441387/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-057f5d59f6bff1143--f39e93ee-e",
+        "labels": [
+          "runs-on=33924441387/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-05830cb60f82058ff--7e9f0f27-f",
+        "labels": [
+          "runs-on=33922284921/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-058d768f4708a8895--c40ae628-2",
+        "labels": [
+          "runs-on=33859859334/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-059f806e11eaf7afa--3345f8eb-c",
+        "labels": [
+          "runs-on=33839359597/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-05b1bf90a0094954a--fa55d68e-7",
+        "labels": [
+          "runs-on=33859861446/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-05b980ecfadd44777--8fe71cde-a",
+        "labels": [
+          "runs-on=33859859334/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-05d52e8c94c7cba47--2be26244-a",
+        "labels": [
+          "runs-on=33924441387/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": true
+      },
+      {
+        "name": "runs-on--i-05e1c305d434f4a84--6755bbbf-1",
+        "labels": [
+          "runs-on=33923942158/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": true
+      },
+      {
+        "name": "runs-on--i-06671f8be3394b1e3--6fe8c624-9",
+        "labels": [
+          "runs-on=33859859334/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-067cce20c587a75f8--c870393c-a",
+        "labels": [
+          "runs-on=33859859334/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-068952d1f73c67861--cff5f52b-3",
+        "labels": [
+          "runs-on=33924441387/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": true
+      },
+      {
+        "name": "runs-on--i-06cceac0fce31c97c--01baf029-7",
+        "labels": [
+          "runs-on=33859861446/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-06d942334a757296d--23d87f56-1",
+        "labels": [
+          "runs-on=33918060775/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-072eb27798e7f9462--9016ac34-d",
+        "labels": [
+          "runs-on=33924441387/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-073dacaa8a5d5232b--b61570d5-0",
+        "labels": [
+          "runs-on=33924441387/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-0752cfd538b4d1172--999243c6-7",
+        "labels": [
+          "runs-on=33924441387/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": true
+      },
+      {
+        "name": "runs-on--i-075427fcead776b24--66990011-f",
+        "labels": [
+          "runs-on=33923942158/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": true
+      },
+      {
+        "name": "runs-on--i-075c4528b984f22b5--116b0114-e",
+        "labels": [
+          "runs-on=33839359597/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-076abc09b099d186a--5c5c8a08-0",
+        "labels": [
+          "runs-on=33859859334/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-079eda1496d340fb6--ca8e1404-2",
+        "labels": [
+          "runs-on=33924441387/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": true
+      },
+      {
+        "name": "runs-on--i-07cba4efafb4b8901--e2fc4a51-e",
+        "labels": [
+          "runs-on=33924441387/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": true
+      },
+      {
+        "name": "runs-on--i-07e7e4dcddb0fd7cd--3e36b932-0",
+        "labels": [
+          "runs-on=33924076781/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": true
+      },
+      {
+        "name": "runs-on--i-07eadda72a48e34ff--2348e5c9-0",
+        "labels": [
+          "runs-on=33923942158/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": true
+      },
+      {
+        "name": "runs-on--i-07f380880eec97a14--cf725346-b",
+        "labels": [
+          "runs-on=33859861446/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-080781de0d64617a7--71b46227-7",
+        "labels": [
+          "runs-on=33859859334/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-080e8237674e2842f--40b11595-c",
+        "labels": [
+          "runs-on=33924441387/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-081741acd1554ebfc--a7eddaec-e",
+        "labels": [
+          "runs-on=33923942158/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": true
+      },
+      {
+        "name": "runs-on--i-084e144eeae1f67e4--90381deb-7",
+        "labels": [
+          "runs-on=33839359597/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-08551b4a918e8ccbe--612f546c-6",
+        "labels": [
+          "runs-on=33924441387/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-087001764e223ea9d--800de8d3-c",
+        "labels": [
+          "runs-on=33924441387/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-089c8dcc1312fb8e3--f5b7407e-f",
+        "labels": [
+          "runs-on=33839359597/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-08e72ff021b1648c6--d55aa43e-0",
+        "labels": [
+          "runs-on=33918060775/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-092261001d7753b71--46127ac4-e",
+        "labels": [
+          "runs-on=33924441387/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": true
+      },
+      {
+        "name": "runs-on--i-0938a916d4f33b6ec--09afd6e3-3",
+        "labels": [
+          "runs-on=33859861446/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-0941bbe37019f475a--edbf8443-c",
+        "labels": [
+          "runs-on=33924441387/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-09499cafd5eb9069d--85efef7d-d",
+        "labels": [
+          "runs-on=33839359597/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-0961e154d10822c83--ff7dc9ef-f",
+        "labels": [
+          "runs-on=33924441387/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": true
+      },
+      {
+        "name": "runs-on--i-0966beda560d62a87--fbe248e9-d",
+        "labels": [
+          "runs-on=33924076781/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": true
+      },
+      {
+        "name": "runs-on--i-097aacccaad7f1015--077b8624-7",
+        "labels": [
+          "runs-on=33859859334/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-099a370b035da3e90--fdcfe727-3",
+        "labels": [
+          "runs-on=33859859334/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-09d1fd88e7f01de55--6cb72e59-4",
+        "labels": [
+          "runs-on=33924441387/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": true
+      },
+      {
+        "name": "runs-on--i-09d356c62a830d596--703cee42-0",
+        "labels": [
+          "runs-on=33918060775/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-09ff4e7498ff324f5--335e05e7-a",
+        "labels": [
+          "runs-on=33839359597/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-0a511890a5d7291b5--c505aeb5-c",
+        "labels": [
+          "runs-on=33924441387/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": true
+      },
+      {
+        "name": "runs-on--i-0a79844542d418895--7ea28913-f",
+        "labels": [
+          "runs-on=33924441387/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-0aa4b03e2be254ca2--0b8e90be-6",
+        "labels": [
+          "runs-on=33859859334/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-0acaca8036bd045ff--d03edbb8-c",
+        "labels": [
+          "runs-on=33839359597/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-0aedad304bc0ea7bd--8644ecea-7",
+        "labels": [
+          "runs-on=33839359597/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-0af0e2b6546b07889--9d8c1630-b",
+        "labels": [
+          "runs-on=33924441387/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-0b04fef5c02023dc7--a7784060-8",
+        "labels": [
+          "runs-on=33859861446/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-0b33fc6f180e30c68--8dbb5be0-2",
+        "labels": [
+          "runs-on=33924441387/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": true
+      },
+      {
+        "name": "runs-on--i-0b36acfaf3caedab0--3310f6a9-1",
+        "labels": [
+          "runs-on=33924441387/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": true
+      },
+      {
+        "name": "runs-on--i-0b6b5ea0c763c6180--d623c71a-9",
+        "labels": [
+          "runs-on=33839359597/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-0b984aef9653d1408--ae100ca6-5",
+        "labels": [
+          "runs-on=33922284921/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-0b9fce4a83601411b--e86a304d-d",
+        "labels": [
+          "runs-on=33839359597/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-0ba462e4eb8ae9586--e7428a30-f",
+        "labels": [
+          "runs-on=33859859334/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-0bf30fd5bfd85513a--0f0c129a-7",
+        "labels": [
+          "runs-on=33924441387/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-0c0529b6de47a74cf--fa8cde0e-9",
+        "labels": [
+          "runs-on=33839359597/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-0c0c16e5cd6311275--572d7d2a-6",
+        "labels": [
+          "runs-on=33839359597/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-0c38ce584fc55b519--0c66f1ff-a",
+        "labels": [
+          "runs-on=33924441387/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-0c40a1964b111fc0c--4300e819-e",
+        "labels": [
+          "runs-on=33839359597/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-0c95f74363022f717--5aa96d2e-f",
+        "labels": [
+          "runs-on=33859861446/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-0c9756eca6cd9f81b--45307b89-0",
+        "labels": [
+          "runs-on=33918060775/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-0ca38c5bc08d100e2--fd9208c6-c",
+        "labels": [
+          "runs-on=33859859334/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-0ca9c7c831ec340de--a8cd9c8e-e",
+        "labels": [
+          "runs-on=33859859334/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-0cd7be7fa6a69bbe0--b43395c5-d",
+        "labels": [
+          "runs-on=33914205676/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-0cf040887c050ce83--550a2962-5",
+        "labels": [
+          "runs-on=33918060775/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-0cfc8fb7565627e6f--8ee97526-0",
+        "labels": [
+          "runs-on=33918469476/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-0cffdaea423d9235c--176d161e-6",
+        "labels": [
+          "runs-on=33924441387/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": true
+      },
+      {
+        "name": "runs-on--i-0d680e8feaa2b70ee--5ceb840f-b",
+        "labels": [
+          "runs-on=33839359597/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-0dcf5ce218cb22dcb--bee4b4a7-4",
+        "labels": [
+          "runs-on=33839359597/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-0dd2309e1b277c4fc--79723802-e",
+        "labels": [
+          "runs-on=33859859334/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-0df346c078b5022ed--39bb45f2-c",
+        "labels": [
+          "runs-on=33859861446/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-0e3edc83e4fb8c2b0--c36638a8-f",
+        "labels": [
+          "runs-on=33924441387/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": true
+      },
+      {
+        "name": "runs-on--i-0e979bb3f75d8c1c0--ad378eff-1",
+        "labels": [
+          "runs-on=33859859334/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-0e994f1617b2dc010--c9aef246-0",
+        "labels": [
+          "runs-on=33923942158/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": true
+      },
+      {
+        "name": "runs-on--i-0ec326562f21b9e58--3e9fda4a-a",
+        "labels": [
+          "runs-on=33923942158/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": true
+      },
+      {
+        "name": "runs-on--i-0ef45692e8a32701d--0d052d3b-1",
+        "labels": [
+          "runs-on=33859861446/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-0f506a33e2c31e3b8--fc31b57f-9",
+        "labels": [
+          "runs-on=33924076781/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": true
+      },
+      {
+        "name": "runs-on--i-0f54a0ecf3a49406e--81ee4f77-3",
+        "labels": [
+          "runs-on=33859861446/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-0f6b21b99f200cb93--ff0575d0-1",
+        "labels": [
+          "runs-on=33859861446/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-0f916ede677e8d342--8f7fd5aa-5",
+        "labels": [
+          "runs-on=33924441387/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-0f98f217608b577f0--3fbb8d46-f",
+        "labels": [
+          "runs-on=33924441387/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-0fd071bda6eedc9a6--71b3251f-b",
+        "labels": [
+          "runs-on=33924441387/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": true
+      },
+      {
+        "name": "runs-on--i-0fe0f01c6887b5682--f2eb8474-6",
+        "labels": [
+          "runs-on=33859859334/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "offline",
+        "busy": false
+      },
+      {
+        "name": "runs-on--i-0ff675dde45d63571--5ae9cb83-9",
+        "labels": [
+          "runs-on=33924076781/runner=2cpu-linux-x64/spot=true"
+        ],
+        "status": "online",
+        "busy": true
+      }
+    ],
+    "online": 58,
+    "busy": 40,
+    "idle": 18
+  },
+  "aws_available": true,
+  "checks": "PASS: order, no wrap, live arrow counts and dropdowns, zero/unknown arrows, removed blocks, three facts, local available/permission states, pagination/cache/403/404",
+  "errors": []
+}

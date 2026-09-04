@@ -1,0 +1,83 @@
+{
+  "checked_at": "2026-09-04T22:19:13.462078+00:00",
+  "source": "Scratch Flask API on gandalf; live tmux and fresh read-only GitHub queries",
+  "live_count": 6,
+  "fresh_tmux_live_count": 6,
+  "live_windows": [
+    [
+      "codex",
+      "issue-7064"
+    ],
+    [
+      "council",
+      "WORK-cicd-layout"
+    ],
+    [
+      "council",
+      "WORK-shepherd-6615"
+    ],
+    [
+      "rangers",
+      "LANE-GARDENER"
+    ],
+    [
+      "rangers",
+      "LANE-SCOUT"
+    ],
+    [
+      "rangers",
+      "LANE-TICKET-MINER"
+    ]
+  ],
+  "per_square": {
+    "issues open": 1,
+    "prs open": 1
+  },
+  "target_checks": [
+    {
+      "target": {
+        "repo": "armbrain-io/armbrain",
+        "issue": 7064,
+        "number": 7064
+      },
+      "expected": "issues open",
+      "open_pr_references": []
+    },
+    {
+      "target": {
+        "repo": "armbrain-io/armbrain",
+        "pr": 6615,
+        "number": 6615
+      },
+      "expected": "prs open",
+      "github": {
+        "state": "OPEN",
+        "headRefOid": "fa800066bd6031991b65ec9ec2525da0be404c9c",
+        "isDraft": false,
+        "reviewDecision": "APPROVED",
+        "mergeable": "MERGEABLE",
+        "mergeStateStatus": "BLOCKED",
+        "labels": {
+          "nodes": [
+            {
+              "name": "bug"
+            },
+            {
+              "name": "area:briefings"
+            },
+            {
+              "name": "\ud83e\udd16 ai-active"
+            },
+            {
+              "name": "automerge"
+            }
+          ]
+        },
+        "mergeQueueEntry": null
+      },
+      "running": 0
+    }
+  ],
+  "dom": "PASS: exact counts, chip toggles, agent section first, safe new-window links, six-square fixtures, zero and unavailable",
+  "runtime_errors": []
+}
