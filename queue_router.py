@@ -4752,6 +4752,12 @@ text-transform:uppercase;color:#c7cee0;margin-top:4px}
 #runson-card .runson-label{font-size:.68em;margin-top:2px;line-height:1.1}
 #runson-card .runson-runners{gap:3px;margin-top:2px}
 #runson-card .runson-runner{padding:0 5px;font-size:.6em}
+#runson-card .runson-runners-details{margin-top:2px}
+#runson-card .runson-runners-details summary{font-size:.68em;cursor:pointer;color:#c7cee0;list-style:none;user-select:none}
+#runson-card .runson-runners-details summary::-webkit-details-marker{display:none}
+#runson-card .runson-runners-details summary::before{content:'▸ ';display:inline-block}
+#runson-card .runson-runners-details[open] summary::before{content:'▾ '}
+#runson-card .runson-runners-details[open] .runson-runners{margin-top:3px}
 #runson-card .runson-flow{gap:5px}
 #runson-card .runson-flow-cell b{font-size:1.15em}
 #runson-card .runson-flow-cell span{font-size:.68em;margin-top:2px}
@@ -6351,7 +6357,8 @@ function refreshRunsOn() {
             + runsonEscape(runsonAge(r.age_minutes)) + '</span>').join('');
         const runnerDetail = count === 0
             ? '<div class="runson-label">no runners active</div>'
-            : '<div class="runson-runners">' + runners + '</div>';
+            : '<details class="runson-runners-details"><summary>show ' + count + ' runner'
+              + (count === 1 ? '' : 's') + '</summary><div class="runson-runners">' + runners + '</div></details>';
         const creditsNumber = (d.credits_remaining === null || d.credits_remaining === undefined)
             ? Number.NaN : Number(d.credits_remaining);
         const credits = Number.isFinite(creditsNumber) ? '$' + creditsNumber.toFixed(2) : 'n/a';
