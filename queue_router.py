@@ -5303,13 +5303,12 @@ const TPS_DIAL_BOXES = {
     aragorn: 'tps-dial-aragorn',
     pippin: 'tps-dial-pippin',
 };
-function tpsDialZones(avgToday, peakToday, allTimeRecord) {
-    const record = Number(allTimeRecord);
+function tpsDialZones(avgToday, peakToday) {
     const average = Math.max(0, Number(avgToday) || 0);
     const peak = Math.max(0, Number(peakToday) || 0);
-    if (!Number.isFinite(record) || record <= 0 || average >= record) return null;
+    if (!Number.isFinite(peak) || peak <= 0) return null;
     const redEnd = Math.min(average, peak * TPS_RED_PEAK_FRACTION);
-    return {redEnd: redEnd, tanEnd: average, max: record};
+    return {redEnd: redEnd, tanEnd: Math.min(average, peak), max: peak};
 }
 function tpsGaugeGradient(zones) {
     const redDeg = (zones.redEnd / zones.max) * 180;
@@ -5319,14 +5318,12 @@ function tpsGaugeGradient(zones) {
         + '#d9a54a ' + redDeg + 'deg, #d9a54a ' + tanDeg + 'deg, '
         + '#39ff14 ' + tanDeg + 'deg, #39ff14 180deg, transparent 180deg)';
 }
-function updateTpsGauge(id, value, avgToday, peakToday, allTimeRecord) {
+function updateTpsGauge(id, value, avgToday, peakToday) {
     const gauge = document.getElementById(id);
     const hasZones = avgToday !== null && avgToday !== undefined
         && peakToday !== null && peakToday !== undefined
-        && allTimeRecord !== null && allTimeRecord !== undefined
-        && Number.isFinite(Number(avgToday)) && Number.isFinite(Number(peakToday))
-        && Number.isFinite(Number(allTimeRecord));
-    const zones = hasZones ? tpsDialZones(avgToday, peakToday, allTimeRecord) : null;
+        && Number.isFinite(Number(avgToday)) && Number.isFinite(Number(peakToday));
+    const zones = hasZones ? tpsDialZones(avgToday, peakToday) : null;
     if (gauge && zones) {
         const bg = gauge.querySelector('.gauge-bg');
         if (bg) bg.style.background = tpsGaugeGradient(zones);
@@ -5334,10 +5331,16 @@ function updateTpsGauge(id, value, avgToday, peakToday, allTimeRecord) {
         gauge.dataset.tpsZoneOrder = 'red-tan-green';
         gauge.dataset.tpsRedEnd = String(zones.redEnd);
         gauge.dataset.tpsTanEnd = String(zones.tanEnd);
-        gauge.dataset.tpsModelRecord = String(zones.max);
     }
     if (!zones) {
         updateGauge(id, null, 0, TPS_GAUGE_PLACEHOLDER_MAX, '', true, () => '#d94a4a');
+        if (gauge && hasZones && Number(peakToday) === 0) {
+            gauge.dataset.max = '0';
+            const valueEl = gauge.querySelector('.gauge-value');
+            if (valueEl) valueEl.textContent = 'no serving yet today';
+            // Allow a later unavailable response to replace the empty-day label.
+            gauge.dataset.lastVal = 'no-serving';
+        }
         return;
     }
     updateGauge(id, value, 0, zones.max, '', true, function(percent) {
@@ -5358,27 +5361,22 @@ function refreshModelServing() {
             // Same wrong-box guard as the other dials: /api/status must have
             // verified this card's identity before serving stats can fill it.
             if (dialId && (!card || card.dataset.identityOk !== 'true')) {
-                updateTpsGauge(dialId, null, null, null, null);
+                updateTpsGauge(dialId, null, null, null);
                 el.innerHTML = '<span class="dim">serving stats unavailable (identity not verified)</span>';
                 continue;
             }
             if (!s.available) {
-                if (dialId) updateTpsGauge(dialId, null, null, null, null);
+                if (dialId) updateTpsGauge(dialId, null, null, null);
                 el.innerHTML = '<span class="dim">serving stats unavailable</span>';
                 continue;
             }
             if (dialId) {
-                updateTpsGauge(dialId, s.tps_now, s.tps_avg_today, s.tps_max_today, s.tps_record);
-                const validRecord = Number(s.tps_record) > Number(s.tps_avg_today);
-                updatePeakMarker(
-                    dialId + '-peak', validRecord ? s.tps_max_today : null,
-                    0, validRecord ? s.tps_record : TPS_GAUGE_PLACEHOLDER_MAX
-                );
+                updateTpsGauge(dialId, s.tps_now, s.tps_avg_today, s.tps_max_today);
             }
             // Two-band strip at the top of the card: now (top) vs today's peak
             // (bottom), on one shared scale so the bars are comparable.
             const peak = s.tps_max_today || 0;
-            const scale = Math.max(Number(s.tps_record) || 0, peak, 1);
+            const scale = Math.max(peak, 1);
             const nowFill = document.getElementById('tps-fill-now-' + name);
             const peakFill = document.getElementById('tps-fill-peak-' + name);
             if (nowFill) nowFill.style.width = Math.min(100, (s.tps_now / scale) * 100) + '%';
@@ -5565,7 +5563,7 @@ const HELP = {
     disk:  'DISK - how full the drive is. No high-water mark here on purpose: disk usage only climbs, so today maximum is just the current number.',
     io:    'DISK and NETWORK traffic in megabytes per second, read/write and in/out. Useful for spotting a box that is busy moving data rather than thinking.',
     tps:   'TOKENS PER SECOND - the speed the model is writing. A token is roughly three quarters of a word. NOW is this second, PEAK TODAY is the fastest it managed today, AVG is the average across everything it served today.',
-    toks:  'TOKENS PER SECOND - the speed the model is writing right now. A token is roughly three quarters of a word. The bright mark is today high point.',
+    toks:  'TOKENS PER SECOND - the speed the model is writing right now. A token is roughly three quarters of a word. The full arc is today’s peak speed.',
     reqs:  'REQUESTS - how many times something asked this box for an answer, in the last hour, last 24 hours and last 7 days.',
     served:'SERVING TIME - total minutes this box spent actually generating today. A big request count with few minutes means lots of short answers.',
     model: 'LOADED MODEL - which AI model is sitting in memory right now, and how much memory it is using. Empty means nothing is loaded and the next request will wait for it to load.',
@@ -5896,7 +5894,7 @@ function refresh() {
                     html += renderGauge(info.gpu_util, 0, 100, "GPU", "%", false, 0.7, true, 'util-' + name, info.max_util_today);
                     html += renderGauge(info.cpu_percent, 0, 100, "CPU", "%", false, 0.7, false, 'cpu-' + name, pk.cpu_percent);
                     if (hasTpsDial) {
-                        html += renderGauge(null, 0, TPS_GAUGE_PLACEHOLDER_MAX, "TOK/S", "", true, 0.7, true, TPS_DIAL_BOXES[name], null);
+                        html += renderGauge(null, 0, TPS_GAUGE_PLACEHOLDER_MAX, "TOK/S", "", true, 0.7, true, TPS_DIAL_BOXES[name]);
                     }
                     const swapPct = info.swap ? info.swap.percent : 0;
                     html += renderSwapGauge(swapPct, 100, 0.7, 'swap-' + name, pk.swap_percent);
@@ -5930,7 +5928,7 @@ function refresh() {
                     if (!hasTpsDial) html += renderGauge(info.gpu_temp, 24, 90, "TEMP", "°C", false, 0.7, false, 'temp-' + name, pk.gpu_temp);
                     html += renderGauge(info.cpu_percent, 0, 100, "CPU", "%", false, 0.7, false, 'cpu-' + name, pk.cpu_percent);
                     if (hasTpsDial) {
-                        html += renderGauge(null, 0, TPS_GAUGE_PLACEHOLDER_MAX, "TOK/S", "", true, 0.7, true, TPS_DIAL_BOXES[name], null);
+                        html += renderGauge(null, 0, TPS_GAUGE_PLACEHOLDER_MAX, "TOK/S", "", true, 0.7, true, TPS_DIAL_BOXES[name]);
                     } else {
                         const swapPct = info.swap ? info.swap.percent : 0;
                         html += renderSwapGauge(swapPct, 100, 0.7, 'swap-' + name, pk.swap_percent);
@@ -5981,7 +5979,7 @@ function refresh() {
                     html += '<div class="dial-strip">';
                     html += renderGauge(info.cpu_percent, 0, 100, "CPU", "%", false, 0.7, false, 'cpu-' + name, pk.cpu_percent);
                     if (hasTpsDial) {
-                        html += renderGauge(null, 0, TPS_GAUGE_PLACEHOLDER_MAX, "TOK/S", "", true, 0.7, true, TPS_DIAL_BOXES[name], null);
+                        html += renderGauge(null, 0, TPS_GAUGE_PLACEHOLDER_MAX, "TOK/S", "", true, 0.7, true, TPS_DIAL_BOXES[name]);
                     } else {
                         html += renderGauge(info.cpu_temp, 24, 90, "TEMP", "°C", false, 0.7, false, 'temp-' + name, pk.gpu_temp);
                         const swapPct = info.swap ? info.swap.percent : 0;
