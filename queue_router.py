@@ -6140,8 +6140,13 @@ function refreshRunsOn() {
             + '<div class="runson-label">live runners</div>' + (count === 0 ? '' : runnerDetail) + '</div>'
             + (function(){
                 var tried = Number(d.jobs_today || 0);
-                return '<div class="runson-flow">'
+                var doneKnown = (d.jobs_done !== null && d.jobs_done !== undefined);
+                var done = doneKnown ? Number(d.jobs_done) : null;
+                var stranded = doneKnown && tried > 0 && done === 0;
+                return '<div class="runson-flow' + (stranded ? ' runson-stranded' : '') + '">'
                   + '<div class="runson-flow-cell"><b>' + tried + '</b><span>jobs tried</span></div>'
+                  + '<div class="runson-flow-arrow">&rarr;</div>'
+                  + '<div class="runson-flow-cell"><b>' + (doneKnown ? done : '?') + '</b><span>jobs done</span></div>'
                   + '</div>';
               })()
             + '<div class="runson-fact"><b>' + Number(d.trial_days_remaining || 0) + ' days</b><span>to $'
