@@ -2286,6 +2286,8 @@ def get_runson_status(force_refresh=False):
             jobs_done_data, jobs_done_error = jobs_done_future.result()
             credits_data, credits_error = credits_future.result()
 
+        if jobs_done_error:
+            logger.warning("RunsOn jobs_done unavailable: %s", jobs_done_error)
         # Free Tier credits are optional: a denied/unavailable credits read must not blank the panel (council 2026-09-02).
         if credits_error:
             logger.warning("RunsOn credits read unavailable (%s); continuing without credits", credits_error)
@@ -2338,9 +2340,10 @@ def get_runson_status(force_refresh=False):
                 "live_runners": len(runner_rows),
                 "runners": runner_rows,
                 "jobs_today": int((jobs_data or {}).get("Count", 0)),
-                # None (not 0) when the query failed - the UI renders "?" so a
+                # None (not 0) when the query failed, paired with the error so a
                 # broken probe can never read as "zero jobs ran".
                 "jobs_done": jobs_done_data,
+                "jobs_done_error": jobs_done_error,
                 "trial_days_remaining": max(0, (charge_date - today_ct).days),
                 "trial_charge_date": charge_date.isoformat(),
                 "subscription_usd_per_year": 350,
@@ -6137,15 +6140,8 @@ function refreshRunsOn() {
             + '<div class="runson-label">live runners</div>' + (count === 0 ? '' : runnerDetail) + '</div>'
             + (function(){
                 var tried = Number(d.jobs_today || 0);
-                var doneKnown = (d.jobs_done !== null && d.jobs_done !== undefined);
-                var done = doneKnown ? Number(d.jobs_done) : null;
-                // Stranded = work was offered and none of it ran. That is a failure
-                // wearing a success-shaped number, so colour it red.
-                var stranded = doneKnown && tried > 0 && done === 0;
-                return '<div class="runson-flow' + (stranded ? ' runson-stranded' : '') + '">'
+                return '<div class="runson-flow">'
                   + '<div class="runson-flow-cell"><b>' + tried + '</b><span>jobs tried</span></div>'
-                  + '<div class="runson-flow-arrow">&rarr;</div>'
-                  + '<div class="runson-flow-cell"><b>' + (doneKnown ? done : '?') + '</b><span>jobs done</span></div>'
                   + '</div>';
               })()
             + '<div class="runson-fact"><b>' + Number(d.trial_days_remaining || 0) + ' days</b><span>to $'

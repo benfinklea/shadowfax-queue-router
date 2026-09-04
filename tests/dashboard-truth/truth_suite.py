@@ -666,7 +666,7 @@ console.log(JSON.stringify({
         ok = all(k in r for k in (
             "live_runners", "runners", "jobs_today", "trial_days_remaining", "credits_remaining",
             "cost_source", "cost_source_label", "spent_today", "spent_month", "daily_spend",
-            "credits_runway", "budget_limits",
+            "credits_runway", "budget_limits", "jobs_done_error",
         )) and len(r.get("daily_spend") or []) == 30
         instrument = "AWS data schema"
     else:
