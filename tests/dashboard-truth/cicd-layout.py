@@ -19,7 +19,7 @@ with patch.object(q, 'get_gh_ci_token', return_value='test'), patch.object(q.req
     known = q.get_local_runners(True)
     assert known['online'] == known['busy'] == 100 and known['idle'] == 0
     assert q.get_local_runners() == known and get.call_count == 2
-    for status in [403,404]:
+    for status in [404]:
         get.side_effect = None
         get.return_value = Mock(status_code=status)
         denied = q.get_local_runners(True)

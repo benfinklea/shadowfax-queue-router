@@ -3899,7 +3899,7 @@ def api_agents():
         return _fresh_jsonify({'error': 'Could not establish live tmux agents'}, disposition, 'agents'), 503
 
 
-# Repository runner inventory uses the same installation token as CI reads.
+# Organization inventory and job history use the same installation token as CI reads.
 LOCAL_RUNNERS_CACHE_TTL = 60
 local_runners_cache = {"data": None, "ts": 0.0}
 local_runners_cache_lock = threading.Lock()
@@ -3921,30 +3921,99 @@ def _local_runner_host(runner):
     return runner['name']
 
 
+def _is_cloud_runner(name, labels):
+    return name.startswith('runs-on--') or any('runs-on=' in label for label in labels)
+
+
+def _local_runner_job_history(token):
+    """Bounded fallback: prioritize active runs, then recently updated runs."""
+    since = (datetime.now(timezone.utc) - timedelta(minutes=60)).isoformat()
+    headers = {'Authorization': f'Bearer {token}', 'Accept': 'application/vnd.github+json'}
+    base = f'https://api.github.com/repos/{GITHUB_CI_REPO}/actions'
+    workflow = base + '/workflows/255384592/runs?per_page=100'
+    runs = {}
+    listing_truncated = False
+    # The API has no updated_at filter. Inspect recent runs and separately list
+    # active runs so a long-running workflow is not lost behind newer runs.
+    for url in (workflow + '&status=in_progress', workflow):
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
+        listing_truncated |= bool(response.links.get('next'))
+        for run in response.json()['workflow_runs']:
+            if datetime.fromisoformat(run['updated_at'].replace('Z', '+00:00')) >= datetime.fromisoformat(since):
+                runs[run['id']] = run
+    ordered = sorted(runs.values(), key=lambda r: (r['status'] == 'in_progress', r['updated_at']), reverse=True)
+    def read_jobs(run):
+        jobs = []
+        url = base + f"/runs/{run['id']}/jobs?per_page=100"
+        while url:
+            response = requests.get(url, headers=headers, timeout=15)
+            response.raise_for_status()
+            jobs.extend(response.json()['jobs'])
+            url = response.links.get('next', {}).get('url')
+        return jobs
+
+    runners, excluded = {}, set()
+    # Keep the sample close to now without increasing the request budget.
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        job_pages = list(pool.map(read_jobs, ordered[:30]))
+    for jobs in job_pages:
+        for job in jobs:
+            name, labels = job.get('runner_name') or '', job.get('labels') or []
+            if not name:
+                continue
+            if _is_cloud_runner(name, labels):
+                excluded.add(name)
+                continue
+            runner = runners.setdefault(name, {'name': name, 'labels': [],
+                'status': 'unknown', 'busy': False, 'host': name.split('-')[0].lower()})
+            runner['labels'] = sorted(set(runner['labels']) | set(labels))
+            runner['busy'] |= job['status'] == 'in_progress'
+    hosts = {}
+    for runner in sorted(runners.values(), key=lambda r: r['name']):
+        host = hosts.setdefault(runner['host'], {'host': runner['host'], 'online': None,
+            'idle': None, 'busy': 0, 'seen_last_hour': 0, 'runners': []})
+        host['runners'].append(runner)
+        host['seen_last_hour'] += 1
+        host['busy'] += int(runner['busy'])
+    return dict(available=True, error=None, source='job_history', online=None, idle=None,
+        busy=sum(r['busy'] for r in runners.values()), seen_last_hour=len(runners),
+        runners=list(runners.values()), hosts=[hosts[h] for h in sorted(hosts)],
+        excluded_cloud=len(excluded), since=since, runs_checked=min(30, len(ordered)),
+        run_limit=30, truncated=len(ordered) > 30 or listing_truncated,
+        repo=GITHUB_CI_REPO, workflow_id=255384592,
+        caption="from the last hour's jobs; the org runner list needs a permission Ben has not granted yet",
+        jobs_today=None, jobs_today_reason='The last hour of jobs does not report jobs today')
+
+
 def get_local_runners(force_refresh=False):
     with local_runners_cache_lock:
         if not force_refresh and local_runners_cache['data'] is not None and time.monotonic() - local_runners_cache['ts'] < LOCAL_RUNNERS_CACHE_TTL:
             return local_runners_cache['data']
         result = {'available': False, 'error': 'Could not establish local runners',
-                  'jobs_today': None, 'jobs_today_reason': 'Repository runner inventory does not report jobs today'}
+                  'source': 'org_inventory', 'jobs_today': None, 'jobs_today_reason': 'Organization runner inventory does not report jobs today'}
         try:
             token = get_gh_ci_token()
             if not token:
                 raise ValueError('CI token unavailable')
             runners, excluded_cloud = [], 0
-            url = f'https://api.github.com/repos/{GITHUB_CI_REPO}/actions/runners?per_page=100'
+            url = 'https://api.github.com/orgs/armbrain-io/actions/runners?per_page=100'
             while url:
                 response = requests.get(
                     url,
                     headers={'Authorization': f'Bearer {token}', 'Accept': 'application/vnd.github+json'},
                     timeout=15)
-                if response.status_code in (403, 404):
+                if response.status_code == 403:
+                    result['source'] = 'job_history'
+                    result.update(_local_runner_job_history(token))
+                    break
+                if response.status_code == 404:
                     result['error'] = 'no permission to read runners'
                     break
                 response.raise_for_status()
                 for r in response.json()['runners']:
                     labels = [label['name'] for label in r['labels']]
-                    if r['name'].startswith('runs-on--') or any('runs-on=' in label for label in labels):
+                    if _is_cloud_runner(r['name'], labels):
                         excluded_cloud += 1
                         continue
                     runner = {'name': r['name'], 'labels': labels,
@@ -6862,14 +6931,20 @@ function refreshLocalRunners() {
     return fetch('/api/local_runners').then(r => r.json()).then(d => {
         const body = document.getElementById('local-runners-body');
         if (!d.available) { body.innerHTML = '<p class="runson-warning">' + runsonEscape(d.error || 'Could not establish local runners') + '</p>'; return; }
-        body.innerHTML = '<div class="runner-facts">' + ['online', 'busy', 'idle'].map(k =>
-            '<div class="runson-fact"><b>' + Number(d[k]) + '</b><span>' + k + '</span></div>').join('') + '</div>'
+        const history = d.source === 'job_history';
+        const count = value => value == null ? 'n/a' : Number(value);
+        body.innerHTML = '<p class="runson-label">Source: ' + runsonEscape(d.source) + '</p>'
+            + (history ? '<p class="runson-label">' + runsonEscape(d.caption) + '</p>' : '')
+            + (d.truncated ? '<p class="runson-warning">Limited job sample · up to 30 runs; counts may be incomplete</p>' : '')
+            + '<div class="runner-facts">' + (history ? ['online', 'busy', 'idle', 'seen_last_hour'] : ['online', 'busy', 'idle']).map(k =>
+            '<div class="runson-fact"><b>' + count(d[k]) + '</b><span>' + k.replaceAll('_', ' ') + '</span></div>').join('') + '</div>'
             + '<details class="runson-runners-details"><summary>show ' + d.runners.length + ' runners</summary>'
             + (d.hosts || []).map(h => '<div class="local-runner-host"><b>' + runsonEscape(h.host)
-                + '</b> · ' + Number(h.online) + ' online · ' + Number(h.busy) + ' busy · ' + Number(h.idle) + ' idle'
+                + '</b> · ' + count(h.online) + ' online · ' + count(h.busy) + ' busy · ' + count(h.idle) + ' idle'
+                + (history ? ' · ' + count(h.seen_last_hour) + ' seen last hour' : '')
                 + h.runners.map(r => '<div class="local-runner">' + runsonEscape(r.name) + ' · '
                     + runsonEscape(r.labels.join(', ')) + ' · ' + runsonEscape(r.status)
-                    + ' · ' + (r.busy ? 'busy' : 'idle') + '</div>').join('') + '</div>').join('') + '</details>'
+                    + ' · ' + (r.busy ? 'busy' : (history ? 'seen in last hour' : 'idle')) + '</div>').join('') + '</div>').join('') + '</details>'
             + '<p class="runson-label">Excluded cloud runners: ' + Number(d.excluded_cloud) + '</p>'
             + '<p class="runson-label">' + (d.jobs_today == null ? 'Jobs today: n/a · ' + runsonEscape(d.jobs_today_reason) : Number(d.jobs_today) + ' jobs today') + '</p>';
     }).catch(() => { document.getElementById('local-runners-body').innerHTML = '<p>Could not establish local runners</p>'; });
