@@ -336,6 +336,46 @@ def gh_json(args: list[str]):
     return json.loads(cp.stdout)
 
 
+def check_green_waiting(d) -> None:
+    waiting = d.get("green_waiting_prs")
+    valid = (isinstance(waiting, list) and type(d.get("green_waiting")) is int
+             and d["green_waiting"] == len(waiting)
+             and all(isinstance(p, dict) and type(p.get("number")) is int
+                     and isinstance(p.get("title"), str) for p in waiting))
+    emit("PASS" if valid else "FAIL", "pipeline.green_waiting.count",
+         d.get("green_waiting"), len(waiting) if isinstance(waiting, list) else None)
+    if not valid:
+        return
+    try:
+        # Re-read the listed PRs individually in one GraphQL request, so PRs
+        # closed/drafted/held since the cached snapshot are also detected.
+        fields = " ".join(
+            f'p{p["number"]}:pullRequest(number:{p["number"]})'
+            '{state isDraft reviewDecision mergeable labels(first:100){nodes{name} pageInfo{hasNextPage}}}'
+            for p in waiting)
+        query = ('{repository(owner:"armbrain-io",name:"armbrain"){' + fields +
+                 ' mergeQueue(branch:"main"){entries(first:100){nodes{pullRequest{number}} pageInfo{hasNextPage}}}}}')
+        live = gh_json(["graphql", "-f", "query=" + query])["data"]["repository"]
+        queue = live["mergeQueue"]
+        if queue is None or queue["entries"]["pageInfo"]["hasNextPage"]:
+            raise ValueError("could not establish complete main merge queue")
+        queued = {p["pullRequest"]["number"] for p in queue["entries"]["nodes"]}
+        invalid = []
+        for pr in waiting:
+            current = live.get(f'p{pr["number"]}')
+            if (not current or current["state"] != "OPEN" or current["isDraft"]
+                    or current["reviewDecision"] != "APPROVED" or current["mergeable"] != "MERGEABLE"
+                    or pr["number"] in queued or current["labels"]["pageInfo"]["hasNextPage"]
+                    or {x["name"].lower() for x in current["labels"]["nodes"]}
+                    & {"do-not-merge", "needs-repair", "hold", "blocked-on-ben"}):
+                invalid.append(pr["number"])
+        emit("FAIL" if invalid else "PASS", "pipeline.green_waiting.live",
+             waiting, {"invalid_prs": invalid, "queued": sorted(queued)},
+             "live OPEN + not draft + APPROVED + MERGEABLE + not held + not queued; cache churn may fail")
+    except Exception as exc:
+        emit("FAIL", "pipeline.green_waiting.live", waiting, "could not establish", str(exc))
+
+
 def check_pipeline() -> None:
     d = api.get("pipeline", {})
     try:
@@ -345,6 +385,7 @@ def check_pipeline() -> None:
     except Exception:
         d_fresh = d
     d = d_fresh
+    check_green_waiting(d)
     ci = api.get("ci_queue", {})
     now = dt.datetime.now(dt.timezone.utc)
     ct = ZoneInfo("America/Chicago")

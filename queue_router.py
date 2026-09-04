@@ -3716,9 +3716,47 @@ pipeline_cache_lock = threading.Lock()
 pipeline_gh_failing_since = None
 pipeline_last_good = None
 
+def _get_green_waiting(token):
+    """Read the oldest 100 open PRs and the main merge queue together."""
+    env = dict(os.environ, GH_TOKEN=token)
+    def gh_json(args):
+        cp = subprocess.run(["gh", *args], env=env, capture_output=True,
+                            text=True, timeout=30, check=True)
+        value = json.loads(cp.stdout)
+        if isinstance(value, dict) and value.get("errors"):
+            raise ValueError("GitHub green-waiting query failed")
+        return value
+
+    prs = gh_json(["pr", "list", "--repo", GITHUB_CI_REPO, "--state", "open",
+                   "--limit", "100", "--search", "sort:created-asc", "--json",
+                   "number,title,isDraft,reviewDecision,mergeable,labels"])
+    owner, name = GITHUB_CI_REPO.split("/")
+    query = '''query($owner:String!,$name:String!){
+      repository(owner:$owner,name:$name){mergeQueue(branch:"main"){
+        entries(first:100){nodes{pullRequest{number}} pageInfo{hasNextPage}}
+      }}
+    }'''
+    queue = gh_json(["api", "graphql", "-f", "query=" + query,
+                     "-f", "owner=" + owner, "-f", "name=" + name])["data"]["repository"]["mergeQueue"]
+    if queue is None or queue["entries"]["pageInfo"]["hasNextPage"]:
+        # An absent or truncated queue cannot establish that a PR is not queued.
+        raise ValueError("Could not establish the complete main merge queue")
+    queued = {entry["pullRequest"]["number"] for entry in queue["entries"]["nodes"]}
+    # Drafts are unfinished; unapproved PRs still need review; non-MERGEABLE
+    # (including UNKNOWN) PRs have not established merge readiness.
+    # Queued PRs are already being fed into the line, so are not waiting.
+    # do-not-merge explicitly forbids merging; needs-repair needs fixes;
+    # hold intentionally pauses work; blocked-on-ben awaits Ben's decision.
+    held = {"do-not-merge", "needs-repair", "hold", "blocked-on-ben"}
+    return [{"number": pr["number"], "title": pr["title"]} for pr in prs
+            if not pr["isDraft"] and pr["reviewDecision"] == "APPROVED"
+            and pr["mergeable"] == "MERGEABLE" and pr["number"] not in queued
+            and not held.intersection(label["name"].lower() for label in pr["labels"])]
+
+
 def get_pipeline_status(force_refresh=False):
     """Shipping-pipeline snapshot for armbrain: issues -> PRs -> CI -> merged
-    today -> deployed today. Read-only GitHub queries, cached 5 min."""
+    today -> green waiting. Read-only GitHub queries, cached with PIPELINE_CACHE_TTL."""
     now = time.time()
     with pipeline_cache_lock:
         if not force_refresh and pipeline_cache["data"] is not None and (now - pipeline_cache["ts"]) < PIPELINE_CACHE_TTL:
@@ -3736,6 +3774,8 @@ def get_pipeline_status(force_refresh=False):
     if token:
         try:
             headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
+            result["green_waiting_prs"] = _get_green_waiting(token)
+            result["green_waiting"] = len(result["green_waiting_prs"])
             # "Today" is CENTRAL TIME (Ben's day), not UTC - counters were resetting at 7pm CT.
             from zoneinfo import ZoneInfo
             from datetime import timedelta
@@ -5131,10 +5171,8 @@ function refreshShipFlow() {
         const ARROW = '<div class="ship-arrow">&#10148;</div>';
         const ciNum = d.ci_queued + '/' + d.ci_running;
         const ciCls = d.ci_queued > 5 ? 'hot' : (d.ci_queued > 0 ? 'warn' : 'ok');
-        let deploySub = '';
-        if (d.deploys_in_flight) deploySub = d.deploys_in_flight + ' in flight' + (d.deploy_started_min !== null && d.deploy_started_min !== undefined ? ' · ' + d.deploy_started_min + 'm' : '');
-        else if (d.deploys_failed_today) deploySub = d.deploys_failed_today + ' failed';
-        else if (d.deploys_ok_today) deploySub = 'all landed';
+        const greenCls = d.green_waiting >= 6 ? 'hot' : (d.green_waiting >= 3 ? 'warn' : (d.green_waiting > 0 ? 'ok' : ''));
+        const greenSub = d.green_waiting_prs.length ? '#' + d.green_waiting_prs[0].number : '';
         let mergedSub = d.merged_last_hour !== null && d.merged_last_hour !== undefined ? '60m: ' + d.merged_last_hour : '';
         if (d.last_merge_at) {
             const t = new Date(d.last_merge_at).toLocaleTimeString('en-US', {hour:'numeric', minute:'2-digit', timeZone:'America/Chicago'}).toLowerCase().replace(' ','');
@@ -5159,7 +5197,7 @@ function refreshShipFlow() {
             shipStage(d.prs_open, 'prs open', '', '', null, HELP.prs) + ARROW +
             shipStage(ciNum, 'ci q/run', ciCls, '', null, HELP.ciqr) + ARROW +
             shipStage(d.merged_today, 'merged today', 'ok', mergedSub, d.merged_spark, HELP.merged, mergedRateClass(d.merged_last_hour)) + ARROW +
-            shipStage(d.deploys_ok_today, 'deployed today', d.deploys_failed_today ? 'hot' : '', deploySub, d.deploys_spark, HELP.deployed) + ARROW +
+            shipStage(d.green_waiting, 'green waiting', greenCls, greenSub, null, HELP.greenWaiting) + ARROW +
             '<div class="ship-stage" title="' + HELP.lastdep.replace(/"/g, '') + '"><div class="ship-num stamp">' + stamp + '</div>'
               + '<div class="ship-cap">last deploy (CT)</div>'
               + (d.last_deploy_sha ? '<div class="ship-sub">⎇ ' + d.last_deploy_sha + '</div>' : '') + '</div>'
@@ -5545,7 +5583,7 @@ const HELP = {
     prs:       'PULL REQUESTS OPEN - finished work waiting to be reviewed and merged.',
     ciqr:      'CI QUEUED / RUNNING - automated test runs waiting to start, and runs happening now. A growing queued number means you are short on runners.',
     merged:    'MERGED TODAY - pull requests that landed in the main branch today. The little bars are the last seven days, so you can see whether today is normal.',
-    deployed:  'DEPLOYED TODAY - releases that went live today. The little bars are the last seven days.',
+    greenWaiting: 'GREEN WAITING - approved pull requests with every test passing that are not in the merge line yet. Zero is good. If this grows, the line is not being fed.',
     lastdep:   'LAST DEPLOY - when the most recent release went out, in Central Time, and the short code identifying exactly which version it was.',
     maxutil:   'The busiest this graphics card got today, as a percentage.',
 };
