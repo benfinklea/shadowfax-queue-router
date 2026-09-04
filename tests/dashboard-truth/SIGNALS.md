@@ -1,6 +1,6 @@
 # Fleet Monitor truth inventory
 
-The suite treats the dashboard as a claim and reads the underlying system again through a separate path. It never calls the power, reboot, swap-clear, or reset controls. CI scope is exactly `armbrain-io/armbrain` workflow runs created in the last 48 hours: `status=queued` and `status=in_progress`; stale queued runs older than 48 hours are shown separately as orphans and excluded from the queue-depth claim. GitHub verification uses one GraphQL request plus REST core requests, never more than 3 Search API requests and fewer than 15 core requests per run.
+The suite treats the dashboard as a claim and reads the underlying system again through a separate path. It never calls the power, reboot, swap-clear, or reset controls. CI scope is exactly `armbrain-io/armbrain` workflow runs created in the last 48 hours: `status=queued` and `status=in_progress`; stale queued runs older than 48 hours are shown separately as orphans and excluded from the queue-depth claim. GitHub verification uses two GraphQL requests plus REST core requests, never more than 3 Search API requests and fewer than 15 core requests per run.
 
 ## API signals
 
@@ -35,8 +35,9 @@ The suite treats the dashboard as a claim and reads the underlying system again 
 | Shipping: merged-rate box colour | `/api/pipeline.merged_last_hour` integer count | pure renderer fixtures assert 0=pulsing red, 1=red, 2=yellow, and 3/7=green; live box binding uses `merged_last_hour` |
 | Shipping: last merge time | newest `merged_at` among recently closed PRs | direct pulls REST exact timestamp |
 | Shipping: merged seven-day spark | seven Central-Time daily merge buckets | seven-integer shape plus GitHub source availability |
-| Shipping: deployed today, failures, in flight | production `push`/`workflow_dispatch` runs of `gateway-deploy.yml` | direct Actions workflow runs and nonnegative typed counts |
-| Shipping: deploy seven-day spark | successful production deploy workflow runs | seven-integer shape plus GitHub source availability |
+| Shipping: green waiting | oldest 100 open PRs, approved + mergeable, not draft, held, or in the main GraphQL merge queue; same 45-second pipeline cache | count equals list length; re-read each listed PR and queue live; DOM has green waiting and no deployed-today square |
+| Pipeline deployment compatibility fields (not rendered as a square) | production `push`/`workflow_dispatch` runs of `gateway-deploy.yml` | retained deployment counts and seven-day spark schema |
+| Pipeline: deploy seven-day spark (API only) | successful production deploy workflow runs | seven-integer shape plus GitHub source availability |
 | Shipping: last deploy time/SHA | latest successful `deploy` job on main | direct runs and jobs REST, exact SHA/time |
 | Shipping: updated chip/degraded state | `/api/pipeline.generated_at` and auth state | timestamp must parse and be under 10 minutes old |
 | CI card: queued/running workflow runs, active runners, orphans | scoped Actions runs; runner names are ancillary detail from jobs on the first 12 in-progress runs | direct queued/in-progress Actions run counts, bracketed at ±1; schema distinguishes unavailable from zero |
