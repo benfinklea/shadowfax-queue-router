@@ -23,7 +23,7 @@ class GreenWaitingTest(unittest.TestCase):
         prs[4]['mergeable'] = 'UNKNOWN'
         for pr, label in zip(prs[5:9], ['do-not-merge', 'needs-repair', 'hold', 'blocked-on-ben']):
             pr['labels'] = [{'name': label}]
-        queue = {'entries': {'nodes': [{'state': 'QUEUED', 'pullRequest': {'number': 10}}], 'pageInfo': {'hasNextPage': False}}}
+        queue = {'entries': {'nodes': [{'state': 'QUEUED', 'pullRequest': {'number': 10, 'title': 'PR 10'}}], 'pageInfo': {'hasNextPage': False}}}
         self.assertEqual(self.read(prs, queue)[0], [{'number': 1, 'title': 'PR 1'}, {'number': 11, 'title': 'PR 11'}])
 
     def test_only_clean_checks_are_green(self):
@@ -34,12 +34,12 @@ class GreenWaitingTest(unittest.TestCase):
         self.assertEqual(self.read(prs, queue)[0], [{'number': 0, 'title': 'CLEAN'}])
 
     def test_queue_preserves_front_order_and_entry_states(self):
-        entries = [{'state': state, 'pullRequest': {'number': number}}
+        entries = [{'state': state, 'pullRequest': {'number': number, 'title': f'PR {number}'}}
                    for number, state in [(42, 'AWAITING_CHECKS'), (7, 'UNMERGEABLE')]]
         waiting, queue = self.read([], {'entries': {'nodes': entries, 'pageInfo': {'hasNextPage': False}}})
         self.assertEqual(waiting, [])
-        self.assertEqual(queue, [{'number': 42, 'state': 'AWAITING_CHECKS'},
-                                 {'number': 7, 'state': 'UNMERGEABLE'}])
+        self.assertEqual(queue, [{'number': 42, 'title': 'PR 42', 'state': 'AWAITING_CHECKS'},
+                                 {'number': 7, 'title': 'PR 7', 'state': 'UNMERGEABLE'}])
 
     def test_missing_or_truncated_queue_is_not_zero(self):
         for queue in [None, {'entries': {'nodes': [], 'pageInfo': {'hasNextPage': True}}}]:

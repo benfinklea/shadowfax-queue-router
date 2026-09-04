@@ -1,0 +1,41 @@
+{
+  "stages": [
+    "issues open",
+    "prs open",
+    "ci q/run",
+    "green waiting",
+    "in line",
+    "merged today",
+    "last deploy (CT)"
+  ],
+  "thresholds": [
+    {
+      "count": 0,
+      "class": "neutral"
+    },
+    {
+      "count": 1,
+      "class": "ok"
+    },
+    {
+      "count": 2,
+      "class": "ok"
+    },
+    {
+      "count": 3,
+      "class": "warn"
+    },
+    {
+      "count": 5,
+      "class": "warn"
+    },
+    {
+      "count": 6,
+      "class": "hot"
+    },
+    {
+      "count": 9,
+      "class": "hot"
+    }
+  ]
+}

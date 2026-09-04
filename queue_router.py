@@ -3763,7 +3763,7 @@ def _get_shipping_readiness(token):
     owner, name = GITHUB_CI_REPO.split("/")
     query = '''query($owner:String!,$name:String!){
       repository(owner:$owner,name:$name){mergeQueue(branch:"main"){
-        entries(first:100){nodes{state pullRequest{number}} pageInfo{hasNextPage}}
+        entries(first:100){nodes{state pullRequest{number title}} pageInfo{hasNextPage}}
       }}
     }'''
     queue = gh_json(["api", "graphql", "-f", "query=" + query,
@@ -3771,7 +3771,7 @@ def _get_shipping_readiness(token):
     if queue is None or queue["entries"]["pageInfo"]["hasNextPage"]:
         # An absent or truncated queue cannot establish that a PR is not queued.
         raise ValueError("Could not establish the complete main merge queue")
-    queue_prs = [{"number": entry["pullRequest"]["number"], "state": entry["state"]}
+    queue_prs = [{"number": entry["pullRequest"]["number"], "title": entry["pullRequest"]["title"], "state": entry["state"]}
                  for entry in queue["entries"]["nodes"]]
     queued = {entry["number"] for entry in queue_prs}
     # Drafts are unfinished; unapproved PRs still need review; non-MERGEABLE
@@ -3788,6 +3788,31 @@ def _get_shipping_readiness(token):
             and not held.intersection(label["name"].lower() for label in pr["labels"])]
 
     return waiting, queue_prs
+
+
+def _get_merged_today_prs(headers, today):
+    """Return the complete search result in merge-time order, never a partial count."""
+    items = []
+    page = 1
+    while True:
+        r = requests.get("https://api.github.com/search/issues", params={
+            "q": f"repo:{GITHUB_CI_REPO} type:pr merged:>={today}",
+            "per_page": 100, "page": page,
+        }, headers=headers, timeout=8)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("incomplete_results") or data["total_count"] > 1000:
+            raise ValueError("Could not establish complete merged-today search")
+        items.extend(data["items"])
+        if len(items) >= data["total_count"]:
+            break
+        if not data["items"]:
+            raise ValueError("Merged-today search ended before its total")
+        page += 1
+    if len(items) != data["total_count"] or len({p["number"] for p in items}) != len(items):
+        raise ValueError("Merged-today search changed during pagination")
+    items.sort(key=lambda p: p["pull_request"]["merged_at"], reverse=True)
+    return [{"number": p["number"], "title": p["title"]} for p in items]
 
 
 def get_pipeline_status(force_refresh=False):
@@ -3831,7 +3856,8 @@ def get_pipeline_status(force_refresh=False):
                 return r.json().get("total_count", 0)
             result["issues_open"] = search_count(f"repo:{GITHUB_CI_REPO} type:issue state:open")
             result["prs_open"] = search_count(f"repo:{GITHUB_CI_REPO} type:pr state:open")
-            result["merged_today"] = search_count(f"repo:{GITHUB_CI_REPO} type:pr merged:>={today}")
+            result["merged_today_prs"] = _get_merged_today_prs(headers, today)
+            result["merged_today"] = len(result["merged_today_prs"])
             # merged in last 60 minutes
             hour_ago = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
             result["merged_last_hour"] = search_count(f"repo:{GITHUB_CI_REPO} type:pr merged:>={hour_ago}")
@@ -4753,6 +4779,14 @@ padding-right:12px;white-space:nowrap}
 .ship-stage{background:rgba(255,255,255,0.025);border:1px solid #1e2942;border-radius:7px;
 padding:7px 14px;min-width:92px;text-align:center;display:flex;flex-direction:column;
 align-items:center;justify-content:center;gap:2px}
+.ship-stage{position:relative}
+.ship-toggle{position:absolute;right:2px;top:1px;border:0;background:none;color:#c7cee0;cursor:pointer;padding:3px}
+.ship-dropdown{position:absolute;top:100%;right:0;z-index:20;background:#111827;border:1px solid #364563;border-radius:5px;padding:7px;min-width:240px;max-height:280px;overflow:auto;text-align:left;box-shadow:0 5px 15px #0008}
+.ship-dropdown[hidden]{display:none}
+.ship-pr{display:flex;gap:8px;white-space:nowrap;font-size:12px;padding:4px 0;color:#c7cee0}
+.ship-pr a{color:var(--neon-cyan)}
+.ship-pr .ship-sub{font-size:inherit}
+.ship-pr .ship-sub.hot{color:var(--neon-red)}
 .ship-stage.merge-green{border-color:rgba(57,255,20,.8);background:rgba(57,255,20,.09)}
 .ship-stage.merge-yellow{border-color:rgba(255,255,0,.8);background:rgba(255,255,0,.09)}
 .ship-stage.merge-red{border-color:rgba(255,0,68,.85);background:rgba(255,0,68,.09)}
@@ -5173,11 +5207,39 @@ function sparkHtml(vals) {
         '<i style="height:' + Math.max(1, Math.round((v / peak) * 11)) + 'px"></i>').join('') + '</div>';
 }
 
-function shipStage(num, cap, cls, sub, spark, help, stageCls) {
+let openShipDropdown = null;
+function shipEscape(value) {
+    return String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function shipShortTitle(title) {
+    const chars = Array.from(title || '');
+    if (chars.length <= 15) return chars.join('');
+    const cut = chars.slice(0, 15).join('');
+    if (/\s/.test(chars[15])) return cut.trimEnd();
+    const space = cut.lastIndexOf(' ');
+    return space > 0 ? cut.slice(0, space) : cut;
+}
+function toggleShipDropdown(key) {
+    openShipDropdown = openShipDropdown === key ? null : key;
+    document.querySelectorAll('.ship-toggle').forEach(button => {
+        const open = button.dataset.dropdown === openShipDropdown;
+        button.setAttribute('aria-expanded', String(open));
+        button.textContent = open ? '▴' : '▾';
+        document.getElementById(button.getAttribute('aria-controls')).hidden = !open;
+    });
+}
+function shipDropdown(key, prs) {
+    const open = openShipDropdown === key;
+    return '<button type="button" class="ship-toggle" data-dropdown="' + key + '" aria-label="Toggle ' + key.replaceAll('-', ' ') + ' PRs" aria-controls="ship-list-' + key + '" aria-expanded="' + open + '" onclick="toggleShipDropdown(this.dataset.dropdown)">' + (open ? '▴' : '▾') + '</button>'
+        + '<div class="ship-dropdown" id="ship-list-' + key + '"' + (open ? '' : ' hidden') + '>'
+        + prs.map(pr => '<div class="ship-pr" data-pr-number="' + pr.number + '"><a href="https://github.com/armbrain-io/armbrain/pull/' + pr.number + '" target="_blank" rel="noopener">#' + pr.number + '</a><span>' + shipEscape(shipShortTitle(pr.title)) + '</span>'
+            + (key === 'in-line' ? '<span class="ship-sub ' + (pr.state === 'UNMERGEABLE' ? 'hot' : '') + '">' + (pr.state === 'UNMERGEABLE' ? 'stuck' : 'testing') + '</span>' : '') + '</div>').join('') + '</div>';
+}
+function shipStage(num, cap, cls, sub, spark, help, stageCls, dropdownKey, prs) {
     return '<div class="ship-stage ' + (stageCls || '') + '"' + (help ? ' title="' + help.replace(/"/g, '') + '"' : '') + '><div class="ship-num ' + (cls || '') + '">' + num + '</div>'
          + '<div class="ship-cap">' + cap + '</div>'
          + (sub ? '<div class="ship-sub">' + sub + '</div>' : '')
-         + (spark ? sparkHtml(spark) : '') + '</div>';
+         + (spark ? sparkHtml(spark) : '') + (dropdownKey ? shipDropdown(dropdownKey, prs) : '') + '</div>';
 }
 
 function mergedRateClass(count) {
@@ -5227,9 +5289,9 @@ function refreshShipFlow() {
             shipStage(d.issues_open, 'issues open', '', '', null, HELP.issues) + ARROW +
             shipStage(d.prs_open, 'prs open', '', '', null, HELP.prs) + ARROW +
             shipStage(ciNum, 'ci q/run', ciCls, '', null, HELP.ciqr) + ARROW +
-            shipStage(d.green_waiting, 'green waiting', greenCls, greenSub, null, HELP.greenWaiting) + ARROW +
-            shipStage(d.queue_depth, 'in line', queueCls, queueSub, null, HELP.inLine) + ARROW +
-            shipStage(d.merged_today, 'merged today', 'ok', mergedSub, d.merged_spark, HELP.merged, mergedRateClass(d.merged_last_hour)) + ARROW +
+            shipStage(d.green_waiting, 'green waiting', greenCls, greenSub, null, HELP.greenWaiting, '', 'green-waiting', d.green_waiting_prs) + ARROW +
+            shipStage(d.queue_depth, 'in line', queueCls, queueSub, null, HELP.inLine, '', 'in-line', d.queue_prs) + ARROW +
+            shipStage(d.merged_today, 'merged today', 'ok', mergedSub, d.merged_spark, HELP.merged, mergedRateClass(d.merged_last_hour), 'merged-today', d.merged_today_prs) + ARROW +
             '<div class="ship-stage" title="' + HELP.lastdep.replace(/"/g, '') + '"><div class="ship-num stamp">' + stamp + '</div>'
               + '<div class="ship-cap">last deploy (CT)</div>'
               + (d.last_deploy_sha ? '<div class="ship-sub">⎇ ' + d.last_deploy_sha + '</div>' : '') + '</div>';
@@ -6512,7 +6574,7 @@ function startPolling() {
     if (!historyTimer) historyTimer = setInterval(refreshHistory, 60000);
     if (!energyTimer) energyTimer = setInterval(refreshEnergy, 60000);
     if (!ciQueueTimer) ciQueueTimer = setInterval(refreshCiQueue, 45000);        // matches backend cache TTL
-    if (!shipFlowTimer) shipFlowTimer = setInterval(refreshShipFlow, 120000);    // /api/pipeline is cached 5 min
+    if (!shipFlowTimer) shipFlowTimer = setInterval(refreshShipFlow, 60000);     // /api/pipeline is cached 45 seconds
     if (!runsonTimer) runsonTimer = setInterval(refreshRunsOn, 120000);           // matches AWS cache TTL
     if (!routeHealthTimer) routeHealthTimer = setInterval(refreshRouteHealth, 30000);
     if (!fleetStatsTimer) fleetStatsTimer = setInterval(refreshFleetStats, 60000); // matches backend cache TTL

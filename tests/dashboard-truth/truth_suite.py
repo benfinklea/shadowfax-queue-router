@@ -344,6 +344,13 @@ def check_green_waiting(d) -> None:
                            and isinstance(p.get("state"), str) for p in queue_prs))
     emit("PASS" if queue_valid else "FAIL", "pipeline.queue.count",
          d.get("queue_depth"), len(queue_prs) if isinstance(queue_prs, list) else None)
+    merged = d.get("merged_today_prs")
+    merged_valid = (isinstance(merged, list) and type(d.get("merged_today")) is int
+                    and d["merged_today"] == len(merged)
+                    and all(isinstance(p, dict) and type(p.get("number")) is int
+                            and isinstance(p.get("title"), str) for p in merged))
+    emit("PASS" if merged_valid else "FAIL", "pipeline.merged_today.count",
+         d.get("merged_today"), len(merged) if isinstance(merged, list) else None)
     waiting = d.get("green_waiting_prs")
     valid = (isinstance(waiting, list) and type(d.get("green_waiting")) is int
              and d["green_waiting"] == len(waiting)
@@ -361,12 +368,12 @@ def check_green_waiting(d) -> None:
             '{state isDraft reviewDecision mergeable mergeStateStatus labels(first:100){nodes{name} pageInfo{hasNextPage}}}'
             for p in waiting)
         query = ('{repository(owner:"armbrain-io",name:"armbrain"){' + fields +
-                 ' mergeQueue(branch:"main"){entries(first:100){nodes{state pullRequest{number}} pageInfo{hasNextPage}}}}}')
+                 ' mergeQueue(branch:"main"){entries(first:100){nodes{state pullRequest{number title}} pageInfo{hasNextPage}}}}}')
         live = gh_json(["graphql", "-f", "query=" + query])["data"]["repository"]
         queue = live["mergeQueue"]
         if queue is None or queue["entries"]["pageInfo"]["hasNextPage"]:
             raise ValueError("could not establish complete main merge queue")
-        live_prs = [{"number": p["pullRequest"]["number"], "state": p["state"]}
+        live_prs = [{"number": p["pullRequest"]["number"], "title": p["pullRequest"]["title"], "state": p["state"]}
                     for p in queue["entries"]["nodes"]]
         emit("PASS" if queue_valid and queue_prs == live_prs else "FAIL", "pipeline.queue.live",
              {"queue_depth": d.get("queue_depth"), "queue_prs": queue_prs},
