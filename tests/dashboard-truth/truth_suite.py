@@ -527,6 +527,30 @@ def check_local_sources() -> None:
         emit("WARN", "fleet_stats.runners_total", "unavailable", "GitHub runner API unavailable")
 
 
+def check_runson_runner_history() -> None:
+    r = api.get("runson", {})
+    if not r.get("available") or not r.get("deployed"):
+        emit("SKIP", "runson.runner_history", r.get("error"), "available deployed RunsOn required")
+        return
+    raw = r.get("live_runners_series")
+    smooth = r.get("live_runners_smoothed")
+    try:
+        expected = [{"ts": p["ts"], "n": sum(x["n"] for x in raw[max(0, i-2):i+3])
+                     / len(raw[max(0, i-2):i+3])} for i, p in enumerate(raw)]
+        times = [dt.datetime.fromisoformat(p["ts"]) for p in raw]
+        ok = (bool(raw) and len(smooth) == len(expected)
+              and raw[-1]["n"] == r["live_runners"]
+              and times == sorted(set(times))
+              and (times[-1] - times[0]).total_seconds() <= 3600
+              and all(a["ts"] == b["ts"] and abs(a["n"] - b["n"]) < 1e-9
+                      for a, b in zip(smooth, expected)))
+    except (TypeError, KeyError, ValueError, IndexError):
+        ok = False
+    emit("PASS" if ok else "FAIL", "runson.runner_history",
+         {"raw": raw, "smoothed": smooth},
+         "centered 5-sample mean with shrinking edges; newest raw equals live_runners; 60-minute ring")
+
+
 def check_runson_gate() -> None:
     claim = api.get("runson", {}).get("gate_shards")
     cp = run(["gh", "variable", "list", "-R", "armbrain-io/armbrain", "--json", "name,value"], timeout=30)
@@ -914,6 +938,7 @@ def run_truth_pass():
     check_models()
     check_pipeline()
     check_runson_gate()
+    check_runson_runner_history()
     check_local_sources()
     check_rendering()
     return [r for r in results if r["level"] == "FAIL"]

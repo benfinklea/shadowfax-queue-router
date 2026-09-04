@@ -685,6 +685,12 @@ def init_db():
             credits REAL NOT NULL CHECK (credits >= 0)
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS runson_runner_samples (
+            ts TEXT PRIMARY KEY,
+            live_runners INTEGER NOT NULL CHECK (live_runners >= 0)
+        )
+    """)
     conn.executemany(
         "INSERT OR IGNORE INTO runson_credit_samples(ts, credits) VALUES (?, ?)",
         RUNSON_CREDIT_ANCHORS,
@@ -1933,11 +1939,8 @@ RUNSON_WARM_INTERVAL = 60   # seconds between background warm passes
 # dashboard would be roughly 980 passes a day of billed reads for nobody. After this
 # long with no reader the loop idles, and the next reader re-arms it.
 RUNSON_WARM_IDLE_AFTER = 20 * 60  # seconds
-# A warm pass only pays for itself if the snapshot would otherwise go stale before
-# the next one. Without this the loop refetched every 60s even right after a reader's
-# own background refresh had just landed - a full ~4,600-row DynamoDB pass per minute
-# for a snapshot that was already good (caught in review, Elrond 2026-09-04).
-RUNSON_WARM_MIN_AGE = RUNSON_CACHE_TTL - RUNSON_WARM_INTERVAL
+# Watched dashboards now need one real observation every minute for the runner
+# sparkline, even when the 120-second API snapshot is still fresh.
 runson_last_read_at = 0.0
 RUNSON_AWS_PROFILE = "armbrain-readonly"  # fleet-runson-observer IAM user in the rebuilt account (council 2026-09-02); files under ~/.config/fleet/aws
 RUNSON_AWS_ACCOUNT_ID = "930358782508"  # rebuilt account resolved by that profile
@@ -2418,7 +2421,34 @@ def _runson_fetch():
     return result
 
 
+def _smooth_runson_runners(series):
+    # Centered 5-sample (~5-minute) moving average; shrink windows at both edges.
+    return [{"ts": point["ts"],
+             "n": sum(p["n"] for p in series[max(0, i - 2):i + 3])
+                  / len(series[max(0, i - 2):i + 3])}
+            for i, point in enumerate(series)]
+
+
+def _record_runson_runners(count, sampled_at):
+    """SQLite-backed 60-minute ring, like the credit samples; never invent history."""
+    now = sampled_at.astimezone(timezone.utc)
+    with sqlite3.connect(CONFIG["db_path"]) as conn:
+        conn.execute("DELETE FROM runson_runner_samples WHERE ts < ?",
+                     ((now - timedelta(minutes=60)).isoformat(),))
+        conn.execute("INSERT OR REPLACE INTO runson_runner_samples VALUES (?, ?)",
+                     (now.isoformat(), count))
+        rows = conn.execute("SELECT ts, live_runners FROM runson_runner_samples "
+                            "WHERE ts <= ? ORDER BY ts", (now.isoformat(),)).fetchall()
+    return [{"ts": ts, "n": n} for ts, n in rows]
+
+
 def _runson_store(result):
+    if result.get("available") and "live_runners" in result:
+        series = _record_runson_runners(result["live_runners"], datetime.now(timezone.utc))
+        result = {**result, "live_runners_series": series,
+                  "live_runners_smoothed": _smooth_runson_runners(series)}
+    else:
+        result = {**result, "live_runners_series": [], "live_runners_smoothed": []}
     with runson_cache_lock:
         runson_cache["data"] = result
         runson_cache["ts"] = time.time()
@@ -2577,14 +2607,14 @@ def _runson_should_warm():
 
 def runson_warm_loop():
     """Keep the RunsOn snapshot warm for as long as anyone is reading the card."""
+    next_sample = time.monotonic() + RUNSON_WARM_INTERVAL
     while True:
-        time.sleep(RUNSON_WARM_INTERVAL)
+        time.sleep(max(0, next_sample - time.monotonic()))
+        next_sample = max(next_sample + RUNSON_WARM_INTERVAL, time.monotonic())
         if not _runson_should_warm():
             continue
         try:
             with runson_refresh_lock:
-                if _runson_snapshot_age() < RUNSON_WARM_MIN_AGE:
-                    continue   # a reader's own refresh already landed; do not pay twice
                 _runson_store(_runson_fetch())
         except Exception:
             logger.exception("runson warm pass failed; will retry")
@@ -4752,6 +4782,9 @@ text-transform:uppercase;color:#c7cee0;margin-top:4px}
 #runson-card .runson-total{display:inline-grid;width:max-content}
 #runson-card .runson-count{font-size:1.15em;line-height:1.05;text-align:right}
 #runson-card .runson-label{font-size:.68em;margin-top:2px;line-height:1.1}
+/* The count row shares the label's width; its number stays at the right edge. */
+#runson-card .runson-count{display:flex;align-items:center;justify-content:flex-end;gap:6px;color:var(--neon-cyan)}
+#runson-card .runson-count .runson-live-spark{flex:1 1 60px;min-width:60px;width:0;height:1.05em;overflow:visible}
 #runson-card .runson-runners{gap:3px;margin-top:2px}
 #runson-card .runson-runner{padding:0 5px;font-size:.6em}
 #runson-card .runson-runners-details{margin-top:2px}
@@ -6283,6 +6316,26 @@ function runsonDailySpendChart(rows) {
         + '<line x1="0" y1="68" x2="300" y2="68" stroke="#30394f"/>' + bars + '</svg>';
 }
 
+function runsonLiveSpark(series) {
+    if (!series || series.length < 2) return '';
+    // shipStage's sparkHtml is a bar chart; use the credits chart's SVG approach.
+    const times = series.map(p => Date.parse(p.ts));
+    const values = series.map(p => Number(p.n));
+    if (!times.every(Number.isFinite) || !values.every(Number.isFinite)) return '';
+    const end = times[times.length - 1];
+    const low = Math.min(...values), span = Math.max(...values) - low;
+    const points = values.map((n, i) => [
+        2 + 96 * (times[i] - (end - 3600000)) / 3600000,
+        span ? 18 - 16 * (n - low) / span : 10
+    ]);
+    const last = points[points.length - 1];
+    const tip = 'Live RunsOn machines, last 60 minutes, smoothed with a 5-minute moving average.';
+    return '<svg class="runson-live-spark" viewBox="0 0 100 20" preserveAspectRatio="none" role="img" aria-label="' + tip + '">'
+        + '<title>' + tip + '</title><polyline points="' + points.map(p => p.join(',')).join(' ')
+        + '" fill="none" stroke="currentColor" stroke-width="1.5" vector-effect="non-scaling-stroke"/>'
+        + '<circle cx="' + last[0] + '" cy="' + last[1] + '" r="2" fill="currentColor" opacity=".4"/></svg>';
+}
+
 function runsonCreditsChart(runway, remaining, compact) {
     const samples = ((runway || {}).samples || []).filter(p =>
         Number.isFinite(Number(p.credits)) && Number.isFinite(Date.parse(p.ts)));
@@ -6391,7 +6444,7 @@ function refreshRunsOn() {
             + '<span class="runson-runway">' + runwayCaption + '</span></div>'
             + runsonCreditsChart(d.credits_runway, d.credits_remaining, true) + '</div></div>';
         body.innerHTML = '<div class="runson-grid">'
-            + '<div class="runson-live"><div class="runson-total"><div class="runson-count' + (count === 0 ? ' zero' : '') + '">' + count + '</div>'
+            + '<div class="runson-live"><div class="runson-total"><div class="runson-count' + (count === 0 ? ' zero' : '') + '\">' + runsonLiveSpark(d.live_runners_smoothed) + '<span>' + count + '</span></div>'
             + '<div class="runson-label">live runners</div></div>' + (count === 0 ? '' : runnerDetail) + '</div>'
             + (function(){
                 var tried = Number(d.jobs_today || 0);
