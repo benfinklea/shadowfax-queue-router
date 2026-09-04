@@ -1943,8 +1943,8 @@ RUNSON_AWS_TIMEOUT = 12
 RUNSON_STACK_NAME = "runs-on"
 RUNSON_WORKFLOW_JOBS_TABLE = "runs-on-workflow-jobs"
 RUNSON_COST_CACHE_TTL = 6 * 60 * 60  # CE calls cost money; never fetch more than four times/day.
-RUNSON_DAILY_BUDGET_USD = 10.0
-RUNSON_MONTHLY_GUARD_USD = 25.0
+RUNSON_DAILY_BUDGET_USD = 15.0
+RUNSON_MONTHLY_GUARD_USD = 350.0
 RUNSON_CREDIT_BURN_BUDGET_USD = 60.0
 RUNSON_CREDIT_ANCHORS = (
     ("2026-08-30T02:00:00+00:00", 139.75),  # Aug 29 evening CT
@@ -6261,7 +6261,7 @@ function refreshRunsOn() {
         // Band 1: live runners, jobs, trial clock, credits on one line.
         // Band 2: the spend column (today/month + fuse bars; the truth suite reads
         // it by id) beside the two charts.
-        const dailyLimit = Number(limits.daily || 10), monthlyLimit = Number(limits.monthly_guard || 25);
+        const dailyLimit = Number(limits.daily || 15), monthlyLimit = Number(limits.monthly_guard || 350);
         const budgetStrip = '<div class="runson-budget" id="runson-budget-strip">'
             + '<div class="runson-spend"><strong id="runson-spent-today">' + runsonMoney(d.spent_today)
             + '</strong><small>Spent today · $' + dailyLimit.toFixed(0) + ' fuse</small></div>'
