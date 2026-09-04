@@ -9,11 +9,27 @@ These tests replace the AWS read with a fake and assert the contract that makes
 that impossible: a reader gets whatever is cached, immediately, and the refresh
 happens behind it.
 """
+import datetime
+import os
+import shutil
+import tempfile
 import threading
 import time
 import unittest
 
 import queue_router as qr
+
+
+def _await_idle_refresh(timeout=5.0):
+    """Block until no background runson refresh is in flight.
+
+    The refresh gate is the only observable handle on the worker thread, so a case
+    that starts one must wait for it here or its snapshot lands inside the next case.
+    """
+    deadline = time.time() + timeout
+    while qr.runson_refresh_lock.locked() and time.time() < deadline:
+        time.sleep(0.02)
+    return not qr.runson_refresh_lock.locked()
 
 
 class RunsonCacheTest(unittest.TestCase):
@@ -27,8 +43,17 @@ class RunsonCacheTest(unittest.TestCase):
             qr.runson_cache["ts"] = 0.0
 
     def tearDown(self):
-        qr._runson_fetch = self._real_fetch
+        # Release the slow fetch, then WAIT for any background refresh to actually
+        # finish before the next case starts. Without the wait, a worker left running
+        # by an earlier case lands its own snapshot into the shared cache partway
+        # through the next one - which is exactly how
+        # test_refresh_gate_is_released_after_a_normal_background_pass intermittently
+        # saw marker 'slow' where it had just stored 'bg'. Caught 2026-09-04 running
+        # the module directly rather than through discover, which happened to order
+        # the cases differently.
         self.release.set()
+        _await_idle_refresh()
+        qr._runson_fetch = self._real_fetch
         with qr.runson_cache_lock:
             qr.runson_cache["data"] = None
             qr.runson_cache["ts"] = 0.0
@@ -195,6 +220,7 @@ class ReviewFindingsTest(unittest.TestCase):
         self.calls = []
 
     def tearDown(self):
+        _await_idle_refresh()
         qr._runson_fetch = self._real_fetch
         qr.runson_last_read_at = 0.0
         if qr.runson_refresh_lock.locked():
@@ -316,3 +342,87 @@ class CreditsErrorVisibilityTest(unittest.TestCase):
         self.assertIn('credits_error = r.get("credits_error")', suite)
         self.assertIn('"credits_error"', suite.split("credits_runway")[1][:200],
                       "credits_error is not in the render_state required-key list")
+
+
+class CostErrorVisibilityTest(unittest.TestCase):
+    """Second 136p instance: a Cost Explorer failure must carry its reason.
+
+    All three return paths of _runson_ce_cost_data_unlocked used to hand back a
+    bare None, so a denied ce:GetCostAndUsage, a Cost Explorer that was never
+    enabled, and a local sqlite failure were indistinguishable - each simply
+    became cost_source="credits". The path runs once per six hours because CE
+    calls cost money, so a silent fallback could sit there for a long time.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="runson-cost-test-")
+        self.db = os.path.join(self.tmp, "test.db")
+        self._real_db = qr.CONFIG["db_path"]
+        self._real_aws = qr._runson_aws_json
+        qr.CONFIG["db_path"] = self.db
+        qr.init_db()
+        self.today = datetime.date(2026, 9, 4)
+
+    def tearDown(self):
+        qr.CONFIG["db_path"] = self._real_db
+        qr._runson_aws_json = self._real_aws
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_a_denied_cost_explorer_read_returns_its_reason(self):
+        qr._runson_aws_json = lambda args, region: (None, "access_denied")
+        data, error = qr._runson_ce_cost_data(self.today, None)
+        self.assertIsNone(data)
+        self.assertEqual(error, "access_denied")
+
+    def test_the_reason_survives_the_six_hour_cache(self):
+        """A reader arriving inside the cache window still learns why, not just that
+        there is no data - the old code cached an empty payload and forgot."""
+        qr._runson_aws_json = lambda args, region: (None, "access_denied")
+        qr._runson_ce_cost_data(self.today, None)
+
+        def _explode(args, region):
+            raise AssertionError("the cached window must not re-probe AWS")
+
+        qr._runson_aws_json = _explode
+        data, error = qr._runson_ce_cost_data(self.today, None)
+        self.assertIsNone(data)
+        self.assertEqual(error, "access_denied", "the cached failure lost its reason")
+
+    def test_a_successful_read_reports_no_error(self):
+        def _ok(args, region):
+            if args[0] == "ce":
+                return {"ResultsByTime": [
+                    {"TimePeriod": {"Start": self.today.isoformat()},
+                     "Total": {"UnblendedCost": {"Amount": "1.25"}}}
+                ]}, None
+            return None, "access_denied"
+
+        qr._runson_aws_json = _ok
+        data, error = qr._runson_ce_cost_data(self.today, None)
+        self.assertIsNone(error)
+        self.assertIsNotNone(data)
+        self.assertEqual(data["spent_today"], 1.25)
+
+    def test_the_payload_carries_cost_error_next_to_cost_source(self):
+        import pathlib
+        source = (pathlib.Path(__file__).resolve().parent.parent / "queue_router.py").read_text()
+        self.assertIn('"cost_error": cost_error or None,', source)
+        source_at = source.index('"cost_source": "cost_explorer" if ce_costs else "credits",')
+        error_at = source.index('"cost_error": cost_error or None,')
+        self.assertLess(abs(error_at - source_at), 400, "cost_error drifted away from cost_source")
+
+    def test_a_local_cache_failure_is_named_rather_than_blamed_on_aws(self):
+        import pathlib
+        source = (pathlib.Path(__file__).resolve().parent.parent / "queue_router.py").read_text()
+        self.assertIn('ce_costs, cost_error = None, f"cost_cache_{type(e).__name__}"', source)
+
+    def test_the_truth_suite_reports_a_failing_cost_read(self):
+        import pathlib
+        suite = (pathlib.Path(__file__).resolve().parent / "dashboard-truth" / "truth_suite.py").read_text()
+        self.assertIn('"runson.cost_read"', suite)
+        self.assertIn('cost_error = r.get("cost_error")', suite)
+        self.assertIn('"cost_error",', suite, "cost_error is not in the render_state required-key list")
+        # The pre-existing fallback probe must have been taught the new signature,
+        # or it silently reads a truthy tuple as a successful CE read.
+        self.assertIn("ce, ce_error = q._runson_ce_cost_data(", suite)
+        self.assertIn('fallback_result.get("ce_error") == "access_denied"', suite)
