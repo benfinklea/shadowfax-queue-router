@@ -12,7 +12,7 @@ class GreenWaitingTest(unittest.TestCase):
         replies = [subprocess.CompletedProcess([], 0, json.dumps(prs)),
                    subprocess.CompletedProcess([], 0, json.dumps({'data': {'repository': {'mergeQueue': queue}}}))]
         with patch.object(qr.subprocess, 'run', side_effect=replies):
-            return qr._get_green_waiting('test-token')
+            return qr._get_shipping_readiness('test-token')
 
     def test_exclusions_and_oldest_order(self):
         base = dict(isDraft=False, reviewDecision='APPROVED', mergeable='MERGEABLE', mergeStateStatus='CLEAN', labels=[])
@@ -23,15 +23,23 @@ class GreenWaitingTest(unittest.TestCase):
         prs[4]['mergeable'] = 'UNKNOWN'
         for pr, label in zip(prs[5:9], ['do-not-merge', 'needs-repair', 'hold', 'blocked-on-ben']):
             pr['labels'] = [{'name': label}]
-        queue = {'entries': {'nodes': [{'pullRequest': {'number': 10}}], 'pageInfo': {'hasNextPage': False}}}
-        self.assertEqual(self.read(prs, queue), [{'number': 1, 'title': 'PR 1'}, {'number': 11, 'title': 'PR 11'}])
+        queue = {'entries': {'nodes': [{'state': 'QUEUED', 'pullRequest': {'number': 10}}], 'pageInfo': {'hasNextPage': False}}}
+        self.assertEqual(self.read(prs, queue)[0], [{'number': 1, 'title': 'PR 1'}, {'number': 11, 'title': 'PR 11'}])
 
     def test_only_clean_checks_are_green(self):
         prs = [dict(number=i, title=state, isDraft=False, reviewDecision='APPROVED',
                     mergeable='MERGEABLE', mergeStateStatus=state, labels=[])
                for i, state in enumerate(['CLEAN', 'BLOCKED', 'UNSTABLE', 'UNKNOWN', 'BEHIND'])]
         queue = {'entries': {'nodes': [], 'pageInfo': {'hasNextPage': False}}}
-        self.assertEqual(self.read(prs, queue), [{'number': 0, 'title': 'CLEAN'}])
+        self.assertEqual(self.read(prs, queue)[0], [{'number': 0, 'title': 'CLEAN'}])
+
+    def test_queue_preserves_front_order_and_entry_states(self):
+        entries = [{'state': state, 'pullRequest': {'number': number}}
+                   for number, state in [(42, 'AWAITING_CHECKS'), (7, 'UNMERGEABLE')]]
+        waiting, queue = self.read([], {'entries': {'nodes': entries, 'pageInfo': {'hasNextPage': False}}})
+        self.assertEqual(waiting, [])
+        self.assertEqual(queue, [{'number': 42, 'state': 'AWAITING_CHECKS'},
+                                 {'number': 7, 'state': 'UNMERGEABLE'}])
 
     def test_missing_or_truncated_queue_is_not_zero(self):
         for queue in [None, {'entries': {'nodes': [], 'pageInfo': {'hasNextPage': True}}}]:
@@ -39,7 +47,7 @@ class GreenWaitingTest(unittest.TestCase):
                 self.read([], queue)
 
     def test_empty_queue_and_prs_is_zero(self):
-        self.assertEqual(self.read([], {'entries': {'nodes': [], 'pageInfo': {'hasNextPage': False}}}), [])
+        self.assertEqual(self.read([], {'entries': {'nodes': [], 'pageInfo': {'hasNextPage': False}}}), ([], []))
 
 
 if __name__ == '__main__':

@@ -1,4 +1,5 @@
 """Headless shipping capture: python green-waiting-dom.py PAYLOAD_JSON OUTPUT_DIR."""
+import base64
 import json
 import re
 import sys
@@ -27,11 +28,14 @@ with sync_playwright() as p:
     page.evaluate('refreshShipFlow()')
     page.wait_for_selector('.ship-stage')
     stages = page.locator('.ship-cap').all_text_contents()
-    assert 'green waiting' in stages and 'deployed today' not in stages, stages
+    assert stages == ['issues open', 'prs open', 'ci q/run', 'green waiting', 'in line', 'merged today', 'last deploy (CT)'], stages
     assert page.locator('.ship-arrow').count() == len(stages) - 1
     assert 'updated' not in page.locator('#ship-flow').inner_text().lower()
     assert page.locator('.ship-updated').count() == 0
     assert 'every required test passing' in page.locator('.ship-stage').filter(has=page.locator('.ship-cap', has_text='green waiting')).get_attribute('title')
+    logo = 'data:image/svg+xml;base64,' + base64.b64encode((root / 'armbrain-logo.svg').read_bytes()).decode()
+    page.locator('.ship-logo').evaluate('(el, src) => { el.src = src; }', logo)
+    page.wait_for_function('document.querySelector(".ship-logo").complete')
     out.joinpath('shipping.html').write_text(page.locator('#ship-flow').evaluate('(el)=>el.outerHTML'))
     page.locator('#ship-flow').screenshot(path=str(out / 'shipping.png'))
     checks = []
@@ -43,6 +47,22 @@ with sync_playwright() as p:
         assert stage.locator('.ship-sub').all_text_contents() == (['#123'] if n else [])
         assert stage.locator('.ship-spark').count() == 0
         checks.append({'count': n, 'class': expected or 'neutral'})
+    queue_checks = []
+    for entries, expected, subtitle in [
+        ([], 'hot', []),
+        ([{'number': 42, 'state': 'AWAITING_CHECKS'}], 'warn', ['#42']),
+        ([{'number': 42, 'state': 'AWAITING_CHECKS'}, {'number': 7, 'state': 'QUEUED'}], 'ok', ['#42']),
+        ([{'number': 42, 'state': 'AWAITING_CHECKS'}, {'number': 7, 'state': 'UNMERGEABLE'}], 'hot', ['#7 stuck']),
+        ([{'number': 7, 'state': 'UNMERGEABLE'}], 'hot', ['#7 stuck']),
+    ]:
+        page.evaluate('(entries)=>{window.payload={...window.payload,queue_depth:entries.length,queue_prs:entries};refreshShipFlow();}', entries)
+        stage = page.locator('.ship-stage').filter(has=page.locator('.ship-cap', has_text='in line'))
+        assert stage.locator('.ship-num').get_attribute('class') == 'ship-num ' + expected
+        assert stage.locator('.ship-num').inner_text() == str(len(entries))
+        assert stage.locator('.ship-sub').all_text_contents() == subtitle
+        assert stage.get_attribute('title') == 'IN LINE - pull requests the merge queue is testing right now. Two is full and good. Zero means nothing is being merged.'
+        queue_checks.append({'entries': entries, 'class': expected, 'subtitle': subtitle})
+    out.joinpath('queue-checks.json').write_text(json.dumps(queue_checks, indent=2))
     out.joinpath('dom-checks.json').write_text(json.dumps({'stages': stages, 'thresholds': checks}, indent=2))
     print(json.dumps({'stages': stages, 'thresholds': checks}))
     browser.close()

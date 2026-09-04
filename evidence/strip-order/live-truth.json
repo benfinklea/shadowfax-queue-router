@@ -1,0 +1,48 @@
+[
+  {
+    "level": "PASS",
+    "signal": "pipeline.queue.count",
+    "dashboard": 0,
+    "instrument": 0,
+    "detail": ""
+  },
+  {
+    "level": "PASS",
+    "signal": "pipeline.green_waiting.count",
+    "dashboard": 2,
+    "instrument": 2,
+    "detail": ""
+  },
+  {
+    "level": "PASS",
+    "signal": "pipeline.queue.live",
+    "dashboard": {
+      "queue_depth": 0,
+      "queue_prs": []
+    },
+    "instrument": {
+      "queue_depth": 0,
+      "queue_prs": []
+    },
+    "detail": "live main merge queue in front-entry order; cache churn may fail"
+  },
+  {
+    "level": "PASS",
+    "signal": "pipeline.green_waiting.live",
+    "dashboard": [
+      {
+        "number": 6840,
+        "title": "fix(billing): restore checkout after beta closes (#6782)"
+      },
+      {
+        "number": 6948,
+        "title": "fix(gates): classify blocking reviews by SHA in the human-decision receipt"
+      }
+    ],
+    "instrument": {
+      "invalid_prs": [],
+      "queued": []
+    },
+    "detail": "live OPEN + not draft + APPROVED + MERGEABLE + CLEAN + not held + not queued; cache churn may fail"
+  }
+]

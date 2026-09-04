@@ -1,0 +1,50 @@
+{
+  "available": true,
+  "repo": "armbrain-io/armbrain",
+  "generated_at": "2026-09-04T21:12:55.391594+00:00",
+  "green_waiting_prs": [
+    {
+      "number": 6840,
+      "title": "fix(billing): restore checkout after beta closes (#6782)"
+    },
+    {
+      "number": 6948,
+      "title": "fix(gates): classify blocking reviews by SHA in the human-decision receipt"
+    }
+  ],
+  "queue_prs": [],
+  "queue_depth": 0,
+  "green_waiting": 2,
+  "issues_open": 341,
+  "prs_open": 130,
+  "merged_today": 30,
+  "merged_last_hour": 0,
+  "last_merge_at": "2026-09-04T19:52:06Z",
+  "merged_spark": [
+    42,
+    64,
+    48,
+    83,
+    67,
+    47,
+    30
+  ],
+  "ci_queued": 7,
+  "ci_running": 1,
+  "deploys_spark": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    6
+  ],
+  "deploys_ok_today": 6,
+  "deploys_failed_today": 0,
+  "deploys_in_flight": 1,
+  "deploy_started_min": 69,
+  "last_deploy_at": "2026-09-04T19:17:07Z",
+  "last_deploy_sha": "5d90ba9f8",
+  "degraded": false
+}

@@ -337,6 +337,13 @@ def gh_json(args: list[str]):
 
 
 def check_green_waiting(d) -> None:
+    queue_prs = d.get("queue_prs")
+    queue_valid = (isinstance(queue_prs, list) and type(d.get("queue_depth")) is int
+                   and d["queue_depth"] == len(queue_prs)
+                   and all(isinstance(p, dict) and type(p.get("number")) is int
+                           and isinstance(p.get("state"), str) for p in queue_prs))
+    emit("PASS" if queue_valid else "FAIL", "pipeline.queue.count",
+         d.get("queue_depth"), len(queue_prs) if isinstance(queue_prs, list) else None)
     waiting = d.get("green_waiting_prs")
     valid = (isinstance(waiting, list) and type(d.get("green_waiting")) is int
              and d["green_waiting"] == len(waiting)
@@ -354,12 +361,18 @@ def check_green_waiting(d) -> None:
             '{state isDraft reviewDecision mergeable mergeStateStatus labels(first:100){nodes{name} pageInfo{hasNextPage}}}'
             for p in waiting)
         query = ('{repository(owner:"armbrain-io",name:"armbrain"){' + fields +
-                 ' mergeQueue(branch:"main"){entries(first:100){nodes{pullRequest{number}} pageInfo{hasNextPage}}}}}')
+                 ' mergeQueue(branch:"main"){entries(first:100){nodes{state pullRequest{number}} pageInfo{hasNextPage}}}}}')
         live = gh_json(["graphql", "-f", "query=" + query])["data"]["repository"]
         queue = live["mergeQueue"]
         if queue is None or queue["entries"]["pageInfo"]["hasNextPage"]:
             raise ValueError("could not establish complete main merge queue")
-        queued = {p["pullRequest"]["number"] for p in queue["entries"]["nodes"]}
+        live_prs = [{"number": p["pullRequest"]["number"], "state": p["state"]}
+                    for p in queue["entries"]["nodes"]]
+        emit("PASS" if queue_valid and queue_prs == live_prs else "FAIL", "pipeline.queue.live",
+             {"queue_depth": d.get("queue_depth"), "queue_prs": queue_prs},
+             {"queue_depth": len(live_prs), "queue_prs": live_prs},
+             "live main merge queue in front-entry order; cache churn may fail")
+        queued = {p["number"] for p in live_prs}
         invalid = []
         for pr in waiting:
             current = live.get(f'p{pr["number"]}')
@@ -375,6 +388,7 @@ def check_green_waiting(d) -> None:
              "live OPEN + not draft + APPROVED + MERGEABLE + CLEAN + not held + not queued; cache churn may fail")
     except Exception as exc:
         emit("FAIL", "pipeline.green_waiting.live", waiting, "could not establish", str(exc))
+        emit("FAIL", "pipeline.queue.live", queue_prs, "could not establish", str(exc))
 
 
 def check_pipeline() -> None:
