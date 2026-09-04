@@ -4748,7 +4748,9 @@ text-transform:uppercase;color:#c7cee0;margin-top:4px}
    band 2 = spend today/month with fuse bars as a column beside the two charts, chart captions folded into the title line. */
 #runson-card .runson-grid{display:flex;flex-wrap:wrap;gap:4px 16px;align-items:flex-start}
 #runson-card .runson-live{min-width:0;display:flex;flex-direction:column}
-#runson-card .runson-count{font-size:1.15em;line-height:1.05}
+/* Keep the count aligned to its label even when the runner details are wider. */
+#runson-card .runson-total{display:inline-grid;width:max-content}
+#runson-card .runson-count{font-size:1.15em;line-height:1.05;text-align:right}
 #runson-card .runson-label{font-size:.68em;margin-top:2px;line-height:1.1}
 #runson-card .runson-runners{gap:3px;margin-top:2px}
 #runson-card .runson-runner{padding:0 5px;font-size:.6em}
@@ -6389,8 +6391,8 @@ function refreshRunsOn() {
             + '<span class="runson-runway">' + runwayCaption + '</span></div>'
             + runsonCreditsChart(d.credits_runway, d.credits_remaining, true) + '</div></div>';
         body.innerHTML = '<div class="runson-grid">'
-            + '<div class="runson-live"><div class="runson-count' + (count === 0 ? ' zero' : '') + '">' + count + '</div>'
-            + '<div class="runson-label">live runners</div>' + (count === 0 ? '' : runnerDetail) + '</div>'
+            + '<div class="runson-live"><div class="runson-total"><div class="runson-count' + (count === 0 ? ' zero' : '') + '">' + count + '</div>'
+            + '<div class="runson-label">live runners</div></div>' + (count === 0 ? '' : runnerDetail) + '</div>'
             + (function(){
                 var tried = Number(d.jobs_today || 0);
                 var doneKnown = (d.jobs_done !== null && d.jobs_done !== undefined);
