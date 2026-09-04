@@ -1930,6 +1930,11 @@ RUNSON_WARM_INTERVAL = 60   # seconds between background warm passes
 # dashboard would be roughly 980 passes a day of billed reads for nobody. After this
 # long with no reader the loop idles, and the next reader re-arms it.
 RUNSON_WARM_IDLE_AFTER = 20 * 60  # seconds
+# A warm pass only pays for itself if the snapshot would otherwise go stale before
+# the next one. Without this the loop refetched every 60s even right after a reader's
+# own background refresh had just landed - a full ~4,600-row DynamoDB pass per minute
+# for a snapshot that was already good (caught in review, Elrond 2026-09-04).
+RUNSON_WARM_MIN_AGE = RUNSON_CACHE_TTL - RUNSON_WARM_INTERVAL
 runson_last_read_at = 0.0
 RUNSON_AWS_PROFILE = "armbrain-readonly"  # fleet-runson-observer IAM user in the rebuilt account (council 2026-09-02); files under ~/.config/fleet/aws
 RUNSON_AWS_ACCOUNT_ID = "930358782508"  # rebuilt account resolved by that profile
@@ -2411,7 +2416,15 @@ def _runson_refresh_async():
             logger.exception("runson background refresh failed; keeping the previous snapshot")
         finally:
             runson_refresh_lock.release()
-    threading.Thread(target=_worker, name="runson-refresh", daemon=True).start()
+    try:
+        threading.Thread(target=_worker, name="runson-refresh", daemon=True).start()
+    except Exception:
+        # The gate is held but _worker will never run, so its finally can never
+        # release it. Left alone, every later blocking reader waits forever on a
+        # lock nobody owns (caught in review, Elrond 2026-09-04).
+        runson_refresh_lock.release()
+        logger.exception("could not start the runson refresh thread; released the refresh gate")
+        return False
     return True
 
 
@@ -2452,6 +2465,13 @@ def get_runson_status(force_refresh=False):
         return _runson_annotate(_runson_refresh_locked(), time.time())
 
 
+def _runson_snapshot_age():
+    with runson_cache_lock:
+        if runson_cache["data"] is None:
+            return float("inf")
+        return max(0.0, time.time() - runson_cache["ts"])
+
+
 def _runson_should_warm():
     """True while the card still has a reader worth warming for."""
     with runson_cache_lock:
@@ -2467,6 +2487,8 @@ def runson_warm_loop():
             continue
         try:
             with runson_refresh_lock:
+                if _runson_snapshot_age() < RUNSON_WARM_MIN_AGE:
+                    continue   # a reader's own refresh already landed; do not pay twice
                 _runson_store(_runson_fetch())
         except Exception:
             logger.exception("runson warm pass failed; will retry")

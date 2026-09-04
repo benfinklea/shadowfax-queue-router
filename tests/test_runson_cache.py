@@ -187,6 +187,92 @@ class WarmLoopIdleTest(unittest.TestCase):
                 qr.runson_cache["ts"] = 0.0
 
 
+class ReviewFindingsTest(unittest.TestCase):
+    """The two defects Elrond found reviewing PR #6, each pinned so they cannot return."""
+
+    def setUp(self):
+        self._real_fetch = qr._runson_fetch
+        self.calls = []
+
+    def tearDown(self):
+        qr._runson_fetch = self._real_fetch
+        qr.runson_last_read_at = 0.0
+        if qr.runson_refresh_lock.locked():
+            qr.runson_refresh_lock.release()
+        with qr.runson_cache_lock:
+            qr.runson_cache["data"] = None
+            qr.runson_cache["ts"] = 0.0
+
+    def seed(self, age_seconds):
+        with qr.runson_cache_lock:
+            qr.runson_cache["data"] = {"available": True, "marker": "cached"}
+            qr.runson_cache["ts"] = time.time() - age_seconds
+
+    def test_warm_min_age_leaves_room_before_the_snapshot_goes_stale(self):
+        """The threshold has to be TTL minus one warm interval, or the cache expires
+        between passes and readers start seeing stale=True on a watched dashboard."""
+        self.assertEqual(qr.RUNSON_WARM_MIN_AGE, qr.RUNSON_CACHE_TTL - qr.RUNSON_WARM_INTERVAL)
+        self.assertGreater(qr.RUNSON_WARM_MIN_AGE, 0)
+
+    def test_a_fresh_snapshot_is_not_refetched_by_the_warm_loop(self):
+        """~4,600 billed DynamoDB rows a minute for a snapshot that was already good."""
+        self.seed(age_seconds=5)
+        self.assertLess(qr._runson_snapshot_age(), qr.RUNSON_WARM_MIN_AGE)
+
+    def test_an_aging_snapshot_is_refetched_by_the_warm_loop(self):
+        self.seed(age_seconds=qr.RUNSON_WARM_MIN_AGE + 5)
+        self.assertGreaterEqual(qr._runson_snapshot_age(), qr.RUNSON_WARM_MIN_AGE)
+
+    def test_snapshot_age_of_an_empty_cache_is_infinite(self):
+        with qr.runson_cache_lock:
+            qr.runson_cache["data"] = None
+        self.assertEqual(qr._runson_snapshot_age(), float("inf"))
+
+    def test_a_failed_thread_start_releases_the_gate(self):
+        """Otherwise the gate is held by a worker that will never run, and every
+        later blocking reader waits forever on a lock nobody owns."""
+        original = qr.threading.Thread
+
+        class ExplodingThread(original):
+            def start(self):
+                raise RuntimeError("can't start new thread")
+
+        qr.threading.Thread = ExplodingThread
+        try:
+            self.assertFalse(qr._runson_refresh_async(), "a failed start must report failure")
+            self.assertFalse(qr.runson_refresh_lock.locked(), "the refresh gate was stranded")
+        finally:
+            qr.threading.Thread = original
+
+    def test_a_reader_after_a_failed_thread_start_still_gets_served(self):
+        """The end-to-end consequence: no deadlock on the next blocking read."""
+        original = qr.threading.Thread
+
+        class ExplodingThread(original):
+            def start(self):
+                raise RuntimeError("can't start new thread")
+
+        self.seed(age_seconds=qr.RUNSON_CACHE_TTL + 30)
+
+        def _fetch():
+            self.calls.append(time.time())
+            return {"available": True, "marker": "recovered"}
+
+        qr._runson_fetch = _fetch
+        qr.threading.Thread = ExplodingThread
+        try:
+            stale = qr.get_runson_status()
+            self.assertEqual(stale["marker"], "cached")
+        finally:
+            qr.threading.Thread = original
+
+        with qr.runson_cache_lock:
+            qr.runson_cache["data"] = None
+            qr.runson_cache["ts"] = 0.0
+        recovered = qr.get_runson_status()
+        self.assertEqual(recovered["marker"], "recovered", "the next blocking reader deadlocked")
+
+
 class TruthSuiteTimeoutTest(unittest.TestCase):
     def test_runson_is_on_the_fifty_second_tier(self):
         """A 20s budget is what turned a slow-but-healthy endpoint into a hard FAIL."""
