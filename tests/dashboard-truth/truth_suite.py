@@ -703,7 +703,7 @@ def check_rendering() -> None:
         page = body.decode()
         check_tps_dials(page)
         check_runson_alignment(page)
-        required = ("fleet-summary", "fleet-row", "ship-flow", "ci-queue-body", "route-health-body",
+        required = ("fleet-summary", "fleet-row", "ship-flow", "local-runners-card", "local-runners-body",
                     "fleet-stats-body", "runson-card", "runson-body", "monitors", "sparklines",
                     "energy-by-machine", "energy-fleet-body")
         missing = [x for x in required if not re.search(rf'id=(?:["\']{re.escape(x)}["\']|{re.escape(x)}(?:\s|>))', page)]
@@ -851,7 +851,7 @@ console.log(JSON.stringify({
         )
         budget_text = ""
         budget_match = re.search(
-            r'<div class="runson-budget" id="runson-budget-strip">(.*?)<div class="runson-gauges" id="runson-budget-gauges">',
+            r'<div class="runner-facts" id="runson-budget-strip">(.*?)</b><span>Spent this month[^<]*</span></div></div>',
             chrome.stdout,
             re.S,
         )
@@ -860,17 +860,17 @@ console.log(JSON.stringify({
             budget_text = re.sub(r"\s+", " ", budget_text).strip()
         budget_render_ok = (
             chrome.returncode == 0
-            and "runson-spend-chart" in chrome.stdout
-            and "runson-credits-chart" in chrome.stdout
-            and "runson-budget-gauges" in chrome.stdout
+            and 'id="runson-spend-chart"' not in chrome.stdout
+            and 'id="runson-credits-chart"' not in chrome.stdout
+            and "AWS credits left" in budget_text
             and "Spent today" in budget_text
-            and "Spent this month" in budget_text
+            and "runson-spent-month" in chrome.stdout
         )
         emit(
             "PASS" if budget_render_ok else "FAIL",
             "runson.budget_strip.rendered",
             budget_text or "strip unreadable",
-            "spent today + spent this month + daily chart + runway chart + gauges",
+            "AWS credits left + spent today + spent this month; no spend/runway charts",
             "headless rendered DOM",
         )
         no_placeholder = (

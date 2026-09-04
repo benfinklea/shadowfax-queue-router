@@ -35,13 +35,11 @@ with sync_playwright() as p:
     assert 'every required test passing' in page.locator('.ship-stage').filter(has=page.locator('.ship-cap', has_text='green waiting')).get_attribute('title')
     assert 'no open review gate' in page.locator('.ship-stage').filter(has=page.locator('.ship-cap', has_text='green waiting')).get_attribute('title')
     logo = 'data:image/svg+xml;base64,' + base64.b64encode((root / 'armbrain-logo.svg').read_bytes()).decode()
-    page.locator('.ship-logo').evaluate('(el, src) => { el.src = src; }', logo)
-    page.wait_for_function('document.querySelector(".ship-logo").complete')
-    assert page.locator('.ship-toggle').count() == 3
+    assert page.locator('.ship-toggle').count() == 6
     assert page.locator('.ship-dropdown:visible').count() == 0
     dropdown_checks = []
     for key, field in [('green-waiting', 'green_waiting_prs'), ('in-line', 'queue_prs'), ('merged-today', 'merged_today_prs')]:
-        toggle = page.locator('[data-dropdown="' + key + '"]')
+        toggle = page.locator('.ship-toggle[data-dropdown="' + key + '"]')
         toggle.click()
         panel = page.locator('#ship-list-' + key)
         assert panel.is_visible()
@@ -64,12 +62,10 @@ with sync_playwright() as p:
         dropdown_checks.append({'key': key, 'rows': rows.count(), 'links': 'PASS', 'refresh': 'PASS'})
     assert 'setInterval(refreshShipFlow, 60000)' in source
     # Refresh recreates the logo; embed it again for this isolated capture.
-    page.locator('.ship-logo').evaluate('(el, src) => { el.src = src; }', logo)
-    page.wait_for_function('document.querySelector(".ship-logo").naturalWidth > 0')
     # Capture the open merged-today dropdown with the unmodified live payload.
     out.joinpath('shipping.html').write_text(page.locator('#ship-flow').evaluate('(el)=>el.outerHTML'))
     page.screenshot(path=str(out / 'shipping.png'))
-    page.locator('[data-dropdown=merged-today]').click()
+    page.locator('.ship-toggle[data-dropdown=merged-today]').click()
     assert page.locator('.ship-dropdown:visible').count() == 0
     page.evaluate('refreshShipFlow()')
     assert page.locator('.ship-dropdown:visible').count() == 0

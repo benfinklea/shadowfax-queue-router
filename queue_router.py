@@ -3899,6 +3899,54 @@ def api_agents():
         return _fresh_jsonify({'error': 'Could not establish live tmux agents'}, disposition, 'agents'), 503
 
 
+# Repository runner inventory uses the same installation token as CI reads.
+LOCAL_RUNNERS_CACHE_TTL = 60
+local_runners_cache = {"data": None, "ts": 0.0}
+local_runners_cache_lock = threading.Lock()
+
+
+def get_local_runners(force_refresh=False):
+    with local_runners_cache_lock:
+        if not force_refresh and local_runners_cache['data'] is not None and time.monotonic() - local_runners_cache['ts'] < LOCAL_RUNNERS_CACHE_TTL:
+            return local_runners_cache['data']
+        result = {'available': False, 'error': 'Could not establish local runners',
+                  'jobs_today': None, 'jobs_today_reason': 'Repository runner inventory does not report jobs today'}
+        try:
+            token = get_gh_ci_token()
+            if not token:
+                raise ValueError('CI token unavailable')
+            runners, page = [], 1
+            while True:
+                response = requests.get(
+                    f'https://api.github.com/repos/{GITHUB_CI_REPO}/actions/runners',
+                    headers={'Authorization': f'Bearer {token}', 'Accept': 'application/vnd.github+json'},
+                    params={'per_page': 100, 'page': page}, timeout=15)
+                if response.status_code in (403, 404):
+                    result['error'] = 'no permission to read runners'
+                    break
+                response.raise_for_status()
+                batch = response.json()['runners']
+                runners.extend({'name': r['name'], 'labels': [label['name'] for label in r['labels']],
+                                'status': r['status'], 'busy': r['busy']} for r in batch)
+                if len(batch) < 100:
+                    online = [r for r in runners if r['status'] == 'online']
+                    result.update(available=True, error=None, runners=runners,
+                                  online=len(online), busy=sum(r['busy'] for r in online),
+                                  idle=sum(not r['busy'] for r in online))
+                    break
+                page += 1
+        except Exception:
+            logger.exception('Could not establish local runner inventory')
+        local_runners_cache.update(data=result, ts=time.monotonic())
+        return result
+
+
+@app.route('/api/local_runners', methods=['GET'])
+def api_local_runners():
+    fresh, disposition = _fresh_bypass('local_runners')
+    return _fresh_jsonify(get_local_runners(fresh), disposition, 'local_runners')
+
+
 # ── Shipping pipeline snapshot (ported forward from bak-20260725; Gemini fleet monitor consumes /api/pipeline) ──
 PIPELINE_CACHE_TTL = 45  # seconds - must match CI_QUEUE_CACHE_TTL so ci_running measurement scope is consistent
 pipeline_cache = {"data": None, "ts": 0.0}
@@ -4945,10 +4993,6 @@ align-items:center;justify-content:center;gap:2px}
 .ship-dropdown{position:absolute;top:100%;right:0;z-index:20;background:#111827;border:1px solid #364563;border-radius:5px;padding:7px;min-width:240px;max-height:280px;overflow:auto;text-align:left;box-shadow:0 5px 15px #0008}
 .ship-dropdown[hidden]{display:none}
 .ship-stage{position:relative}
-.ship-stage.has-agents{padding-top:25px}
-.ship-stage.has-agents .ship-toggle{top:22px}
-.ship-agent-chip{position:absolute;top:3px;right:4px;border:1px solid #457687;border-radius:8px;background:#18303d;color:#c9f5ff;font-size:11px;line-height:16px;padding:0 5px;cursor:pointer}
-.ship-agent-chip:focus-visible{outline:2px solid var(--neon-cyan)}
 .ship-agents{padding-bottom:6px;margin-bottom:5px;border-bottom:1px solid #364563}
 .ship-agent-row{font-size:12px;white-space:nowrap;padding:3px 0}
 .ship-agent-row a{color:var(--neon-cyan)}
@@ -5146,6 +5190,26 @@ letter-spacing:0;white-space:pre;width:22ch;text-align:right}
 .last-updated.aging .lu-time{color:var(--neon-yellow);text-shadow:0 0 6px #ffff0066}
 .last-updated.stale .lu-time{color:var(--neon-red);text-shadow:0 0 8px #ff004488}
 @media(max-width:767px){.last-updated{position:static;text-align:center;margin:-18px 0 14px}}
+
+.monitor-glance-band{grid-template-columns:repeat(2,minmax(0,1fr))}
+#glance-strip{grid-column:1/-1}
+.cicd-label{font-family:'Orbitron',monospace;color:var(--neon-cyan);text-shadow:0 0 10px var(--neon-cyan);font-size:1em;letter-spacing:2px;margin:0 0 10px}
+.ship-flow{flex-wrap:nowrap;align-items:stretch}
+.ship-stage{flex:1 1 0;min-width:0;padding:8px 6px}
+.ship-cap{font-size:.65em;letter-spacing:1px}
+.ship-num.stamp{font-size:.85em}
+.ship-arrow{flex:0 0 48px;align-self:center;justify-content:center;height:36px;padding:0 7px 0 2px;border:0;background:#922276;color:#ffe1fa;clip-path:polygon(0 15%,70% 15%,70% 0,100% 50%,70% 100%,70% 85%,0 85%,12% 50%);cursor:pointer;font-size:11px}
+.ship-arrow.empty{color:#aa779d;background:#4c2347}
+.ship-arrow:focus-visible{background:#d437b0}
+#local-runners-card{padding:8px 12px 9px;min-width:0}
+#local-runners-card h3{font-size:.78em;margin:0 0 5px;letter-spacing:1.2px}
+.runner-facts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:12px}
+#runson-card .runner-facts b,#local-runners-card .runner-facts b{font-family:'Orbitron',monospace;font-size:1.3em;color:var(--neon-cyan)}
+.runner-facts span{display:block;font-size:.8em}
+.runner-facts small{display:block;color:#c7cee0;overflow-wrap:anywhere}
+.local-runner{font-size:.85em;padding:4px 0;overflow-wrap:anywhere}
+#local-runners-card details{margin-top:10px}
+@media(max-width:900px){.monitor-glance-band{grid-template-columns:1fr}.ship-flow{flex-wrap:wrap}.ship-stage{flex:1 0 110px}}
 </style></head>
 <body><div class="hdr-wrap"><h1>GANDALF // FLEET MONITOR</h1><div id="last-updated" class="last-updated" title="Time of the most recent successful data refresh. Green = fresh, amber = aging, red = this page has gone stale."><span class="lu-label">last updated</span><span class="lu-time" id="lu-time">connecting…</span></div></div>
 
@@ -5155,20 +5219,23 @@ letter-spacing:0;white-space:pre;width:22ch;text-align:right}
 <div class=card id=glance-strip style="padding:9px 12px">
 <div class="panel-refresh-surface">
 <button type="button" class="panel-refresh-btn" data-panel="Shipping pipeline" title="Refresh this panel" aria-label="Refresh Shipping pipeline panel" onclick="refreshPanel(this, 'refreshShipFlow')">&#x21bb;</button>
+<h2 class="cicd-label">CI/CD</h2>
 <div id="ship-flow" class="ship-flow panel-refresh-body"><span class="gdim">shipping pipeline…</span></div>
 <div id="ship-fleet" class="ship-fleet" aria-live="polite">🤖 working: checking agents…</div>
 </div>
 <div class="gstrip">
-<div class="panel-refresh-surface glance-panel"><button type="button" class="panel-refresh-btn" data-panel="CI queue" title="Refresh this panel" aria-label="Refresh CI queue panel" onclick="refreshPanel(this, 'refreshCiQueue')">&#x21bb;</button><div class="gcell panel-refresh-body" id="ci-queue-body"><span class="gdim">CI queue…</span></div></div>
-<div class="panel-refresh-surface glance-panel"><button type="button" class="panel-refresh-btn" data-panel="Route health" title="Refresh this panel" aria-label="Refresh Route health panel" onclick="refreshPanel(this, 'refreshRouteHealth')">&#x21bb;</button><div class="gcell panel-refresh-body" id="route-health-body"><span class="gdim">routes…</span></div></div>
 <div class="panel-refresh-surface glance-panel"><button type="button" class="panel-refresh-btn" data-panel="Fleet stats" title="Refresh this panel" aria-label="Refresh Fleet stats panel" onclick="refreshPanel(this, 'refreshFleetStats')">&#x21bb;</button><div class="gcell panel-refresh-body" id="fleet-stats-body"><span class="gdim">agents…</span></div></div>
 </div>
 </div>
 
 <div class=card id=runson-card>
-<button type="button" class="panel-refresh-btn" data-panel="RunsOn CI" title="Refresh this panel" aria-label="Refresh RunsOn CI panel" onclick="refreshPanel(this, 'refreshRunsOn')">&#x21bb;</button>
-<h3>☁️ RunsOn CI <span class="runson-account" id="runson-account">AWS account 930358782508</span><span id="runson-shard-state">Shard state unknown: loading</span></h3>
+<button type="button" class="panel-refresh-btn" data-panel="AWS" title="Refresh this panel" aria-label="Refresh AWS panel" onclick="refreshPanel(this, 'refreshRunsOn')">&#x21bb;</button>
+<h3>☁️ AWS <span class="runson-account" id="runson-account">AWS account 930358782508</span><span id="runson-shard-state">Shard state unknown: loading</span></h3>
 <div id=runson-body><p>Loading...</p></div>
+</div>
+<div class="card" id="local-runners-card">
+<button type="button" class="panel-refresh-btn" data-panel="HOME LAB" aria-label="Refresh HOME LAB panel" onclick="refreshPanel(this, 'refreshLocalRunners')">&#x21bb;</button>
+<h3>HOME LAB</h3><div id="local-runners-body">Loading...</div>
 </div>
 </div>
 
@@ -5393,15 +5460,17 @@ function shipShortTitle(title) {
 }
 function toggleShipDropdown(key) {
     openShipDropdown = openShipDropdown === key ? null : key;
-    document.querySelectorAll('.ship-toggle, .ship-agent-chip').forEach(button => {
+    document.querySelectorAll('.ship-toggle, .ship-arrow').forEach(button => {
         const open = button.dataset.dropdown === openShipDropdown;
         button.setAttribute('aria-expanded', String(open));
         if (button.classList.contains('ship-toggle')) button.textContent = open ? '▴' : '▾';
-        document.getElementById(button.getAttribute('aria-controls')).hidden = !open;
+        const panel = document.getElementById(button.getAttribute('aria-controls'));
+        panel.hidden = !open;
+        if (open) panel.scrollTop = 0;
     });
 }
 function shipAgentRows(agents) {
-    if (!agents.length) return '';
+    if (!agents.length) return '<div class="ship-agents"><strong>agents</strong><div>' + (shipAgents ? 'No live agents on this square' : 'Could not establish live agents') + '</div></div>';
     return '<div class="ship-agents"><strong>agents</strong>' + agents.map(agent => {
         const target = agent.target;
         const link = target ? '<a href="https://github.com/' + shipEscape(target.repo) + '/' + (target.pr ? 'pull' : 'issues') + '/' + Number(target.number) + '" target="_blank" rel="noopener noreferrer">#' + Number(target.number) + '</a>' : '';
@@ -5435,13 +5504,20 @@ function shipDropdown(key, prs, agents) {
 function shipStage(num, cap, cls, sub, spark, help, stageCls, dropdownKey, prs) {
     const agents = (shipAgents || []).filter(a => a.live && a.square === cap);
     const key = dropdownKey || cap.replaceAll(' ', '-').replaceAll('/', '-');
-    const chip = agents.length ? '<button type="button" class="ship-agent-chip" data-dropdown="' + key
-        + '" aria-label="' + agents.length + ' agents on ' + cap + '" aria-controls="ship-list-' + key
-        + '" aria-expanded="' + (openShipDropdown === key) + '" onclick="toggleShipDropdown(this.dataset.dropdown)">🤖 ' + agents.length + '</button>' : '';
-    return '<div class="ship-stage ' + (stageCls || '') + (agents.length ? ' has-agents' : '') + '" data-square="' + cap + '"' + (help ? ' title="' + help.replace(/"/g, '') + '"' : '') + '>' + chip + '<div class="ship-num ' + (cls || '') + '">' + num + '</div>'
+    return '<div class="ship-stage ' + (stageCls || '') + '" data-square="' + cap + '"' + (help ? ' title="' + help.replace(/"/g, '') + '"' : '') + '><div class="ship-num ' + (cls || '') + '">' + num + '</div>'
          + '<div class="ship-cap">' + cap + '</div>'
          + (sub ? '<div class="ship-sub">' + sub + '</div>' : '')
-         + (spark ? sparkHtml(spark) : '') + (dropdownKey || agents.length ? shipDropdown(key, prs || [], agents) : '') + '</div>';
+         + (spark ? sparkHtml(spark) : '') + shipDropdown(key, prs || [], agents) + '</div>';
+}
+
+function shipArrow(square) {
+    const count = shipAgents ? shipAgents.filter(a => a.live && a.square === square).length : null;
+    const key = square.replaceAll(' ', '-').replaceAll('/', '-');
+    return '<button type="button" class="ship-arrow' + (count === 0 ? ' empty' : '')
+        + '" data-square-left="' + square + '" data-dropdown="' + key + '" aria-controls="ship-list-' + key
+        + '" aria-expanded="' + (openShipDropdown === key) + '" aria-label="Agents on ' + square
+        + ': ' + (count === null ? 'could not establish' : count) + '" onclick="toggleShipDropdown(this.dataset.dropdown)">🤖'
+        + (count === null ? ' ?' : count ? ' ' + count : '') + '</button>';
 }
 
 function mergedRateClass(count) {
@@ -5473,7 +5549,6 @@ function refreshShipFlow() {
             el.innerHTML = '<span class="gdim">shipping pipeline unavailable (GitHub read failed)' + since + ' — stale, not an outage</span>';
             return;
         }
-        const ARROW = '<div class="ship-arrow">&#10148;</div>';
         const ciNum = d.ci_queued + '/' + d.ci_running;
         const ciCls = d.ci_queued > 5 ? 'hot' : (d.ci_queued > 0 ? 'warn' : 'ok');
         const greenCls = d.green_waiting >= 6 ? 'hot' : (d.green_waiting >= 3 ? 'warn' : (d.green_waiting > 0 ? 'ok' : ''));
@@ -5492,13 +5567,12 @@ function refreshShipFlow() {
             stamp = t.toLocaleString('en-US', {month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZone: 'America/Chicago'});
         }
         el.innerHTML =
-            '<div class="ship-label"><img src="/armbrain-logo.svg" alt="Armbrain" class="ship-logo" title="Armbrain - the product this pipeline ships">SHIPPING</div>' +
-            shipStage(d.issues_open, 'issues open', '', '', null, HELP.issues) + ARROW +
-            shipStage(d.prs_open, 'prs open', '', '', null, HELP.prs) + ARROW +
-            shipStage(ciNum, 'ci q/run', ciCls, '', null, HELP.ciqr) + ARROW +
-            shipStage(d.green_waiting, 'green waiting', greenCls, greenSub, null, HELP.greenWaiting, '', 'green-waiting', d.green_waiting_prs) + ARROW +
-            shipStage(d.queue_depth, 'in line', queueCls, queueSub, null, HELP.inLine, '', 'in-line', d.queue_prs) + ARROW +
-            shipStage(d.merged_today, 'merged today', 'ok', mergedSub, d.merged_spark, HELP.merged, mergedRateClass(d.merged_last_hour), 'merged-today', d.merged_today_prs) + ARROW +
+            shipStage(d.issues_open, 'issues open', '', '', null, HELP.issues) + shipArrow('issues open') +
+            shipStage(d.prs_open, 'prs open', '', '', null, HELP.prs) + shipArrow('prs open') +
+            shipStage(ciNum, 'ci q/run', ciCls, '', null, HELP.ciqr) + shipArrow('ci q/run') +
+            shipStage(d.green_waiting, 'green waiting', greenCls, greenSub, null, HELP.greenWaiting, '', 'green-waiting', d.green_waiting_prs) + shipArrow('green waiting') +
+            shipStage(d.queue_depth, 'in line', queueCls, queueSub, null, HELP.inLine, '', 'in-line', d.queue_prs) + shipArrow('in line') +
+            shipStage(d.merged_today, 'merged today', 'ok', mergedSub, d.merged_spark, HELP.merged, mergedRateClass(d.merged_last_hour), 'merged-today', d.merged_today_prs) + shipArrow('merged today') +
             '<div class="ship-stage" title="' + HELP.lastdep.replace(/"/g, '') + '"><div class="ship-num stamp">' + stamp + '</div>'
               + '<div class="ship-cap">last deploy (CT)</div>'
               + (d.last_deploy_sha ? '<div class="ship-sub">⎇ ' + d.last_deploy_sha + '</div>' : '') + '</div>';
@@ -6722,31 +6796,14 @@ function refreshRunsOn() {
             ? Number.NaN : Number(d.credits_remaining);
         const credits = Number.isFinite(creditsNumber) ? '$' + creditsNumber.toFixed(2) : 'n/a';
         const limits = d.budget_limits || {};
-        // Band 1: live runners, jobs, trial clock, credits on one line.
-        // Band 2: the spend column (today/month + fuse bars; the truth suite reads
-        // it by id) beside the two charts.
         const dailyLimit = Number(limits.daily || 15), monthlyLimit = Number(limits.monthly_guard || 350);
-        const budgetStrip = '<div class="runson-budget" id="runson-budget-strip">'
-            + '<div class="runson-spend"><strong id="runson-spent-today">' + runsonMoney(d.spent_today)
-            + '</strong><small>Spent today · $' + dailyLimit.toFixed(0) + ' fuse</small></div>'
-            + '<div class="runson-spend"><strong id="runson-spent-month">' + runsonMoney(d.spent_month)
-            + '</strong><small>Spent this month · $' + monthlyLimit.toFixed(0) + ' guard</small></div>'
-            + '<div class="runson-gauges" id="runson-budget-gauges">'
-            + runsonBudgetGauge('Daily fuse', d.spent_today, dailyLimit)
-            + runsonBudgetGauge('Monthly guard', d.spent_month, monthlyLimit)
-            + '</div></div>';
-        // Band 2: the two charts, captions folded into their title lines.
-        const runwayCaption = (function(){
-            const projection = ((d.credits_runway || {}).projection_date);
-            return projection ? 'lasts until ~' + runsonEscape(projection) : '<span class="runson-na">runway n/a</span>';
-        })();
-        const visuals = '<div class="runson-visuals">' + budgetStrip
-            + '<div class="runson-chart"><div class="runson-chart-title"><span>Spend · 30d</span>'
-            + '<span class="runson-source">' + runsonEscape(d.cost_source_label || 'n/a') + '</span></div>'
-            + runsonDailySpendChart(d.daily_spend) + '</div>'
-            + '<div class="runson-chart"><div class="runson-chart-title"><span>Credits</span>'
-            + '<span class="runson-runway">' + runwayCaption + '</span></div>'
-            + runsonCreditsChart(d.credits_runway, d.credits_remaining, true) + '</div></div>';
+        const visuals = '<div class="runner-facts" id="runson-budget-strip">'
+            + '<div class="runson-fact"><b>' + credits + '</b><span>AWS credits left</span>'
+            + (Number.isFinite(creditsNumber) ? '' : '<small>' + runsonEscape(d.credits_error || 'Credits balance unavailable') + '</small>') + '</div>'
+            + '<div class="runson-fact"><b id="runson-spent-today">' + runsonMoney(d.spent_today)
+            + '</b><span>Spent today · $' + dailyLimit.toFixed(0) + ' fuse</span></div>'
+            + '<div class="runson-fact"><b id="runson-spent-month">' + runsonMoney(d.spent_month)
+            + '</b><span>Spent this month · $' + monthlyLimit.toFixed(0) + ' guard</span></div></div>';
         body.innerHTML = '<div class="runson-grid">'
             + '<div class="runson-live"><div class="runson-total"><div class="runson-count' + (count === 0 ? ' zero' : '') + '\">' + runsonLiveSpark(d.live_runners_smoothed) + '<span>' + count + '</span></div>'
             + '<div class="runson-label">live runners</div></div>' + (count === 0 ? '' : runnerDetail) + '</div>'
@@ -6763,7 +6820,6 @@ function refreshRunsOn() {
               })()
             + '<div class="runson-fact"><b>' + Number(d.trial_days_remaining || 0) + ' days</b><span>to $'
             + Number(d.subscription_usd_per_year || 350) + '/yr · ' + runsonEscape(d.trial_charge_date || '2026-09-30') + '</span></div>'
-            + '<div class="runson-fact"><b>' + credits + '</b><span>AWS credits left</span></div>'
             + '</div>' + visuals;
     }).catch(() => {
         const body = document.getElementById('runson-body');
@@ -6771,11 +6827,26 @@ function refreshRunsOn() {
     });
 }
 
+function refreshLocalRunners() {
+    return fetch('/api/local_runners').then(r => r.json()).then(d => {
+        const body = document.getElementById('local-runners-body');
+        if (!d.available) { body.innerHTML = '<p class="runson-warning">' + runsonEscape(d.error || 'Could not establish local runners') + '</p>'; return; }
+        body.innerHTML = '<div class="runner-facts">' + ['online', 'busy', 'idle'].map(k =>
+            '<div class="runson-fact"><b>' + Number(d[k]) + '</b><span>' + k + '</span></div>').join('') + '</div>'
+            + '<details class="runson-runners-details"><summary>show ' + d.runners.length + ' runners</summary>'
+            + d.runners.map(r => '<div class="local-runner">' + runsonEscape(r.name) + ' · '
+                + runsonEscape(r.labels.join(', ')) + ' · ' + runsonEscape(r.status)
+                + ' · ' + (r.busy ? 'busy' : 'idle') + '</div>').join('') + '</details>'
+            + '<p class="runson-label">' + (d.jobs_today == null ? 'Jobs today: n/a · ' + runsonEscape(d.jobs_today_reason) : Number(d.jobs_today) + ' jobs today') + '</p>';
+    }).catch(() => { document.getElementById('local-runners-body').innerHTML = '<p>Could not establish local runners</p>'; });
+}
+
 // --- Polling control: pause everything when the tab isn't visible, resume ---
 // --- with an immediate refresh when it becomes visible again.              ---
-let statusTimer = null, fleetTimer = null, historyTimer = null, energyTimer = null, ciQueueTimer = null, routeHealthTimer = null, fleetStatsTimer = null, modelServingTimer = null, shipFlowTimer = null, runsonTimer = null;
+let statusTimer = null, fleetTimer = null, historyTimer = null, energyTimer = null, ciQueueTimer = null, routeHealthTimer = null, fleetStatsTimer = null, modelServingTimer = null, shipFlowTimer = null, runsonTimer = null, localRunnersTimer = null;
 
 function startPolling() {
+    if (!localRunnersTimer) localRunnersTimer = setInterval(refreshLocalRunners, 60000);
     if (!statusTimer) statusTimer = setInterval(refresh, 12000);     // queue/GPU state: 12s
     if (!fleetTimer) fleetTimer = setInterval(refreshFleet, 45000);  // ssh fleet stats: 45s
     if (!historyTimer) historyTimer = setInterval(refreshHistory, 60000);
@@ -6801,6 +6872,7 @@ function startSlowPolling() {
 function stopSlowPolling() { clearInterval(slowTimer); slowTimer = null; }
 
 function stopPolling() {
+    clearInterval(localRunnersTimer); localRunnersTimer = null;
     clearInterval(statusTimer); statusTimer = null;
     clearInterval(fleetTimer); fleetTimer = null;
     clearInterval(historyTimer); historyTimer = null;
@@ -6968,7 +7040,7 @@ document.addEventListener('visibilitychange', () => {
         startPolling();
         [['refresh', refresh], ['refreshFleet', refreshFleet], ['refreshHistory', refreshHistory],
          ['refreshEnergy', refreshEnergy], ['refreshCiQueue', refreshCiQueue],
-         ['refreshShipFlow', refreshShipFlow], ['refreshRunsOn', refreshRunsOn],
+         ['refreshShipFlow', refreshShipFlow], ['refreshRunsOn', refreshRunsOn], ['refreshLocalRunners', refreshLocalRunners],
          ['refreshRouteHealth', refreshRouteHealth], ['refreshFleetStats', refreshFleetStats],
          ['refreshModelServing', refreshModelServing]].forEach(([n, f]) => {
             try { f(); } catch (err) { console.error('[dashboard] ' + n + ' failed on resume:', err); }
@@ -7042,6 +7114,7 @@ function refreshPanel(button, loaderName) {
         refreshFleetStats: refreshFleetStats,
         refreshHistory: refreshHistory,
         refreshEnergy: refreshEnergy,
+        refreshLocalRunners: refreshLocalRunners,
         refreshRunsOn: refreshRunsOn
     };
     const loader = loaders[loaderName];
@@ -7117,6 +7190,7 @@ safeCall('refreshFleet', refreshFleet);
 safeCall('refreshCiQueue', refreshCiQueue);
 safeCall('refreshShipFlow', refreshShipFlow);
 safeCall('refreshRunsOn', refreshRunsOn);
+safeCall('refreshLocalRunners', refreshLocalRunners);
 safeCall('refreshRouteHealth', refreshRouteHealth);
 safeCall('refreshFleetStats', refreshFleetStats);
 // first serving refresh waits for the target cards (built by refresh()) to exist
