@@ -465,9 +465,9 @@ def check_local_sources() -> None:
             )
             emit(
                 "PASS" if scale_ok else "FAIL", f"model.{name}.tps_record_scale",
-                {"model_name": model_name, "dial_max": claim.get("tps_record")},
+                {"model_name": model_name, "payload_record": claim.get("tps_record")},
                 {"stored_peak": round(stored_peak, 1) if stored_peak is not None else None},
-                "dial maximum equals persisted peak for the current model",
+                "payload record equals persisted peak for the current model; independent of dial scale",
             )
             previous = prior_records.get((name, model_name))
             monotonic_ok = (
@@ -597,10 +597,48 @@ def check_runson_alignment(page: str) -> None:
          "headless DOM fixtures, including expanded runner details")
 
 
+def check_tps_dials(page: str) -> None:
+    """Replay one API snapshot through the real renderer; measure the DOM needle."""
+    code, body = http("/api/model_serving")
+    serving = json.loads(body)
+    if code != 200 or not isinstance(serving, dict):
+        raise ValueError("could not establish model-serving payload")
+    sections = (
+        ("const TPS_GAUGE_PLACEHOLDER_MAX = 1;", "function refreshFleetStats()"),
+        ("function getNormalColor(", "// Plain-English explanations"),
+        ("function renderGauge(", "function renderSwapGauge("),
+        ("function updateGauge(", "function refresh()"),
+    )
+    renderer = "const HELP = {};\n" + "\n".join(
+        page[page.index(start):page.index(end, page.index(start))] for start, end in sections
+    )
+    probe = Path(__file__).with_name("tps-dial.js").read_text()
+    fixture = re.sub(r"<script\b[^>]*>.*?</script>", "", page, flags=re.S)
+    snapshot = json.dumps(serving).replace("<", "\\u003c")
+    fixture = fixture.replace("</body>", "<script>" + renderer
+                              + "\nconst servingSnapshot = " + snapshot + ";\n"
+                              + probe + "</script></body>")
+    with tempfile.TemporaryDirectory(prefix="tps-dial-") as directory:
+        path = Path(directory) / "fixture.html"
+        path.write_text(fixture)
+        chrome = run([
+            "google-chrome", "--headless", "--no-sandbox", "--disable-gpu",
+            "--virtual-time-budget=5000", "--dump-dom", path.as_uri(),
+        ], timeout=60)
+    match = re.search(r'<pre id="tps-dial-result">(.*?)</pre>', chrome.stdout, re.S)
+    rows = json.loads(html.unescape(match.group(1))) if match else []
+    emit("PASS" if chrome.returncode == 0 and len(rows) == 32 else "FAIL",
+         "page.tps_dial.probe", len(rows), 32, "live snapshot + seven fixtures for each dial box")
+    for row in rows:
+        emit("PASS" if row["ok"] else "FAIL", "page.tps_dial." + row["case"] + "." + row["box"],
+             row["rendered"], row["expected"], "headless DOM; payload=" + json.dumps(row["payload"]))
+
+
 def check_rendering() -> None:
     try:
         code, body = http("/")
         page = body.decode()
+        check_tps_dials(page)
         check_runson_alignment(page)
         required = ("fleet-summary", "fleet-row", "ship-flow", "ci-queue-body", "route-health-body",
                     "fleet-stats-body", "runson-card", "runson-body", "monitors", "sparklines",
@@ -619,9 +657,9 @@ def check_rendering() -> None:
         tps_probe = None
         if probe_start >= 0 and probe_end > probe_start:
             probe_js = page[probe_start:probe_end] + """
-const fixture = tpsDialZones(120, 300, 360);
-const capped = tpsDialZones(20, 400, 500);
-const guarded = tpsDialZones(120, 300, 120);
+const fixture = tpsDialZones(120, 300);
+const capped = tpsDialZones(20, 400);
+const guarded = tpsDialZones(0, 0);
 console.log(JSON.stringify({
   fixture: fixture,
   capped: capped,
@@ -645,7 +683,7 @@ console.log(JSON.stringify({
         color_positions = [gradient.find(color) for color in ("#d94a4a", "#d9a54a", "#39ff14")]
         order_ok = (
             fixture.get("redEnd") == 45
-            and fixture.get("max") == 360
+            and fixture.get("max") == 300
             and fixture.get("redEnd", 1) <= fixture.get("tanEnd", 0) <= fixture.get("max", 0)
             and capped.get("redEnd") <= capped.get("tanEnd", -1)
             and guarded is None
@@ -657,7 +695,7 @@ console.log(JSON.stringify({
         avg_binding_ok = (
             fixture.get("tanEnd") == 120
             and capped.get("tanEnd") == 20
-            and "updateTpsGauge(dialId, s.tps_now, s.tps_avg_today, s.tps_max_today, s.tps_record)" in page
+            and "updateTpsGauge(dialId, s.tps_now, s.tps_avg_today, s.tps_max_today)" in page
             and set((tps_probe or {}).get("boxes", {})) == {"gandalf", "frodo", "aragorn", "pippin"}
         )
         emit("PASS" if avg_binding_ok else "FAIL", "page.tps_dial.average_boundary",
