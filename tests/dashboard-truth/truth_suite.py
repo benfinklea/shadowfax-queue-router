@@ -86,7 +86,11 @@ def check_apis() -> None:
     for endpoint, required in GET_SCHEMAS.items():
         path = f"/api/{endpoint}"
         try:
-            endpoint_timeout = 120 if endpoint == "pipeline" else (50 if endpoint in ("status", "fleet") else TIMEOUT)
+            # runson joins the 50s tier: even with stale-while-revalidate in
+            # queue_router, the first read after a monitor restart can still be a
+            # cold AWS fetch, and a 20s budget turned that into a hard FAIL on the
+            # hourly run (shadowfax-queue-router#5).
+            endpoint_timeout = 120 if endpoint == "pipeline" else (50 if endpoint in ("status", "fleet", "runson") else TIMEOUT)
             code, body = http(path, endpoint_timeout)
             value = json.loads(body)
             api[endpoint] = value

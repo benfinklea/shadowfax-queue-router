@@ -1912,8 +1912,30 @@ def get_ci_queue_status(force_refresh=False):
 
 runson_cache = {"data": None, "ts": 0.0}
 runson_cache_lock = threading.Lock()
+# Single-flight gate for the AWS refresh. A cold refresh is ~25-30s of serial work
+# (describe-stacks, then thousands of DynamoDB job rows through CLI subprocesses,
+# then Cost Explorer), so two concurrent readers must never both start one.
+runson_refresh_lock = threading.Lock()
 runson_cost_cache_lock = threading.Lock()
 RUNSON_CACHE_TTL = 120  # seconds - AWS reads are slower and credentials are short-lived
+# How stale a snapshot may be and still be served instantly while a refresh runs
+# behind it. RunsOn capacity and daily job counts do not turn over in minutes, so a
+# reader is far better served by a 4-minute-old answer than by a 25-second wait -
+# which is what made the hourly dash-truth run fail api.runson.schema on its 20s
+# budget while the endpoint sat mid-refresh (benfinklea/shadowfax-queue-router#5).
+RUNSON_MAX_STALE = 15 * 60  # seconds
+RUNSON_WARM_INTERVAL = 60   # seconds between background warm passes
+# The warm loop only runs while somebody is actually reading the card. A full pass
+# reads ~4,600 DynamoDB job rows; warming that around the clock for an unwatched
+# dashboard would be roughly 980 passes a day of billed reads for nobody. After this
+# long with no reader the loop idles, and the next reader re-arms it.
+RUNSON_WARM_IDLE_AFTER = 20 * 60  # seconds
+# A warm pass only pays for itself if the snapshot would otherwise go stale before
+# the next one. Without this the loop refetched every 60s even right after a reader's
+# own background refresh had just landed - a full ~4,600-row DynamoDB pass per minute
+# for a snapshot that was already good (caught in review, Elrond 2026-09-04).
+RUNSON_WARM_MIN_AGE = RUNSON_CACHE_TTL - RUNSON_WARM_INTERVAL
+runson_last_read_at = 0.0
 RUNSON_AWS_PROFILE = "armbrain-readonly"  # fleet-runson-observer IAM user in the rebuilt account (council 2026-09-02); files under ~/.config/fleet/aws
 RUNSON_AWS_ACCOUNT_ID = "930358782508"  # rebuilt account resolved by that profile
 RUNSON_AWS_ENV = {**os.environ, "AWS_SHARED_CREDENTIALS_FILE": os.path.expanduser("~/.config/fleet/aws/armbrain-readonly.credentials"), "AWS_CONFIG_FILE": os.path.expanduser("~/.config/fleet/aws/armbrain-readonly.config")}
@@ -2217,13 +2239,8 @@ def _runson_error_result(error):
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
 
-def get_runson_status(force_refresh=False):
-    """RunsOn runners, daily jobs, trial fuse, and credits; cached and read-only."""
-    now = time.time()
-    with runson_cache_lock:
-        if not force_refresh and runson_cache["data"] is not None and (now - runson_cache["ts"]) < RUNSON_CACHE_TTL:
-            return runson_cache["data"]
-
+def _runson_fetch():
+    """One full RunsOn read. Slow (~25-30s cold) and read-only; never call directly."""
     stack, stack_error = _runson_aws_json(
         ["cloudformation", "describe-stacks", "--stack-name", RUNSON_STACK_NAME],
         "us-east-2",
@@ -2368,10 +2385,114 @@ def get_runson_status(force_refresh=False):
                 "generated_at": datetime.now(timezone.utc).isoformat(),
             }
 
+    return result
+
+
+def _runson_store(result):
     with runson_cache_lock:
         runson_cache["data"] = result
         runson_cache["ts"] = time.time()
     return result
+
+
+def _runson_refresh_locked():
+    """Fetch and cache. The caller MUST hold runson_refresh_lock."""
+    # Another refresher may have finished while this one waited for the gate.
+    with runson_cache_lock:
+        cached, ts = runson_cache["data"], runson_cache["ts"]
+    if cached is not None and (time.time() - ts) < RUNSON_CACHE_TTL:
+        return cached
+    return _runson_store(_runson_fetch())
+
+
+def _runson_refresh_async():
+    """Start a background refresh unless one is already running. Never blocks."""
+    if not runson_refresh_lock.acquire(blocking=False):
+        return False
+    def _worker():
+        try:
+            _runson_refresh_locked()
+        except Exception:
+            logger.exception("runson background refresh failed; keeping the previous snapshot")
+        finally:
+            runson_refresh_lock.release()
+    try:
+        threading.Thread(target=_worker, name="runson-refresh", daemon=True).start()
+    except Exception:
+        # The gate is held but _worker will never run, so its finally can never
+        # release it. Left alone, every later blocking reader waits forever on a
+        # lock nobody owns (caught in review, Elrond 2026-09-04).
+        runson_refresh_lock.release()
+        logger.exception("could not start the runson refresh thread; released the refresh gate")
+        return False
+    return True
+
+
+def _runson_annotate(data, ts):
+    """Return a copy tagged with its age. The cached dict itself is shared - never mutate it."""
+    age = max(0.0, time.time() - ts)
+    return {**data, "cache_age_seconds": round(age, 1), "stale": age >= RUNSON_CACHE_TTL}
+
+
+def get_runson_status(force_refresh=False):
+    """RunsOn runners, daily jobs, trial fuse, and credits; cached and read-only.
+
+    Stale-while-revalidate. A reader gets whatever is cached the moment it asks and
+    the refresh happens behind it, so /api/runson answers in milliseconds instead of
+    blocking for the ~25-30s a cold AWS read takes. Only two callers ever wait: the
+    very first one after a restart (no snapshot exists yet - and the warm loop below
+    exists to make that window small), and one that explicitly asked for ?fresh=1.
+    """
+    global runson_last_read_at
+    with runson_cache_lock:
+        cached, ts = runson_cache["data"], runson_cache["ts"]
+        runson_last_read_at = time.time()
+    age = time.time() - ts
+
+    if force_refresh:
+        with runson_refresh_lock:
+            return _runson_annotate(_runson_store(_runson_fetch()), time.time())
+
+    if cached is not None:
+        if age < RUNSON_CACHE_TTL:
+            return _runson_annotate(cached, ts)
+        if age < RUNSON_MAX_STALE:
+            _runson_refresh_async()
+            return _runson_annotate(cached, ts)
+
+    # No snapshot, or one too old to stand behind. This is the only blocking path.
+    with runson_refresh_lock:
+        return _runson_annotate(_runson_refresh_locked(), time.time())
+
+
+def _runson_snapshot_age():
+    with runson_cache_lock:
+        if runson_cache["data"] is None:
+            return float("inf")
+        return max(0.0, time.time() - runson_cache["ts"])
+
+
+def _runson_should_warm():
+    """True while the card still has a reader worth warming for."""
+    with runson_cache_lock:
+        idle = time.time() - runson_last_read_at
+    return idle <= RUNSON_WARM_IDLE_AFTER
+
+
+def runson_warm_loop():
+    """Keep the RunsOn snapshot warm for as long as anyone is reading the card."""
+    while True:
+        time.sleep(RUNSON_WARM_INTERVAL)
+        if not _runson_should_warm():
+            continue
+        try:
+            with runson_refresh_lock:
+                if _runson_snapshot_age() < RUNSON_WARM_MIN_AGE:
+                    continue   # a reader's own refresh already landed; do not pay twice
+                _runson_store(_runson_fetch())
+        except Exception:
+            logger.exception("runson warm pass failed; will retry")
+
 
 route_health_cache = {"data": None, "ts": 0.0}
 route_health_cache_lock = threading.Lock()
@@ -6790,6 +6911,12 @@ if __name__ == "__main__":
     # Model-serving sampler (tokens/sec + requests served, persisted to sqlite)
     serving_thread = threading.Thread(target=collect_model_serving, daemon=True)
     serving_thread.start()
+
+    # Keep the RunsOn snapshot warm. Without this the first reader after a restart
+    # pays the full ~25-30s cold AWS read, which is exactly what timed out the
+    # hourly dash-truth run on its 20s budget (shadowfax-queue-router#5).
+    runson_thread = threading.Thread(target=runson_warm_loop, daemon=True)
+    runson_thread.start()
 
     # ComfyUI watchdog (auto-restart if down) — OFF BY DEFAULT.
     #
