@@ -570,10 +570,38 @@ def check_runson_gate() -> None:
          {"RUNSON_GATE_SHARDS": expected}, detail if cp.returncode == 0 else cp.stderr.strip()[:200])
 
 
+def check_runson_alignment(page: str) -> None:
+    """Measure text edges using real dashboard CSS/renderer, without live APIs."""
+    renderer = page[page.index("function runsonEscape("):page.index("// --- Polling control:")]
+    fixture = re.sub(r"<script\b[^>]*>.*?</script>", "", page, flags=re.S)
+    probe = (Path(__file__).with_name("runson-alignment.js")).read_text()
+    fixture = fixture.replace("</body>", "<script>" + renderer + probe + "</script></body>")
+    with tempfile.TemporaryDirectory(prefix="runson-alignment-") as directory:
+        path = Path(directory) / "fixture.html"
+        path.write_text(fixture)
+        chrome = run([
+            "google-chrome", "--headless", "--no-sandbox", "--disable-gpu",
+            "--window-size=1440,1200", "--virtual-time-budget=5000", "--dump-dom", path.as_uri(),
+        ], timeout=60)
+    match = re.search(r'<pre id="runson-alignment-result">(.*?)</pre>', chrome.stdout, re.S)
+    rows = json.loads(html.unescape(match.group(1))) if match else []
+    ok = chrome.returncode == 0 and len(rows) == 5 and all(
+        abs(row["numberRight"] - row["labelRight"]) <= 1
+        and row["maxStationaryDelta"] <= 1
+        and row["labelAlign"] in ("start", "left")
+        and row["zeroClass"] == (row["count"] == 0)
+        for row in rows
+    )
+    emit("PASS" if ok else "FAIL", "runson.count.label_alignment", rows,
+         "0, 12, 123: text right edges within 1px; label/card/facts/details unchanged",
+         "headless DOM fixtures, including expanded runner details")
+
+
 def check_rendering() -> None:
     try:
         code, body = http("/")
         page = body.decode()
+        check_runson_alignment(page)
         required = ("fleet-summary", "fleet-row", "ship-flow", "ci-queue-body", "route-health-body",
                     "fleet-stats-body", "runson-card", "runson-body", "monitors", "sparklines",
                     "energy-by-machine", "energy-fleet-body")
