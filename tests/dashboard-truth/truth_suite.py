@@ -5,7 +5,10 @@ from __future__ import annotations
 
 import concurrent.futures
 import datetime as dt
+import ast
+import textwrap
 import hashlib
+import inspect
 import html
 import json
 import os
@@ -500,7 +503,13 @@ def check_pipeline() -> None:
             emit("WARN", "pipeline.last_deploy_sha", d.get("last_deploy_sha"), "unreadable", unread)
             emit("WARN", "pipeline.last_deploy_at", d.get("last_deploy_at"), "unreadable", unread)
     except Exception as exc:
-        emit("FAIL", "pipeline.direct_github", d, "gh api failed", str(exc))
+        # The 9/2 ruling: an instrument that could not be READ is UNKNOWN, not a
+        # finding against the subject. A gh api failure here - rate limit, budget,
+        # network - says nothing about the dashboard, and FAILing on it pages
+        # someone about a probe rather than a defect. Same class as the
+        # last_deploy fix; this is the layer council spotted one further out.
+        emit("WARN", "pipeline.direct_github", d, "unreadable",
+             f"gh api failed, so the GitHub side was never read: {exc}")
     try:
         generated = dt.datetime.fromisoformat(str(d.get("generated_at")).replace("Z", "+00:00"))
         age = (now - generated.astimezone(dt.timezone.utc)).total_seconds()
@@ -713,13 +722,42 @@ def check_tps_dials(page: str) -> None:
              row["rendered"], row["expected"], "headless DOM; payload=" + json.dumps(row["payload"]))
 
 
-# Signals that only exist if the headless render completes. When it does not, each is
-# reported as not-evaluated rather than silently omitted - see the handler at the end of
-# check_rendering(). Keep this list in step with the emits inside that function.
-RENDER_DEPENDENT_SIGNALS = (
-    "runson.budget_strip.rendered",
-    "runson.budget_strip.no_eternal_placeholder",
-)
+def _render_dependent_signals() -> tuple[str, ...]:
+    """Every signal check_rendering() can emit, read from its own AST.
+
+    The hand-maintained tuple this replaced carried a comment asking the next person
+    to keep it in step, which is a promise that it will drift. Deriving it means a new
+    emit() inside check_rendering is covered the moment it is written.
+
+    AST rather than a regex: the first argument is often a ternary
+    (`emit("PASS" if ok else "FAIL", "signal", ...)`), and a regex that tries to
+    match the level before the signal silently skips exactly those calls. The first
+    attempt here did that and returned one signal of three - a derived list that is
+    quietly incomplete is worse than an honest hand-written one.
+
+    Falls back to the two known signals if the source cannot be parsed, so a
+    packaging change degrades to the old behaviour instead of reporting nothing.
+    """
+    known = ("runson.budget_strip.rendered", "runson.budget_strip.no_eternal_placeholder")
+    try:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(check_rendering)))
+    except (OSError, TypeError, SyntaxError):
+        return known
+    signals: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (isinstance(func, ast.Name) and func.id == "emit"):
+            continue
+        if len(node.args) < 2:
+            continue
+        second = node.args[1]
+        if isinstance(second, ast.Constant) and isinstance(second.value, str):
+            # page.render REPORTS the failure; it must not also be a casualty of it.
+            if second.value != "page.render":
+                signals.append(second.value)
+    return tuple(dict.fromkeys(signals)) or known
 
 
 def check_rendering() -> None:
@@ -924,7 +962,7 @@ console.log(JSON.stringify({
         # Anything downstream of the render never ran. Say so per signal rather than
         # letting it disappear from the report.
         emitted = {r["signal"] for r in results}
-        for signal in RENDER_DEPENDENT_SIGNALS:
+        for signal in _render_dependent_signals():
             if signal not in emitted:
                 emit("WARN", signal, "not-evaluated", "requires the headless render",
                      f"skipped because the render step did not complete: {cause}")
