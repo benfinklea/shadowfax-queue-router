@@ -7028,7 +7028,8 @@ function refreshRunsOn() {
         const gate = d.gate_shards === 'on' || d.gate_shards === 'off' ? d.gate_shards : 'unknown';
         const count = Math.max(0, Number(d.live_runners) || 0);
         const off = gate === 'off' || d.available === false || d.deployed === false;
-        capacityOutline(card, capacityColour(off ? 0 : count, [1, 50.5, 100, 128]), !off && count >= 128);
+        // Ben: "should be more yellow already just by being on."
+        capacityOutline(card, capacityColour(off ? -1 : count, [-1, 0, 100, 128]), !off && count >= 128);
         if (account && d.aws_account_id) account.textContent = 'AWS account ' + d.aws_account_id;
         if (d.deployed === false) {
             body.innerHTML = '<p class="runson-warning">RunsOn is not deployed</p>';
