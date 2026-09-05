@@ -1747,6 +1747,18 @@ def get_gateway_key():
 
 ci_queue_cache = {"data": None, "ts": 0.0}
 ci_queue_cache_lock = threading.Lock()
+
+# MERGE LANE (council 136cx part 4). Its OWN cache and its own TTL, deliberately NOT
+# piggybacked on ci_queue_cache above - that one has CI_QUEUE_CACHE_TTL = 2 seconds, and
+# adding two GitHub calls to a two-second refresh would be thousands of requests an hour
+# on a token the whole fleet shares and which hit ZERO twice on 2026-09-05.
+#
+# 60 seconds costs at most 120 requests/hour and is far finer than the thing it watches:
+# the starvation this strip exists to surface ran for over 80 minutes.
+merge_lane_cache = {"data": None, "ts": 0.0}
+merge_lane_cache_lock = threading.Lock()
+MERGE_LANE_CACHE_TTL = 60
+MERGE_LANE_LABEL = "merge-reserved"
 ci_queue_refresh_lock = threading.Lock()
 CI_QUEUE_CACHE_TTL = 2  # seconds - keep volatile counts inside the truth suite's +/-1 window
 
@@ -1928,6 +1940,90 @@ def get_runner_jobs():
 def api_runner_jobs():
     # Even ?fresh=1 must honor the fleet's hard 120-second budget window.
     return jsonify(get_runner_jobs())
+
+
+def get_merge_lane_status():
+    """The reserved merge lane: depth, oldest wait, merges last hour, lane runners.
+
+    WHY THIS STRIP EXISTS. On 2026-09-05 fifteen branches starved the merge queue's top
+    three entries for over eighty minutes at 1 AM and nobody saw it until a human went
+    looking. A strip reading "12 queued, oldest 2h 40m, 0 merged last hour" would have put
+    that in front of Ben without him asking.
+
+    EVERY FIELD FAILS TO None, NEVER TO ZERO. "0 merged last hour" is an alarming, useful
+    fact; a zero invented from a failed request is a lie that looks like that fact. The
+    shared token hit zero twice tonight, so this is not hypothetical - the UI renders None
+    as "unknown" and colours it neutral rather than red.
+    """
+    now = time.time()
+    with merge_lane_cache_lock:
+        if merge_lane_cache["data"] is not None and (now - merge_lane_cache["ts"]) < MERGE_LANE_CACHE_TTL:
+            return merge_lane_cache["data"]
+
+    result = {
+        "available": False, "depth": None, "oldest_awaiting_min": None,
+        "merged_last_hour": None, "lane_runners": None,
+        "lane_state": "unknown", "error": None,
+    }
+    token = get_gh_ci_token()
+    if not token:
+        result["error"] = "no GitHub token"
+        with merge_lane_cache_lock:
+            merge_lane_cache.update(data=result, ts=now)
+        return result
+
+    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
+    owner, _, name = GITHUB_CI_REPO.partition("/")
+
+    # One GraphQL call: queue depth and the oldest entry still waiting on checks.
+    try:
+        q = ('{repository(owner:"%s",name:"%s"){mergeQueue{entries(first:50)'
+             '{nodes{state enqueuedAt}}}}}' % (owner, name))
+        r = requests.post("https://api.github.com/graphql", headers=headers,
+                          json={"query": q}, timeout=10)
+        if r.ok:
+            nodes = (((r.json().get("data") or {}).get("repository") or {}).get("mergeQueue")
+                     or {}).get("entries", {}).get("nodes") or []
+            result["depth"] = len(nodes)
+            waiting = sorted(n["enqueuedAt"] for n in nodes
+                             if n.get("state") == "AWAITING_CHECKS" and n.get("enqueuedAt"))
+            if waiting:
+                from datetime import datetime, timezone as _tz
+                t0 = datetime.fromisoformat(waiting[0].replace("Z", "+00:00"))
+                result["oldest_awaiting_min"] = int(
+                    (datetime.now(_tz.utc) - t0).total_seconds() // 60)
+            else:
+                result["oldest_awaiting_min"] = 0
+        else:
+            result["error"] = f"graphql HTTP {r.status_code}"
+    except Exception as exc:
+        result["error"] = f"graphql {type(exc).__name__}"
+
+    # One REST search: PRs merged in the last hour.
+    try:
+        from datetime import datetime, timedelta, timezone as _tz
+        since = (datetime.now(_tz.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        r = requests.get("https://api.github.com/search/issues", headers=headers,
+                         params={"q": f"repo:{GITHUB_CI_REPO} is:pr is:merged merged:>={since}",
+                                 "per_page": 1}, timeout=10)
+        if r.ok:
+            result["merged_last_hour"] = r.json().get("total_count", 0)
+        elif result["error"] is None:
+            result["error"] = f"search HTTP {r.status_code}"
+    except Exception as exc:
+        if result["error"] is None:
+            result["error"] = f"search {type(exc).__name__}"
+
+    # The lane itself does not exist until armbrain#7118 lands. Reporting "not configured"
+    # costs ZERO requests and is honest; polling for a label nobody carries would spend
+    # budget to learn something already known.
+    result["lane_runners"] = None
+    result["lane_state"] = "not-configured"
+
+    result["available"] = result["depth"] is not None or result["merged_last_hour"] is not None
+    with merge_lane_cache_lock:
+        merge_lane_cache.update(data=result, ts=now)
+    return result
 
 
 def get_ci_queue_status(force_refresh=False):
@@ -4672,6 +4768,11 @@ def get_fleet():
 
     return _fresh_jsonify(ordered, disposition, "fleet")
 
+@app.route("/api/merge_lane", methods=["GET"])
+def api_merge_lane():
+    return jsonify(get_merge_lane_status())
+
+
 @app.route("/api/ci_queue", methods=["GET"])
 def api_ci_queue():
     """Queued/running GitHub Actions counts for armbrain-io/armbrain (cached)."""
@@ -5042,6 +5143,19 @@ transition:border-color .18s,color .18s,box-shadow .18s,background .18s}
 box-shadow:0 0 10px rgba(255,0,68,.6)}
 .panel-fetched{position:absolute;top:10px;right:40px;z-index:4;color:#667;font-size:.58em;
 letter-spacing:.4px;white-space:nowrap;text-transform:lowercase}
+/* MERGE LANE strip (council 136cx part 4). Four cells, one question each.
+   Unknown is GREY, never green and never red: a failed read must not look like a
+   healthy zero, and "0 merged last hour" is a real alarm we must not counterfeit. */
+.ml-strip{display:flex;gap:10px;flex-wrap:wrap;margin:4px 0 2px}
+.ml-cell{flex:1 1 88px;min-width:88px;padding:8px 10px;border-radius:6px;background:#161b26;border:1px solid #232a38;text-align:center}
+.ml-num{font:700 1.5em 'Rajdhani',sans-serif;line-height:1.1}
+.ml-lab{font:500 .68em 'Rajdhani',sans-serif;letter-spacing:.6px;text-transform:uppercase;color:#8b93a7;margin-top:2px}
+.ml-ok .ml-num{color:#7ddc9a}
+.ml-bad{border-color:#7a2c34;background:#241419}
+.ml-bad .ml-num{color:#ff6b7a}
+.ml-unknown .ml-num{color:#8b93a7}
+.ml-note{font:500 .72em 'Rajdhani',sans-serif;color:#8b93a7;margin-top:6px}
+.ml-bad-note{color:#ff6b7a}
 .runson-account{color:#c7cee0;font:500 .72em 'Rajdhani',sans-serif;letter-spacing:.7px;
 text-shadow:none;text-transform:none;margin-left:8px}
 .panel-refresh-body{padding-right:34px}
@@ -5537,6 +5651,14 @@ letter-spacing:0;white-space:pre;width:22ch;text-align:right}
 
 </div>
 
+<!-- MERGE LANE (council 136cx part 4). Placed directly under CI/CD because the question
+     it answers - are merges actually moving - is the first thing anyone asks of that
+     section, and on 2026-09-05 nobody could answer it without going and looking. -->
+<div class=card id=merge-lane-card>
+<button type="button" class="panel-refresh-btn" data-panel="MERGE LANE" title="Refresh this panel" aria-label="Refresh MERGE LANE panel" onclick="refreshPanel(this, 'refreshMergeLane')">&#x21bb;</button>
+<h3>&#x26A1; MERGE LANE</h3>
+<div id="merge-lane-body" class="panel-refresh-body"><p>Loading...</p></div>
+</div>
 <div class=card id=runson-card>
 <button type="button" class="panel-refresh-btn" data-panel="AWS" title="Refresh this panel" aria-label="Refresh AWS panel" onclick="refreshPanel(this, 'refreshRunsOn')">&#x21bb;</button>
 <h3>☁️ AWS <span class="runson-account" id="runson-account">AWS account 930358782508</span></h3>
@@ -5925,6 +6047,46 @@ function refreshShipFlow() {
     }).catch(() => {
         const el = document.getElementById('ship-flow');
         if (el && !el.querySelector('.ship-stage')) el.innerHTML = '<span class="gdim">shipping pipeline failed to load.</span>';
+    });
+}
+
+function refreshMergeLane() {
+    fetch('/api/merge_lane').then(r => r.json()).then(d => {
+        const el = document.getElementById('merge-lane-body');
+        if (!el) return;
+        // UNKNOWN IS NEUTRAL, NEVER GREEN AND NEVER RED. A failed request must not render
+        // as "0 merged last hour" - that is an alarming, useful fact, and inventing it
+        // from an error is a lie shaped exactly like the truth. The shared token hit zero
+        // twice on 2026-09-05, so this path is real, not defensive decoration.
+        const val = v => (v === null || v === undefined) ? null : v;
+        const cell = (label, text, cls) =>
+            `<div class="ml-cell ${cls}"><div class="ml-num">${text}</div><div class="ml-lab">${label}</div></div>`;
+
+        const depth = val(d.depth), oldest = val(d.oldest_awaiting_min), merged = val(d.merged_last_hour);
+
+        // Red only when we KNOW merges are stuck: something queued and nothing landed.
+        const stuck = (depth !== null && depth > 0 && merged === 0);
+        const oldStuck = (oldest !== null && oldest > 20);
+
+        let html = '';
+        html += cell('in queue', depth === null ? '?' : depth, depth === null ? 'ml-unknown' : (stuck ? 'ml-bad' : 'ml-ok'));
+        html += cell('oldest waiting', oldest === null ? '?' : (oldest >= 60 ? Math.floor(oldest/60) + 'h ' + (oldest%60) + 'm' : oldest + 'm'),
+                     oldest === null ? 'ml-unknown' : (oldStuck ? 'ml-bad' : 'ml-ok'));
+        html += cell('merged last hour', merged === null ? '?' : merged, merged === null ? 'ml-unknown' : (stuck ? 'ml-bad' : 'ml-ok'));
+        // The lane does not exist until armbrain#7118 lands. Saying so is honest and costs
+        // no API call; polling for a label nobody carries would spend budget to re-learn
+        // something already known.
+        html += cell('lane runners', d.lane_state === 'not-configured' ? 'n/a' : (d.lane_runners === null ? '?' : d.lane_runners),
+                     d.lane_state === 'not-configured' ? 'ml-unknown' : 'ml-ok');
+
+        let note = '';
+        if (d.lane_state === 'not-configured') note += '<div class="ml-note">reserved lane not built yet (armbrain#7118)</div>';
+        if (d.error) note += `<div class="ml-note">read error: ${d.error} - figures above may be stale</div>`;
+        if (stuck) note += '<div class="ml-note ml-bad-note">merges are queued and none landed in the last hour</div>';
+        el.innerHTML = '<div class="ml-strip">' + html + '</div>' + note;
+    }).catch(() => {
+        const el = document.getElementById('merge-lane-body');
+        if (el) el.innerHTML = '<div class="ml-note">merge lane unreadable</div>';
     });
 }
 
@@ -7195,14 +7357,20 @@ function refreshLocalRunners() {
 
 // --- Polling control: pause everything when the tab isn't visible, resume ---
 // --- with an immediate refresh when it becomes visible again.              ---
-let statusTimer = null, fleetTimer = null, historyTimer = null, energyTimer = null, ciQueueTimer = null, routeHealthTimer = null, modelServingTimer = null, shipFlowTimer = null, runsonTimer = null, localRunnersTimer = null;
+let statusTimer = null, fleetTimer = null, historyTimer = null, energyTimer = null, ciQueueTimer = null, routeHealthTimer = null, modelServingTimer = null, shipFlowTimer = null, runsonTimer = null, localRunnersTimer = null, mergeLaneTimer = null;
 
 function startPolling() {
+    // PAINT ONCE IMMEDIATELY. Without this the card sits on "Loading..." for a full
+    // minute after every page load, and a glanceable display that is blank when you
+    // glance at it is not one. Caught by reading the rendered DOM rather than trusting
+    // that registering a timer was the same as showing a number.
+    try { refreshMergeLane(); } catch (err) { console.error('[dashboard] merge lane first paint failed:', err); }
     if (!localRunnersTimer) localRunnersTimer = setInterval(refreshLocalRunners, 60000);
     if (!statusTimer) statusTimer = setInterval(refresh, 12000);     // queue/GPU state: 12s
     if (!fleetTimer) fleetTimer = setInterval(refreshFleet, 45000);  // ssh fleet stats: 45s
     if (!historyTimer) historyTimer = setInterval(refreshHistory, 60000);
     if (!energyTimer) energyTimer = setInterval(refreshEnergy, 60000);
+    if (!mergeLaneTimer) mergeLaneTimer = setInterval(refreshMergeLane, 60000);  // matches MERGE_LANE_CACHE_TTL
     if (!ciQueueTimer) ciQueueTimer = setInterval(refreshCiQueue, 45000);        // matches backend cache TTL
     if (!shipFlowTimer) shipFlowTimer = setInterval(refreshShipFlow, 60000);     // /api/pipeline is cached 45 seconds
     if (!runsonTimer) runsonTimer = setInterval(refreshRunsOn, 120000);           // matches AWS cache TTL
@@ -7229,6 +7397,7 @@ function stopPolling() {
     clearInterval(historyTimer); historyTimer = null;
     clearInterval(energyTimer); energyTimer = null;
     clearInterval(ciQueueTimer); ciQueueTimer = null;
+    clearInterval(mergeLaneTimer); mergeLaneTimer = null;
     clearInterval(shipFlowTimer); shipFlowTimer = null;
     clearInterval(runsonTimer); runsonTimer = null;
     clearInterval(routeHealthTimer); routeHealthTimer = null;
