@@ -5159,9 +5159,8 @@ text-transform:uppercase;color:#c7cee0;margin-top:4px}
 /* RunsOn shares the glance band, so retain every datum while tightening its
    typography, gaps, and charts to the same glanceable density. */
 #runson-card{padding:8px 12px 9px;min-width:0}
-#runson-card.glow-on{border-color:var(--neon-green);box-shadow:0 0 18px rgba(57,255,20,.35),inset 0 0 35px rgba(57,255,20,.05)}
-#runson-card.glow-off{border-color:var(--neon-red);box-shadow:0 0 18px rgba(255,0,68,.35),inset 0 0 35px rgba(255,0,68,.05)}
-#runson-card.glow-unknown{border-color:#596274;box-shadow:none}
+#runson-card,#local-runners-card{border-color:var(--capacity-color,var(--neon-red));box-shadow:var(--capacity-glow,none)}
+#runson-card::before,#local-runners-card::before{background:var(--capacity-color,var(--neon-red))}
 #runson-shard-state{display:block;margin-top:2px;color:#c7cee0;font:500 .78em 'Rajdhani',sans-serif;letter-spacing:.4px;text-transform:none}
 #runson-card h3{font-size:.78em;margin:0 0 5px;letter-spacing:1.2px}
 /* Two bands only (Ben, 2026-09-02: "7 pieces of data and 2 charts" must not stack four rows deep):
@@ -5299,10 +5298,7 @@ letter-spacing:0;white-space:pre;width:22ch;text-align:right}
 .ship-cap{font-size:.65em;letter-spacing:1px}
 .ship-num.stamp{font-size:.85em}
 .ship-arrow{position:relative;flex:0 0 48px;align-self:center;justify-content:center;height:36px;padding:0 7px 0 2px;border:0;background:transparent;color:var(--arrow-color);cursor:pointer;font-size:11px;text-shadow:none}
-.ship-arrow.bots-red{--arrow-color:var(--neon-red);--arrow-outline:color-mix(in srgb,var(--neon-red) 55%,black)}
-.ship-arrow.bots-yellow{--arrow-color:var(--neon-yellow);--arrow-outline:var(--neon-yellow)}
-.ship-arrow.bots-green{--arrow-color:var(--neon-green);--arrow-outline:var(--neon-green)}
-.ship-arrow.bots-blue{--arrow-color:var(--neon-blue);--arrow-outline:var(--neon-blue)}
+.ship-arrow-shape{filter:var(--arrow-glow,none)}
 .ship-arrow-shape{position:absolute;inset:0;width:100%;height:100%;fill:var(--arrow-color);fill-opacity:.09;stroke:var(--arrow-outline);stroke-width:1.5;stroke-linejoin:round;pointer-events:none}
 .ship-arrow-badge{position:relative;color:var(--arrow-color)}
 .ship-arrow:focus-visible{outline:2px solid var(--arrow-color);outline-offset:2px}
@@ -5614,13 +5610,39 @@ function shipStage(num, cap, cls, sub, spark, help, stageCls, dropdownKey, prs) 
          + (spark ? sparkHtml(spark) : '') + shipDropdown(key, prs || [], agents) + '</div>';
 }
 
+// Anchors: "<=1 red, green at 90%/100 runners, glowing blue at 100%/128";
+// yellow midway to green; CI/CD "0 red, 1 yellow, 4 green, 8 glowing blue".
+function capacityColour(value, anchors) {
+    const n = Number.isFinite(Number(value)) ? Number(value) : 0;
+    const colours = ['var(--neon-red)', 'var(--neon-yellow)', 'var(--neon-green)', 'var(--neon-blue)'];
+    if (n <= anchors[0]) return colours[0];
+    for (let i = 1; i < anchors.length; i++) {
+        if (n <= anchors[i]) {
+            const percent = 100 * (n - anchors[i - 1]) / (anchors[i] - anchors[i - 1]);
+            return 'color-mix(in srgb,' + colours[i - 1] + ' ' + (100 - percent) + '%,' + colours[i] + ')';
+        }
+    }
+    return colours[3];
+}
+function capacityOutline(card, colour, glow) {
+    card.style.setProperty('--capacity-color', colour);
+    card.style.setProperty('--capacity-glow', glow
+        ? '0 0 10px ' + colour + ',0 0 24px ' + colour + ',inset 0 0 18px color-mix(in srgb,' + colour + ' 15%,transparent)'
+        : 'none');
+}
+
 function shipArrow(square, glyph, count, description) {
     const agentLane = glyph === '🤖';
-    const tier = count === 0 ? 'red' : count < 4 ? 'yellow' : count === 4 ? 'green' : 'blue';
+    count = Math.max(0, Number(count) || 0);
+    const colour = capacityColour(count, [0, 1, 4, 8]);
+    const outline = count === 0 ? 'color-mix(in srgb,' + colour + ' 55%,black)' : colour;
+    const style = '--arrow-color:' + colour + ';--arrow-outline:' + outline
+        + ';--arrow-glow:' + (count >= 8 ? 'drop-shadow(0 0 5px ' + colour + ')' : 'none')
+        + (agentLane ? '' : ';cursor:default');
     const key = square.replaceAll(' ', '-').replaceAll('/', '-');
     const label = shipEscape(description + ': ' + count);
     const tag = agentLane ? 'button' : 'span';
-    return '<' + tag + (agentLane ? ' type="button"' : ' role="img" style="cursor:default"') + ' class="ship-arrow bots-' + tier
+    return '<' + tag + (agentLane ? ' type="button"' : ' role="img"') + ' class="ship-arrow" style="' + style
         + '" data-square-left="' + square + '" title="' + label + '" aria-label="' + label + '"'
         + (agentLane ? ' data-dropdown="' + key + '" aria-controls="ship-list-' + key
             + '" aria-expanded="' + (openShipDropdown === key) + '" onclick="toggleShipDropdown(this.dataset.dropdown)"' : '') + '>'
@@ -6841,12 +6863,13 @@ function refreshRunsOn() {
         const body = document.getElementById('runson-body');
         const account = document.getElementById('runson-account');
         if (!card || !body) return;
-        card.classList.remove('glow-on', 'glow-off', 'glow-unknown');
         const gate = d.gate_shards === 'on' || d.gate_shards === 'off' ? d.gate_shards : 'unknown';
-        card.classList.add('glow-' + gate);
+        const count = Math.max(0, Number(d.live_runners) || 0);
+        const off = gate === 'off' || d.available === false || d.deployed === false;
+        capacityOutline(card, capacityColour(off ? 0 : count, [1, 50.5, 100, 128]), !off && count >= 128);
         if (account && d.aws_account_id) account.textContent = 'AWS account ' + d.aws_account_id;
         if (d.deployed === false) {
-            card.style.display = 'none';
+            body.innerHTML = '<p class="runson-warning">RunsOn is not deployed</p>';
             return;
         }
         card.style.display = '';
@@ -6858,7 +6881,6 @@ function refreshRunsOn() {
             return;
         }
 
-        const count = Number(d.live_runners || 0);
         const runners = (d.runners || []).map(r =>
             '<span class="runson-runner">' + runsonEscape(r.instance_type || 'unknown') + ' · '
             + runsonEscape(runsonAge(r.age_minutes)) + '</span>').join('');
@@ -6904,6 +6926,12 @@ function refreshRunsOn() {
 function refreshLocalRunners() {
     return fetch('/api/local_runners').then(r => r.json()).then(d => {
         const body = document.getElementById('local-runners-body');
+        const online = Math.max(0, Number(d.online) || 0);
+        const busy = Math.max(0, Number(d.busy) || 0);
+        const fraction = d.available && online > 0 && busy > 1 ? busy / online : 0;
+        const red = online > 1 ? 1 / online : 0;
+        capacityOutline(document.getElementById('local-runners-card'),
+            capacityColour(fraction, [red, (red + 0.9) / 2, 0.9, 1]), fraction >= 1);
         if (!d.available) { body.innerHTML = '<p class="runson-warning">' + runsonEscape(d.error || 'Could not establish local runners') + '</p>'; return; }
         const history = d.source === 'job_history';
         const count = value => value == null ? 'n/a' : Number(value);
