@@ -14,12 +14,20 @@ def response(runners, next_url=None):
                 links={'next': {'url': next_url}} if next_url else {})
 
 
+def denied(status):
+    result = Mock(status_code=status)
+    result.raise_for_status.side_effect = requests.HTTPError(response=result)
+    return result
+
+
 class LocalRunnersTest(unittest.TestCase):
     def setUp(self):
         q.local_runners_cache.update(data=None, ts=0)
+        q.runner_reads.clear()
 
     def tearDown(self):
         q.local_runners_cache.update(data=None, ts=0)
+        q.runner_reads.clear()
 
     def test_link_pagination_filter_hosts_and_cache(self):
         next_url = 'https://api.github.com/orgs/armbrain-io/actions/runners?per_page=100&page=2'
@@ -54,8 +62,9 @@ class LocalRunnersTest(unittest.TestCase):
             self.assertEqual(result['excluded_cloud'], 1)
 
     def test_partial_inventory_is_never_reported_as_complete(self):
-        for failure in [Mock(status_code=404), requests.Timeout('test')]:
+        for failure in [denied(404), requests.Timeout('test')]:
             with self.subTest(failure=failure), patch.object(q, 'get_gh_ci_token', return_value='test'), patch.object(q.requests, 'get', side_effect=[response([runner('sam-1')], 'https://api.github.com/next'), failure]):
+                q.runner_reads.clear()
                 result = q.get_local_runners(True)
                 self.assertFalse(result['available'])
                 self.assertNotIn('online', result)
@@ -63,7 +72,11 @@ class LocalRunnersTest(unittest.TestCase):
 
 
 class JobHistoryTest(unittest.TestCase):
-    setUp = LocalRunnersTest.setUp
+    def setUp(self):
+        LocalRunnersTest.setUp(self)
+        budget = patch.object(q, '_runner_budget', return_value=1500)
+        budget.start()
+        self.addCleanup(budget.stop)
     tearDown = LocalRunnersTest.tearDown
     @staticmethod
     def page(key, values, next_url=None):
@@ -79,11 +92,10 @@ class JobHistoryTest(unittest.TestCase):
         old = self.run_record(3, minutes=61)
         def job(name, status='completed', labels=()):
             return dict(runner_name=name, status=status, labels=labels)
-        pages = [Mock(status_code=403), self.page('workflow_runs', [active]),
+        pages = [denied(403), self.page('workflow_runs', [active]),
                  self.page('workflow_runs', [recent, active, old]),
                  self.page('jobs', [job('aragorn-5', 'in_progress'), job('runs-on--cloud', 'in_progress'),
                                     job('cloud-label', 'in_progress', ['runs-on=abc']), job('', 'queued')], 'https://api.github.com/jobs-next'),
-                 self.page('jobs', [job('eastfarthing-3')]),
                  self.page('jobs', [job('aragorn-5'), job('eastfarthing-3')])]
         with patch.object(q, 'get_gh_ci_token', return_value='test'), patch.object(q.requests, 'get', side_effect=pages) as get:
             result = q.get_local_runners(True)
@@ -97,24 +109,25 @@ class JobHistoryTest(unittest.TestCase):
             self.assertTrue(all(h['online'] is None and h['idle'] is None for h in result['hosts']))
             self.assertEqual(result['runs_checked'], 2)
             self.assertEqual(q.get_local_runners(), result)
-            self.assertEqual(get.call_count, 6)
+            self.assertEqual(get.call_count, 5)
+            self.assertTrue(result['truncated'])
 
     def test_run_cap_prioritizes_active_and_flags_truncation(self):
         recent = [self.run_record(i) for i in range(35)]
         active = self.run_record(99, 'in_progress', minutes=50)
-        pages = [Mock(status_code=403), self.page('workflow_runs', [active]),
+        pages = [denied(403), self.page('workflow_runs', [active]),
                  self.page('workflow_runs', recent)] + [self.page('jobs', []) for _ in range(30)]
         with patch.object(q, 'get_gh_ci_token', return_value='test'), patch.object(q.requests, 'get', side_effect=pages) as get:
             result = q.get_local_runners(True)
             self.assertEqual(get.call_count, 33)
-            self.assertIn('/runs/99/jobs?', get.call_args_list[3].args[0])
+            self.assertIn('/runs/99/jobs', get.call_args_list[3].args[0])
             self.assertEqual(result['runs_checked'], 30)
             self.assertTrue(result['truncated'])
             self.assertEqual(result['seen_last_hour'], 0)
             self.assertEqual(result['busy'], 0)
 
     def test_failed_jobs_do_not_publish_partial_counts_and_cache_error(self):
-        pages = [Mock(status_code=403), self.page('workflow_runs', []),
+        pages = [denied(403), self.page('workflow_runs', []),
                  self.page('workflow_runs', [self.run_record(1)]), requests.Timeout('jobs timeout')]
         with patch.object(q, 'get_gh_ci_token', return_value='test'), patch.object(q.requests, 'get', side_effect=pages) as get:
             result = q.get_local_runners(True)

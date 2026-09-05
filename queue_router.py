@@ -1793,6 +1793,143 @@ def _release_inflight_fresh_bypass(response):
                 fresh_bypass_at[endpoint] = time.monotonic()
     return response
 
+# Shared reads keep both panels and CI enrichment inside one jobs-call window.
+RUNNER_JOBS_TTL = 120
+runner_reads_lock = threading.RLock()
+runner_reads = {}
+runner_jobs_lock = threading.Lock()
+runner_jobs_cache = {"data": None, "ts": 0.0}
+
+
+def _runner_read(key, url, headers, ttl, calls=None, params=None):
+    with runner_reads_lock:
+        now = time.monotonic()
+        entry = runner_reads.get(key)
+        if entry and now - entry[0] < ttl:
+            if isinstance(entry[1], Exception):
+                raise entry[1]
+            return entry[1]
+        if calls is not None:
+            calls[0] += 1
+        try:
+            response = requests.get(url, headers=headers, params=params, timeout=8)
+            response.raise_for_status()
+        except Exception as exc:
+            # Cache failures too: no retries that multiply the shared token load.
+            runner_reads[key] = (time.monotonic(), exc)
+            raise
+        runner_reads[key] = (time.monotonic(), response)
+        # Bound memory while retaining every unexpired per-run entry.
+        for old_key, (stamp, _) in list(runner_reads.items()):
+            if now - stamp > 600:
+                del runner_reads[old_key]
+        return response
+
+
+def _runner_budget(headers, calls=None):
+    response = _runner_read('budget', 'https://api.github.com/rate_limit',
+                            headers, RUNNER_JOBS_TTL, calls)
+    return response.json()['resources']['core']['remaining']
+
+
+def _runner_run_jobs(run_id, headers, calls=None):
+    if _runner_budget(headers, calls) < 1000:
+        raise ValueError('GitHub budget below 1,000 remaining')
+    return _runner_read(('jobs', run_id),
+        f'https://api.github.com/repos/{GITHUB_CI_REPO}/actions/runs/{run_id}/jobs',
+        headers, RUNNER_JOBS_TTL, calls, {'filter': 'latest', 'per_page': 100})
+
+
+def _runner_active_runs(headers, calls=None):
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=48)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    return _runner_read('active_runs',
+        f'https://api.github.com/repos/{GITHUB_CI_REPO}/actions/runs',
+        headers, CI_QUEUE_CACHE_TTL, calls,
+        {'status': 'in_progress', 'per_page': 100, 'created': f'>={cutoff}'})
+
+
+def _runner_inventory(headers, calls=None):
+    rows = []
+    url = 'https://api.github.com/orgs/armbrain-io/actions/runners?per_page=100'
+    while url:
+        response = _runner_read(('inventory', url), url, headers, 60, calls)
+        rows.extend(response.json()['runners'])
+        url = response.links.get('next', {}).get('url')
+    return rows
+
+
+def get_runner_jobs():
+    with runner_jobs_lock:
+        now = time.monotonic()
+        previous = runner_jobs_cache['data']
+        if previous is not None and now - runner_jobs_cache['ts'] < RUNNER_JOBS_TTL:
+            return dict(previous, cached=True, github_calls=0)
+        calls = [0]
+        remaining = None
+        try:
+            token = get_gh_ci_token()
+            if not token:
+                raise ValueError('CI token unavailable')
+            headers = {'Authorization': f'token {token}', 'Accept': 'application/vnd.github+json'}
+            remaining = _runner_budget(headers, calls)
+            if remaining < 1000:
+                raise ValueError('GitHub budget below 1,000 remaining')
+            inventory = _runner_inventory(headers, calls)
+            response = _runner_active_runs(headers, calls)
+            runs = response.json().get('workflow_runs', [])
+            truncated = bool(response.links.get('next'))
+            matched, errors = {}, []
+            for run in runs:
+                try:
+                    response = _runner_run_jobs(run['id'], headers, calls)
+                    truncated |= bool(response.links.get('next'))
+                    for job in response.json().get('jobs', []):
+                        if job.get('status') == 'in_progress' and job.get('runner_name'):
+                            matched[job['runner_name']] = (run, job)
+                except Exception as exc:
+                    errors.append(str(exc))
+            jobs = []
+            for runner in inventory:
+                if not runner['busy']:
+                    continue
+                name = runner['name']
+                labels = [label['name'] for label in runner.get('labels', [])]
+                cloud = _is_cloud_runner(name, labels)
+                row = dict(host='RunsOn' if cloud else name.split('-')[0].lower(),
+                           runner=name, pool='aws' if cloud else 'home', repo=None,
+                           pr=None, branch=None, workflow=None, job='busy - job not visible',
+                           started_at=None, minutes_running=None, run_url=None, run_id=None)
+                if name in matched:
+                    run, job = matched[name]
+                    started = job.get('started_at')
+                    minutes = None
+                    if started:
+                        minutes = round(max(0, (datetime.now(timezone.utc) - datetime.fromisoformat(started.replace('Z', '+00:00'))).total_seconds() / 60), 1)
+                    prs = run.get('pull_requests') or []
+                    row.update(repo=GITHUB_CI_REPO, pr=prs[0]['number'] if prs else None,
+                               branch=run.get('head_branch'), workflow=run.get('name'),
+                               job=job.get('name'), started_at=started, minutes_running=minutes,
+                               run_url=run.get('html_url'), run_id=run['id'])
+                jobs.append(row)
+            result = dict(jobs=sorted(jobs, key=lambda j: (j['host'], j['runner'])),
+                          available=True, stale=bool(errors), error='; '.join(sorted(set(errors))) or None,
+                          truncated=truncated, updated_at=datetime.now(timezone.utc).isoformat(), cached=False)
+        except Exception as exc:
+            result = dict(previous or dict(jobs=[], available=False, updated_at=None, truncated=False),
+                          stale=True, error=str(exc), cached=previous is not None)
+        result.update(github_calls=calls[0], refresh_github_calls=calls[0], budget_remaining=remaining)
+        runner_jobs_cache.update(data=result, ts=time.monotonic())
+        logger.info('runner_jobs refresh github_calls=%s jobs=%s stale=%s budget_remaining=%s',
+                    calls[0], len(result['jobs']), result['stale'], remaining)
+        return result
+
+
+@app.route('/api/runner_jobs', methods=['GET'])
+def api_runner_jobs():
+    # Even ?fresh=1 must honor the fleet's hard 120-second budget window.
+    return jsonify(get_runner_jobs())
+
+
 def get_ci_queue_status(force_refresh=False):
     """Current GitHub Actions queue depth and job-level activity for armbrain."""
     now = time.time()
@@ -1827,12 +1964,7 @@ def get_ci_queue_status(force_refresh=False):
                 headers=headers,
                 timeout=8,
             )
-            ip = requests.get(
-                base,
-                params={"status": "in_progress", "per_page": 100, "created": f">={cutoff}"},
-                headers=headers,
-                timeout=8,
-            )
+            ip = _runner_active_runs(headers)
             if q.ok and ip.ok:
                 result["available"] = True
                 result["queued"] = q.json().get("total_count", 0)
@@ -1844,12 +1976,7 @@ def get_ci_queue_status(force_refresh=False):
                     active_jobs = 0
                     active_runners = set()
                     for run in (ip.json().get("workflow_runs") or [])[:12]:
-                        jobs = requests.get(
-                            f"{base}/{run['id']}/jobs",
-                            params={"per_page": 100},
-                            headers=headers,
-                            timeout=8,
-                        )
+                        jobs = _runner_run_jobs(run['id'], headers)
                         if not jobs.ok:
                             continue
                         for job in jobs.json().get("jobs", []):
@@ -3943,15 +4070,11 @@ def _local_runner_job_history(token):
             if datetime.fromisoformat(run['updated_at'].replace('Z', '+00:00')) >= datetime.fromisoformat(since):
                 runs[run['id']] = run
     ordered = sorted(runs.values(), key=lambda r: (r['status'] == 'in_progress', r['updated_at']), reverse=True)
+    job_truncated = []
     def read_jobs(run):
-        jobs = []
-        url = base + f"/runs/{run['id']}/jobs?per_page=100"
-        while url:
-            response = requests.get(url, headers=headers, timeout=15)
-            response.raise_for_status()
-            jobs.extend(response.json()['jobs'])
-            url = response.links.get('next', {}).get('url')
-        return jobs
+        response = _runner_run_jobs(run['id'], headers)
+        job_truncated.append(bool(response.links.get('next')))
+        return response.json()['jobs']
 
     runners, excluded = {}, set()
     # Keep the sample close to now without increasing the request budget.
@@ -3980,7 +4103,7 @@ def _local_runner_job_history(token):
         busy=sum(r['busy'] for r in runners.values()), seen_last_hour=len(runners),
         runners=list(runners.values()), hosts=[hosts[h] for h in sorted(hosts)],
         excluded_cloud=len(excluded), since=since, runs_checked=min(30, len(ordered)),
-        run_limit=30, truncated=len(ordered) > 30 or listing_truncated,
+        run_limit=30, truncated=len(ordered) > 30 or listing_truncated or any(job_truncated),
         repo=GITHUB_CI_REPO, workflow_id=255384592,
         caption="from the last hour's jobs; the org runner list needs a permission Ben has not granted yet",
         jobs_today=None, jobs_today_reason='The last hour of jobs does not report jobs today')
@@ -3997,21 +4120,20 @@ def get_local_runners(force_refresh=False):
             if not token:
                 raise ValueError('CI token unavailable')
             runners, excluded_cloud = [], 0
-            url = 'https://api.github.com/orgs/armbrain-io/actions/runners?per_page=100'
-            while url:
-                response = requests.get(
-                    url,
-                    headers={'Authorization': f'Bearer {token}', 'Accept': 'application/vnd.github+json'},
-                    timeout=15)
-                if response.status_code == 403:
+            try:
+                inventory = _runner_inventory({'Authorization': f'Bearer {token}', 'Accept': 'application/vnd.github+json'})
+            except requests.HTTPError as exc:
+                if exc.response.status_code == 403:
                     result['source'] = 'job_history'
                     result.update(_local_runner_job_history(token))
-                    break
-                if response.status_code == 404:
+                    inventory = None
+                elif exc.response.status_code == 404:
                     result['error'] = 'no permission to read runners'
-                    break
-                response.raise_for_status()
-                for r in response.json()['runners']:
+                    inventory = None
+                else:
+                    raise
+            if inventory is not None:
+                for r in inventory:
                     labels = [label['name'] for label in r['labels']]
                     if _is_cloud_runner(r['name'], labels):
                         excluded_cloud += 1
@@ -4020,8 +4142,6 @@ def get_local_runners(force_refresh=False):
                               'status': r['status'], 'busy': r['busy']}
                     runner['host'] = _local_runner_host(runner)
                     runners.append(runner)
-                url = response.links.get('next', {}).get('url')
-            else:
                 hosts = {}
                 for runner in runners:
                     host = hosts.setdefault(runner['host'], {'host': runner['host'],
@@ -5311,6 +5431,15 @@ letter-spacing:0;white-space:pre;width:22ch;text-align:right}
 .local-runner{font-size:.85em;padding:4px 0;overflow-wrap:anywhere}
 #local-runners-card details{margin-top:10px}
 @media(max-width:900px){.monitor-glance-band{grid-template-columns:1fr}.ship-flow{flex-wrap:wrap}.ship-stage{flex:1 0 110px}}
+.runner-jobs-details{margin-top:6px;color:#c7cee0;font-size:.78em}
+.runner-jobs-details summary{cursor:pointer;list-style:none;user-select:none}
+.runner-jobs-details summary::-webkit-details-marker{display:none}
+.runner-jobs-details summary::before{content:'▸ '}
+.runner-jobs-details[open] summary::before{content:'▾ '}
+.runner-jobs-details>div{max-height:330px;overflow:auto;margin-top:6px}
+.runner-jobs-host>b{display:block;margin-top:8px;color:var(--neon-cyan)}
+.runner-job-row{display:grid;grid-template-columns:minmax(90px,1fr) 75px minmax(130px,2fr) 50px;gap:8px;border-bottom:1px solid #27304a;padding:5px 0;overflow-wrap:anywhere}
+.runner-job-row a{color:var(--neon-cyan)}
 </style></head>
 <body><div class="hdr-wrap"><h1>FLEET MONITOR</h1><div id="last-updated" class="last-updated" title="Time of the most recent successful data refresh. Green = fresh, amber = aging, red = this page has gone stale."><span class="lu-label">last updated</span><span class="lu-time" id="lu-time">connecting…</span></div></div>
 
@@ -5332,10 +5461,12 @@ letter-spacing:0;white-space:pre;width:22ch;text-align:right}
 <button type="button" class="panel-refresh-btn" data-panel="AWS" title="Refresh this panel" aria-label="Refresh AWS panel" onclick="refreshPanel(this, 'refreshRunsOn')">&#x21bb;</button>
 <h3>☁️ AWS <span class="runson-account" id="runson-account">AWS account 930358782508</span></h3>
 <div id=runson-body><p>Loading...</p></div>
+<details class="runner-jobs-details" id="aws-runner-jobs"><summary>show running jobs</summary><div>Loading...</div></details>
 </div>
 <div class="card" id="local-runners-card">
 <button type="button" class="panel-refresh-btn" data-panel="HOME LAB" aria-label="Refresh HOME LAB panel" onclick="refreshPanel(this, 'refreshLocalRunners')">&#x21bb;</button>
 <h3>HOME LAB</h3><div id="local-runners-body">Loading...</div>
+<details class="runner-jobs-details" id="home-runner-jobs"><summary>show running jobs</summary><div>Loading...</div></details>
 </div>
 </div>
 
@@ -6857,8 +6988,39 @@ function runsonBudgetGauge(label, spent, limit) {
         + '" style="width:' + Math.min(100, percent) + '%"></div></div></div>';
 }
 
+let runnerJobsData = null, runnerJobsPending = null, runnerJobsAwsOff = false;
+function renderRunnerJobs(data) {
+    for (const pool of ['home', 'aws']) {
+        const details = document.getElementById(pool + '-runner-jobs');
+        const rows = (data.jobs || []).filter(j => j.pool === pool);
+        details.querySelector('summary').textContent = (pool === 'aws' && runnerJobsAwsOff && !rows.length
+            ? 'RunsOn off - 0 jobs' : 'show ' + rows.length + ' running jobs') + (data.stale ? ' · stale' : '');
+        const hosts = [...new Set(rows.map(j => j.host))];
+        details.querySelector('div').innerHTML = (data.stale ? '<p class="runson-warning">Stale · ' + runsonEscape(data.error || 'refresh unavailable') + '</p>' : '')
+            + (data.truncated ? '<p class="runson-warning">Limited GitHub sample; unmatched busy runners remain visible</p>' : '')
+            + hosts.map(host => '<div class="runner-jobs-host"><b>' + runsonEscape(host) + '</b>'
+                + rows.filter(j => j.host === host).map(j => {
+                    const target = j.pr ? '<a href="https://github.com/' + runsonEscape(j.repo) + '/pull/' + Number(j.pr) + '">PR #' + Number(j.pr) + '</a>' : runsonEscape(j.branch || '');
+                    const title = runsonEscape([j.workflow, j.job].filter(Boolean).join(' · '));
+                    const job = j.run_id ? '<a href="https://github.com/' + runsonEscape(j.repo) + '/actions/runs/' + Number(j.run_id) + '">' + title + '</a>' : title;
+                    return '<div class="runner-job-row"><span>' + runsonEscape(j.runner) + '</span><span>' + target + '</span><span>' + job + '</span><span>' + (j.minutes_running == null ? '—' : Number(j.minutes_running) + ' min') + '</span></div>';
+                }).join('') + '</div>').join('') + (!rows.length ? '<p>' + (data.available ? 'No running jobs' : 'Running jobs unavailable') + '</p>' : '');
+    }
+}
+function refreshRunnerJobs() {
+    if (runnerJobsPending) return runnerJobsPending;
+    runnerJobsPending = fetch('/api/runner_jobs').then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+        .then(d => { runnerJobsData = d; renderRunnerJobs(d); })
+        .catch(() => renderRunnerJobs({...runnerJobsData, stale:true, error:'Running jobs refresh failed'}))
+        .finally(() => { runnerJobsPending = null; });
+    return runnerJobsPending;
+}
+
 function refreshRunsOn() {
+    refreshRunnerJobs();
     fetch('/api/runson').then(r => r.json()).then(d => {
+        runnerJobsAwsOff = d.gate_shards === 'off' || d.deployed === false;
+        if (runnerJobsData) renderRunnerJobs(runnerJobsData);
         const card = document.getElementById('runson-card');
         const body = document.getElementById('runson-body');
         const account = document.getElementById('runson-account');
@@ -6924,6 +7086,7 @@ function refreshRunsOn() {
 }
 
 function refreshLocalRunners() {
+    refreshRunnerJobs();
     return fetch('/api/local_runners').then(r => r.json()).then(d => {
         const body = document.getElementById('local-runners-body');
         const online = Math.max(0, Number(d.online) || 0);
