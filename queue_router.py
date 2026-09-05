@@ -1949,7 +1949,51 @@ RUNSON_AWS_TIMEOUT = 12
 RUNSON_STACK_NAME = "runs-on"
 RUNSON_WORKFLOW_JOBS_TABLE = "runs-on-workflow-jobs"
 RUNSON_COST_CACHE_TTL = 6 * 60 * 60  # CE calls cost money; never fetch more than four times/day.
-RUNSON_DAILY_BUDGET_USD = 15.0
+# Ben's ruling, 2026-09-05 12:50 AM CT, verbatim: "only use spot units on aws to keep
+# costs down. I am authorizing $25/day and $500/month until we get this backlog fully
+# completed and we are down to less than 100 open issues." Council 136bh.
+#
+# These are ENFORCED, not displayed. Until 2026-09-05 there was a RUNSON_DAILY_BUDGET_USD
+# = 15.0 that appeared exactly twice in this file - its definition and the API payload -
+# and the dashboard drew a bar captioned "$15 fuse" next to it. Nothing ever compared
+# spend against it. On 2026-09-04 the account spent $38.78, 2.6x that "fuse", and nothing
+# fired because there was nothing to fire. A number that reads as a control and is only a
+# label is worse than no number: it buys false confidence.
+RUNSON_DAILY_BUDGET_USD = 25.0
+RUNSON_MONTHLY_BUDGET_USD = 500.0
+
+
+def runson_budget_verdict(spent_today, spent_month, cost_error=None):
+    """Decide whether RunsOn may keep spending. Pure, so the thresholds are testable.
+
+    Returns (state, reason) where state is "ok", "tripped" or "unreadable".
+
+    FAIL-CLOSED ON AN UNREADABLE READ. If Cost Explorer cannot be read we do not know
+    what has been spent, and continuing to burn against an unknown is the one mistake
+    that costs money rather than time. This mirrors SPEND_ON_UNREADABLE_POOL=false in the
+    lane keeper: unreadable is not healthy, and None is never zero.
+    """
+    if cost_error:
+        return "unreadable", f"cost read failed ({cost_error}); refusing to spend against an unknown"
+    if spent_today is None or spent_month is None:
+        return "unreadable", "cost read returned no figure; refusing to spend against an unknown"
+    try:
+        today = float(spent_today)
+        month = float(spent_month)
+    except (TypeError, ValueError):
+        return "unreadable", f"cost read was not numeric ({spent_today!r}, {spent_month!r})"
+    if today >= RUNSON_DAILY_BUDGET_USD:
+        return "tripped", (
+            f"daily budget reached: ${today:.2f} of ${RUNSON_DAILY_BUDGET_USD:.2f}"
+        )
+    if month >= RUNSON_MONTHLY_BUDGET_USD:
+        return "tripped", (
+            f"monthly budget reached: ${month:.2f} of ${RUNSON_MONTHLY_BUDGET_USD:.2f}"
+        )
+    return "ok", (
+        f"${today:.2f}/${RUNSON_DAILY_BUDGET_USD:.2f} today, "
+        f"${month:.2f}/${RUNSON_MONTHLY_BUDGET_USD:.2f} this month"
+    )
 RUNSON_MONTHLY_GUARD_USD = 350.0
 RUNSON_CREDIT_BURN_BUDGET_USD = 60.0
 RUNSON_CREDIT_ANCHORS = (
@@ -2411,10 +2455,14 @@ def _runson_fetch():
                 },
                 "budget_limits": {
                     "daily": RUNSON_DAILY_BUDGET_USD,
+                    "monthly": RUNSON_MONTHLY_BUDGET_USD,
                     "monthly_guard": RUNSON_MONTHLY_GUARD_USD,
                     "credit_burn_monthly": RUNSON_CREDIT_BURN_BUDGET_USD,
                 },
                 "budget_actuals": (ce_costs or {}).get("budget_actuals", {}),
+                "fuse": _runson_fuse_step(
+                    costs.get("spent_today"), costs.get("spent_month"), cost_error
+                ),
                 "generated_at": datetime.now(timezone.utc).isoformat(),
             }
 
@@ -2492,6 +2540,80 @@ def _runson_annotate(data, ts):
     """Return a copy tagged with its age. The cached dict itself is shared - never mutate it."""
     age = max(0.0, time.time() - ts)
     return {**data, "cache_age_seconds": round(age, 1), "stale": age >= RUNSON_CACHE_TTL}
+
+
+def _runson_fuse_step(spent_today, spent_month, cost_error):
+    """Evaluate the budget and trip the gate if needed. Returns the payload block.
+
+    Wrapped so a failure here can never take down /api/runson. A cost guard that turns
+    into an outage is a worse trade than the spend it was guarding against.
+    """
+    try:
+        state, reason = runson_budget_verdict(spent_today, spent_month, cost_error)
+        gate = (get_runson_gate_shards() or {}).get("gate_shards", "unknown")
+        action, detail = runson_enforce_budget(state, reason, gate)
+        return {
+            "state": state,
+            "reason": reason,
+            "gate_at_evaluation": gate,
+            "action": action,
+            "detail": detail,
+            "daily_limit": RUNSON_DAILY_BUDGET_USD,
+            "monthly_limit": RUNSON_MONTHLY_BUDGET_USD,
+            "enforced": True,
+        }
+    except Exception as exc:
+        logger.warning("RunsOn fuse evaluation failed: %s", type(exc).__name__)
+        return {
+            "state": "error", "reason": f"fuse evaluation raised {type(exc).__name__}",
+            "gate_at_evaluation": None, "action": "none", "detail": None,
+            "daily_limit": RUNSON_DAILY_BUDGET_USD,
+            "monthly_limit": RUNSON_MONTHLY_BUDGET_USD,
+            "enforced": True,
+        }
+
+
+def runson_enforce_budget(verdict_state, reason, current_gate):
+    """Trip the shard gate off when the budget verdict is not ok. Council 136bh.
+
+    THIS IS THE ONLY WRITE THIS SERVICE MAKES, and it is deliberately one-directional:
+    it can set RUNSON_GATE_SHARDS to false and it can never set it to true. Turning
+    capacity back ON is a judgement about readiness (council 136bh (d) ties it to
+    armbrain#7070 being deployed), not something a spend reading should decide. A fuse
+    that can re-arm itself is a flapping loop, not a fuse.
+
+    Idempotent: if the gate is already off there is nothing to do and no call is made.
+
+    Returns (action, detail) for the payload. Never raises - a monitoring endpoint that
+    500s because a budget write failed has turned a cost guard into an outage.
+    """
+    if verdict_state == "ok":
+        return "none", "within budget"
+    if current_gate == "off":
+        return "already-off", f"gate already off; {reason}"
+    if current_gate != "on":
+        # "unknown" - we could not read the gate. Do not write blind: a PATCH here could
+        # be flipping something we never saw, and the read failure is already surfaced
+        # as gate_shards_error.
+        return "skipped", f"gate state unknown, not writing blind; {reason}"
+
+    token = get_gh_ci_token()
+    if not token:
+        return "failed", "GitHub token unavailable; gate NOT tripped"
+    try:
+        response = requests.patch(
+            "https://api.github.com/repos/armbrain-io/armbrain/actions/variables/RUNSON_GATE_SHARDS",
+            headers={"Authorization": f"token {token}", "Accept": "application/vnd.github+json"},
+            json={"name": "RUNSON_GATE_SHARDS", "value": "false"},
+            timeout=8,
+        )
+    except Exception as exc:
+        logger.warning("RunsOn budget fuse could not write the gate: %s", type(exc).__name__)
+        return "failed", f"gate write raised {type(exc).__name__}; gate NOT tripped"
+    if response.status_code in (200, 204):
+        logger.warning("RunsOn budget fuse TRIPPED the shard gate: %s", reason)
+        return "tripped", reason
+    return "failed", f"gate write returned HTTP {response.status_code}; gate NOT tripped"
 
 
 def _runson_gate_shards_fetch():
@@ -6896,12 +7018,23 @@ function refreshRunsOn() {
             ? Number.NaN : Number(d.credits_remaining);
         const credits = Number.isFinite(creditsNumber) ? '$' + creditsNumber.toFixed(2) : 'n/a';
         const limits = d.budget_limits || {};
-        const dailyLimit = Number(limits.daily || 15), monthlyLimit = Number(limits.monthly_guard || 350);
+        /* Defaults track Ben's 2026-09-05 authorization ($25/day, $500/month). They are
+           only a fallback for a payload that predates the field - the server is the
+           source of truth, and the previous 15/350 defaults outlived the real numbers. */
+        const dailyLimit = Number(limits.daily || 25), monthlyLimit = Number(limits.monthly || 500);
+        const fuse = d.fuse || {};
         const visuals = '<div class="runner-facts" id="runson-budget-strip">'
             + '<div class="runson-fact"><b>' + credits + '</b><span>AWS credits left</span>'
             + (Number.isFinite(creditsNumber) ? '' : '<small>' + runsonEscape(d.credits_error || 'Credits balance unavailable') + '</small>') + '</div>'
             + '<div class="runson-fact"><b id="runson-spent-today">' + runsonMoney(d.spent_today)
-            + '</b><span>Spent today · $' + dailyLimit.toFixed(0) + ' fuse</span></div>'
+            /* The word "fuse" is only honest now that runson_enforce_budget() actually
+               trips the shard gate. Before 2026-09-05 this caption sat next to a number
+               nothing compared against, and the account spent $38.78 through a "$15
+               fuse" without a thing firing. If the enforcement is ever removed, this
+               label must go with it. */
+            + '</b><span>Spent today · $' + dailyLimit.toFixed(0) + '/day · $' + monthlyLimit.toFixed(0) + '/mo'
+            + (fuse.state === 'tripped' ? ' · FUSE TRIPPED' : fuse.state === 'unreadable' ? ' · FUSE HELD (cost unreadable)' : '')
+            + '</span></div>'
             + '<div class="runson-fact"><b id="runson-spent-month">' + runsonMoney(d.spent_month)
             + '</b><span>Spent this month · $' + monthlyLimit.toFixed(0) + ' guard</span></div></div>';
         body.innerHTML = '<div class="runson-grid">'
