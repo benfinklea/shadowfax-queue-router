@@ -5298,9 +5298,14 @@ letter-spacing:0;white-space:pre;width:22ch;text-align:right}
 .ship-stage{flex:1 1 0;min-width:0;padding:8px 6px}
 .ship-cap{font-size:.65em;letter-spacing:1px}
 .ship-num.stamp{font-size:.85em}
-.ship-arrow{flex:0 0 48px;align-self:center;justify-content:center;height:36px;padding:0 7px 0 2px;border:0;background:#922276;color:#ffe1fa;clip-path:polygon(0 15%,70% 15%,70% 0,100% 50%,70% 100%,70% 85%,0 85%,12% 50%);cursor:pointer;font-size:11px}
-.ship-arrow.empty{color:#aa779d;background:#4c2347}
-.ship-arrow:focus-visible{background:#d437b0}
+.ship-arrow{position:relative;flex:0 0 48px;align-self:center;justify-content:center;height:36px;padding:0 7px 0 2px;border:0;background:transparent;color:var(--arrow-color);cursor:pointer;font-size:11px;text-shadow:none}
+.ship-arrow.bots-red{--arrow-color:var(--neon-red);--arrow-outline:color-mix(in srgb,var(--neon-red) 55%,black)}
+.ship-arrow.bots-yellow{--arrow-color:var(--neon-yellow);--arrow-outline:var(--neon-yellow)}
+.ship-arrow.bots-green{--arrow-color:var(--neon-green);--arrow-outline:var(--neon-green)}
+.ship-arrow.bots-blue{--arrow-color:var(--neon-blue);--arrow-outline:var(--neon-blue)}
+.ship-arrow-shape{position:absolute;inset:0;width:100%;height:100%;fill:var(--arrow-color);fill-opacity:.09;stroke:var(--arrow-outline);stroke-width:1.5;stroke-linejoin:round;pointer-events:none}
+.ship-arrow-badge{position:relative;color:var(--arrow-color)}
+.ship-arrow:focus-visible{outline:2px solid var(--arrow-color);outline-offset:2px}
 #local-runners-card{padding:8px 12px 9px;min-width:0}
 #local-runners-card h3{font-size:.78em;margin:0 0 5px;letter-spacing:1.2px}
 .runner-facts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:12px}
@@ -5609,13 +5614,15 @@ function shipStage(num, cap, cls, sub, spark, help, stageCls, dropdownKey, prs) 
 }
 
 function shipArrow(square) {
-    const count = shipAgents ? shipAgents.filter(a => a.live && a.square === square).length : null;
+    const count = (shipAgents || []).filter(a => a.live && a.square === square).length;
+    const tier = count === 0 ? 'red' : count < 4 ? 'yellow' : count === 4 ? 'green' : 'blue';
     const key = square.replaceAll(' ', '-').replaceAll('/', '-');
-    return '<button type="button" class="ship-arrow' + (count === 0 ? ' empty' : '')
+    return '<button type="button" class="ship-arrow bots-' + tier
         + '" data-square-left="' + square + '" data-dropdown="' + key + '" aria-controls="ship-list-' + key
         + '" aria-expanded="' + (openShipDropdown === key) + '" aria-label="Agents on ' + square
-        + ': ' + (count === null ? 'could not establish' : count) + '" onclick="toggleShipDropdown(this.dataset.dropdown)">🤖'
-        + (count === null ? ' ?' : count ? ' ' + count : '') + '</button>';
+        + ': ' + count + '" onclick="toggleShipDropdown(this.dataset.dropdown)">'
+        + '<svg class="ship-arrow-shape" viewBox="0 0 48 36" preserveAspectRatio="none" aria-hidden="true"><polygon points="1,6 33,6 33,1 47,18 33,35 33,30 1,30 6,18"/></svg>'
+        + '<span class="ship-arrow-badge">🤖 ' + count + '</span></button>';
 }
 
 function mergedRateClass(count) {
