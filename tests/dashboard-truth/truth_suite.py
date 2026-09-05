@@ -53,6 +53,15 @@ results: list[dict] = []
 api: dict[str, object] = {}
 
 
+# Wall-clock cap for the LIVE page render. Measured on gandalf against the running
+# service with the same invocation, three consecutive runs: cold 64.0s, warm 11.1s,
+# warm 10.0s. The old 60s cap sat four seconds under the cold cost, and the hourly
+# cron is always cold - which is why 01:13Z timed out while warm interactive runs
+# passed. 150s is roughly 2.3x the worst observed cold render.
+# The fixture renders elsewhere in this file read a local file and stay at 60s.
+CHROME_LIVE_RENDER_TIMEOUT = 150
+
+
 def emit(level: str, signal: str, dashboard, instrument, detail: str = "") -> None:
     row = {"level": level, "signal": signal, "dashboard": dashboard,
            "instrument": instrument, "detail": detail}
@@ -836,7 +845,7 @@ console.log(JSON.stringify({
         chrome = run([
             "google-chrome", "--headless", "--no-sandbox", "--disable-gpu",
             "--virtual-time-budget=26000", "--dump-dom", BASE + "/",
-        ], timeout=60)
+        ], timeout=CHROME_LIVE_RENDER_TIMEOUT)
         gate = api.get("runson", {}).get("gate_shards")
         expected_glow = "glow-" + (gate if gate in ("on", "off") else "unknown")
         card_tag = re.search(r'<div[^>]*id="runson-card"[^>]*>', chrome.stdout)
@@ -874,10 +883,11 @@ console.log(JSON.stringify({
         if budget_match:
             budget_text = html.unescape(re.sub(r"<[^>]+>", " ", budget_match.group(1)))
             budget_text = re.sub(r"\s+", " ", budget_text).strip()
+        rendered_markup = re.sub(r"(?is)<script\b.*?</script>", "", chrome.stdout)
         budget_render_ok = (
             chrome.returncode == 0
-            and 'id="runson-spend-chart"' not in chrome.stdout
-            and 'id="runson-credits-chart"' not in chrome.stdout
+            and 'id="runson-spend-chart"' not in rendered_markup
+            and 'id="runson-credits-chart"' not in rendered_markup
             and "AWS credits left" in budget_text
             and "Spent today" in budget_text
             and "runson-spent-month" in chrome.stdout
