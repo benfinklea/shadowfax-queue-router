@@ -5703,8 +5703,8 @@ function refreshShipFlow() {
         }
         el.innerHTML =
             shipStage(d.issues_open, 'issues open', '', '', null, HELP.issues) + shipArrow('issues open', '🤖', (shipAgents || []).filter(a => a.live && a.square === 'issues open').length, 'Live agent lanes on issues open') +
-            shipStage(d.prs_open, 'prs open', '', '', null, HELP.prs) + shipArrow('prs open', '⚙', d.prs_open, 'Open PRs (proxy: awaiting-trigger count unavailable)') +
-            shipStage(ciNum, 'ci q/run', ciCls, '', null, HELP.ciqr) + shipArrow('ci q/run', '⚙', d.ci_queued + d.ci_running, 'Workflow runs queued or in progress') +
+            shipStage(d.prs_open, 'prs open', '', '', null, HELP.prs) + shipArrow('prs open', '⚙', d.ci_queued, 'Workflow runs queued') +
+            shipStage(ciNum, 'ci q/run', ciCls, '', null, HELP.ciqr) + shipArrow('ci q/run', '⚙', d.ci_running, 'Workflow runs in progress') +
             shipStage(d.green_waiting, 'green waiting', greenCls, greenSub, null, HELP.greenWaiting, '', 'green-waiting', d.green_waiting_prs) + shipArrow('green waiting', '⚡', d.green_waiting, 'Green eligible PRs not yet enqueued') +
             shipStage(d.queue_depth, 'in line', queueCls, queueSub, null, HELP.inLine, '', 'in-line', d.queue_prs) + shipArrow('in line', '⚡', d.queue_depth, 'Merge queue entries') +
             shipStage(d.merged_today, 'merged today', 'ok', mergedSub, d.merged_spark, HELP.merged, mergedRateClass(d.merged_last_hour), 'merged-today', d.merged_today_prs) + shipArrow('merged today', '⚡', shipDeployCount(d), 'Production deploy workflows in flight, or merge awaiting deploy') +
