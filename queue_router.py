@@ -4109,6 +4109,72 @@ def _local_runner_job_history(token):
         jobs_today=None, jobs_today_reason='The last hour of jobs does not report jobs today')
 
 
+CI_TIMING_STATE = Path('/workspace/planning/state/ci-timing')
+
+
+def _local_jobs_today(runners, now=None):
+    """Count observed CT-day jobs from local records and existing cached reads only."""
+    from zoneinfo import ZoneInfo
+    now = now or datetime.now(timezone.utc)
+    start = now.astimezone(ZoneInfo('America/Chicago')).replace(
+        hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+    names = {r['name'] for r in runners}
+    hosts = tuple(FLEET_IPS) + ('pippin', 'fellowship-gate')
+    jobs = {}
+    latest = None
+
+    def record(run_id, attempt, name, runner, labels, started, completed):
+        nonlocal latest
+        if not runner or _is_cloud_runner(runner, labels):
+            return
+        if not (runner in names or 'self-hosted' in labels or
+                any(runner.lower() == host or runner.lower().startswith(host + '-') for host in hosts)):
+            return
+        key = (run_id, attempt, name)
+        old_start, old_end = jobs.get(key, (None, None))
+        jobs[key] = (started or old_start, completed or old_end)
+        if completed and (latest is None or completed > latest):
+            latest = completed
+
+    try:
+        # CT days can span two UTC months; files are partitioned by completion.
+        months = {start.strftime('%Y-%m'), now.strftime('%Y-%m')}
+        for month in sorted(months):
+            with (CI_TIMING_STATE / f'jobs-{month}.jsonl').open() as stream:
+                for line in stream:
+                    try:
+                        row = json.loads(line)
+                        completed = datetime.fromisoformat(row['ts_completed'].replace('Z', '+00:00'))
+                        started = completed - timedelta(seconds=float(row['duration_s']))
+                        record(row['run_id'], row.get('run_attempt', 1), row['job_name'],
+                               row.get('runner_name', ''), [], started, completed)
+                    except (ValueError, KeyError, TypeError):
+                        continue  # The collector may be appending its final line.
+    except OSError:
+        logger.warning('Local CI timing records unavailable')
+        return dict(jobs_today=None, jobs_done=None, jobs_today_reason='Timing records unavailable',
+                    jobs_count_note='Timing records unavailable')
+
+    # Snapshot shared responses without triggering a read or extending polling.
+    with runner_reads_lock:
+        cached = list(runner_reads.items())
+    for key, (_, response) in cached:
+        if not isinstance(key, tuple) or key[0] != 'jobs' or isinstance(response, Exception):
+            continue
+        for job in response.json().get('jobs', []):
+            try:
+                started = datetime.fromisoformat(job['started_at'].replace('Z', '+00:00')) if job.get('started_at') else None
+                completed = datetime.fromisoformat(job['completed_at'].replace('Z', '+00:00')) if job.get('completed_at') else None
+                record(key[1], job.get('run_attempt', 1), job['name'], job.get('runner_name', ''),
+                       job.get('labels') or [], started, completed)
+            except (ValueError, KeyError, TypeError):
+                continue
+    return dict(jobs_today=sum(start <= begun <= now for begun, _ in jobs.values() if begun),
+                jobs_done=sum(start <= ended <= now for _, ended in jobs.values() if ended),
+                jobs_today_reason=None, jobs_count_note='today CT · observed jobs',
+                jobs_latest_completed=latest.isoformat() if latest else None)
+
+
 def get_local_runners(force_refresh=False):
     with local_runners_cache_lock:
         if not force_refresh and local_runners_cache['data'] is not None and time.monotonic() - local_runners_cache['ts'] < LOCAL_RUNNERS_CACHE_TTL:
@@ -4157,6 +4223,7 @@ def get_local_runners(force_refresh=False):
                                  for key in ('online', 'busy', 'idle')})
         except Exception:
             logger.exception('Could not establish local runner inventory')
+        result.update(_local_jobs_today(result.get('runners', [])))
         local_runners_cache.update(data=result, ts=time.monotonic())
         return result
 
@@ -5410,7 +5477,7 @@ letter-spacing:0;white-space:pre;width:22ch;text-align:right}
 .last-updated.stale .lu-time{color:var(--neon-red);text-shadow:0 0 8px #ff004488}
 @media(max-width:767px){.last-updated{position:static;text-align:center;margin:-18px 0 14px}}
 
-.monitor-glance-band{grid-template-columns:repeat(2,minmax(0,1fr))}
+.monitor-glance-band{grid-template-columns:repeat(2,minmax(0,1fr));align-items:stretch}
 #glance-strip{grid-column:1/-1}
 .cicd-label{font-family:'Orbitron',monospace;color:var(--neon-cyan);text-shadow:0 0 10px var(--neon-cyan);font-size:1em;letter-spacing:2px;margin:0 0 10px}
 .ship-flow{flex-wrap:nowrap;align-items:stretch}
@@ -5430,6 +5497,10 @@ letter-spacing:0;white-space:pre;width:22ch;text-align:right}
 .runner-facts small{display:block;color:#c7cee0;overflow-wrap:anywhere}
 .local-runner{font-size:.85em;padding:4px 0;overflow-wrap:anywhere}
 #local-runners-card details{margin-top:10px}
+#local-runners-card .fleet-job-tiles{margin-top:0}
+#local-runners-card .fleet-job-tiles b{font-size:1.15em;line-height:1.05}
+#local-runners-card .fleet-job-tiles span{font-size:.68em;letter-spacing:1px;text-transform:uppercase;margin-top:2px}
+.fleet-job-note{font-size:.68em;color:#c7cee0;margin-top:3px}
 @media(max-width:900px){.monitor-glance-band{grid-template-columns:1fr}.ship-flow{flex-wrap:wrap}.ship-stage{flex:1 0 110px}}
 .runner-jobs-details{margin-top:6px;color:#c7cee0;font-size:.78em}
 .runner-jobs-details summary{cursor:pointer;list-style:none;user-select:none}
@@ -7099,7 +7170,11 @@ function refreshLocalRunners() {
         if (!d.available) { body.innerHTML = '<p class="runson-warning">' + runsonEscape(d.error || 'Could not establish local runners') + '</p>'; return; }
         const history = d.source === 'job_history';
         const count = value => value == null ? 'n/a' : Number(value);
-        body.innerHTML = '<p class="runson-label">Source: ' + runsonEscape(d.source) + '</p>'
+        body.innerHTML = '<div class="runner-facts fleet-job-tiles">'
+            + [['live runners', d.busy], ['jobs tried', d.jobs_today], ['jobs done', d.jobs_done]].map(([label, value]) =>
+                '<div class="runson-fact"><b>' + count(value) + '</b><span>' + label + '</span></div>').join('') + '</div>'
+            + '<div class="fleet-job-note" title="Observed self-hosted jobs in armbrain; timing collector may lag. Live runners is current busy inventory.">'
+            + runsonEscape(d.jobs_count_note || '') + '</div>'
             + (history ? '<p class="runson-label">' + runsonEscape(d.caption) + '</p>' : '')
             + (d.truncated ? '<p class="runson-warning">Limited job sample · up to 30 runs; counts may be incomplete</p>' : '')
             + '<div class="runner-facts">' + (history ? ['online', 'busy', 'idle', 'seen_last_hour'] : ['online', 'busy', 'idle']).map(k =>
