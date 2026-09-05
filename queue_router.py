@@ -4792,7 +4792,7 @@ def api_power():
 @app.route("/")
 def index():
     """Dashboard home page."""
-    return '''<!DOCTYPE html><html><head><title>GANDALF // FLEET MONITOR</title>
+    return '''<!DOCTYPE html><html><head><title>FLEET MONITOR</title>
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230a0d14'/%3E%3Crect x='6' y='6' width='20' height='20' rx='2' fill='%23111827' stroke='%23374151' stroke-width='1'/%3E%3Crect x='9' y='9' width='5' height='5' rx='1' fill='%2300fff2'/%3E%3Crect x='18' y='9' width='5' height='5' rx='1' fill='%2339ff14'/%3E%3Crect x='9' y='18' width='5' height='5' rx='1' fill='%2300a8ff'/%3E%3Crect x='18' y='18' width='5' height='5' rx='1' fill='%23ffaa00'/%3E%3Cpath d='M10 3v3M16 3v3M22 3v3 M10 26v3M16 26v3M22 26v3 M3 10h3M3 16h3M3 22h3 M26 10h3M26 16h3M26 22h3' stroke='%234b5563' stroke-width='1.2' stroke-linecap='round'/%3E%3C/svg%3E">
 <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Rajdhani:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
@@ -5311,7 +5311,7 @@ letter-spacing:0;white-space:pre;width:22ch;text-align:right}
 #local-runners-card details{margin-top:10px}
 @media(max-width:900px){.monitor-glance-band{grid-template-columns:1fr}.ship-flow{flex-wrap:wrap}.ship-stage{flex:1 0 110px}}
 </style></head>
-<body><div class="hdr-wrap"><h1>GANDALF // FLEET MONITOR</h1><div id="last-updated" class="last-updated" title="Time of the most recent successful data refresh. Green = fresh, amber = aging, red = this page has gone stale."><span class="lu-label">last updated</span><span class="lu-time" id="lu-time">connecting…</span></div></div>
+<body><div class="hdr-wrap"><h1>FLEET MONITOR</h1><div id="last-updated" class="last-updated" title="Time of the most recent successful data refresh. Green = fresh, amber = aging, red = this page has gone stale."><span class="lu-label">last updated</span><span class="lu-time" id="lu-time">connecting…</span></div></div>
 
 <div id="fleet-summary" style="margin:4px 0 14px 0;font-size:0.95em;color:#889">Loading fleet summary...</div>
 
@@ -5323,14 +5323,12 @@ letter-spacing:0;white-space:pre;width:22ch;text-align:right}
 <div id="ship-flow" class="ship-flow panel-refresh-body"><span class="gdim">shipping pipeline…</span></div>
 <div id="ship-fleet" class="ship-fleet" aria-live="polite">🤖 working: checking agents…</div>
 </div>
-<div class="gstrip">
-<div class="panel-refresh-surface glance-panel"><button type="button" class="panel-refresh-btn" data-panel="Fleet stats" title="Refresh this panel" aria-label="Refresh Fleet stats panel" onclick="refreshPanel(this, 'refreshFleetStats')">&#x21bb;</button><div class="gcell panel-refresh-body" id="fleet-stats-body"><span class="gdim">agents…</span></div></div>
-</div>
+
 </div>
 
 <div class=card id=runson-card>
 <button type="button" class="panel-refresh-btn" data-panel="AWS" title="Refresh this panel" aria-label="Refresh AWS panel" onclick="refreshPanel(this, 'refreshRunsOn')">&#x21bb;</button>
-<h3>☁️ AWS <span class="runson-account" id="runson-account">AWS account 930358782508</span><span id="runson-shard-state">Shard state unknown: loading</span></h3>
+<h3>☁️ AWS <span class="runson-account" id="runson-account">AWS account 930358782508</span></h3>
 <div id=runson-body><p>Loading...</p></div>
 </div>
 <div class="card" id="local-runners-card">
@@ -5877,37 +5875,6 @@ function refreshModelServing() {
     }).catch(() => {});
 }
 
-function refreshFleetStats() {
-    fetch('/api/fleet_stats').then(r => r.json()).then(d => {
-        const el = document.getElementById('fleet-stats-body');
-        if (!el) return;
-        const a = d.agents || {boxes: {}, total: 0};
-        // null = box unreadable right now (down / circuit open) - show ?, not 0
-        const agentDetail = Object.entries(a.boxes).map(([n, v]) =>
-            n + ' ' + (v === null || v === undefined ? '?' : v)).join(' · ');
-        const r = d.runners || {};
-        const f = (r.available ? (r.fleet || {busy: 0, total: 0, online: 0}) : null);
-        const runnerDetail = r.available
-            ? Object.entries(r.boxes).map(([n, b]) => n + ' ' + b.busy + '/' + b.total).join(' · ')
-            : 'runner counts unavailable (gh / GitHub API failed) — stale read, not an outage';
-        let html = '<span class="gicon" title="agents: ' + agentDetail + '">🤖</span>'
-                 + '<div class="gpair" title="' + HELP.agents.replace(/"/g, '') + ' Per box: ' + agentDetail + '"><div class="gnum">' + a.total + '</div><div class="gcap">agents</div></div>';
-        if (f) {
-            const pct = f.total > 0 ? (f.busy / f.total) * 100 : 0;
-            const hot = (f.online > 0 && f.busy >= f.online);
-            html += '<div class="gpair" title="' + HELP.runners.replace(/"/g, '') + ' Per box: ' + runnerDetail + '"><div class="gnum ' + (hot ? 'hot' : (f.busy ? 'warn' : 'ok')) + '">'
-                 + f.busy + '/' + f.total + '</div><div class="gcap">runners</div></div>'
-                 + '<div class="gbar" title="' + runnerDetail + '"><i class="' + (hot ? 'hot' : '') + '" style="width:' + pct + '%"></i></div>';
-        } else {
-            html += '<span class="gdim" title="' + runnerDetail + '">runners ?</span>';
-        }
-        el.innerHTML = html;
-    }).catch(() => {
-        const el = document.getElementById('fleet-stats-body');
-        if (el) el.innerHTML = '<p class="glance-unavailable">Fleet stats failed to load.</p>';
-    });
-}
-
 function progressBar(percent, cls, id, peakPct) {
     let barClass = cls;
     if (percent > 90) barClass = 'progress-red';
@@ -6049,8 +6016,6 @@ const HELP = {
     peak:  'The high-water mark for today. Like the peak needle on a stereo amplifier: it stays where the loudest moment was, even after the level drops back down. Resets at midnight.',
     routepill: 'A ROUTE is a nickname you ask for instead of naming a model, so the gateway can pick the machine. This badge sits on the machine that serves it. GREEN means the model is loaded in memory and will answer immediately. GREY means the route works but nothing is loaded, so the first request waits while it loads. RED means the route is missing from the gateway entirely - that one is a problem.',
     routesum:  'LOADED ROUTES - how many of your local model routes have their model actually sitting in memory right now, out of the total number of local routes. Grey dots are idle, not broken: models unload after sitting unused, and the next request loads them again. Only red is a real fault.',
-    agents:    'CLI AGENTS - how many AI coding agents are running across the fleet right now.',
-    runners:   'RUNNERS - GitHub Actions workers available to run your tests and builds, shown as busy out of total. When busy equals total, new work waits in line.',
     issues:    'ISSUES OPEN - open tickets on the armbrain repository.',
     prs:       'PULL REQUESTS OPEN - finished work waiting to be reviewed and merged.',
     ciqr:      'CI QUEUED / RUNNING - automated test runs waiting to start, and runs happening now. A growing queued number means you are short on runners.',
@@ -6860,16 +6825,10 @@ function refreshRunsOn() {
         const card = document.getElementById('runson-card');
         const body = document.getElementById('runson-body');
         const account = document.getElementById('runson-account');
-        const shardState = document.getElementById('runson-shard-state');
         if (!card || !body) return;
         card.classList.remove('glow-on', 'glow-off', 'glow-unknown');
         const gate = d.gate_shards === 'on' || d.gate_shards === 'off' ? d.gate_shards : 'unknown';
         card.classList.add('glow-' + gate);
-        if (shardState) {
-            shardState.textContent = gate === 'on' ? 'Shards on RunsOn'
-                : (gate === 'off' ? 'Shards on home lab'
-                : 'Shard state unknown: ' + (d.gate_shards_error || 'no clean signal'));
-        }
         if (account && d.aws_account_id) account.textContent = 'AWS account ' + d.aws_account_id;
         if (d.deployed === false) {
             card.style.display = 'none';
@@ -6944,15 +6903,13 @@ function refreshLocalRunners() {
                 + (history ? ' · ' + count(h.seen_last_hour) + ' seen last hour' : '')
                 + h.runners.map(r => '<div class="local-runner">' + runsonEscape(r.name) + ' · '
                     + runsonEscape(r.labels.join(', ')) + ' · ' + runsonEscape(r.status)
-                    + ' · ' + (r.busy ? 'busy' : (history ? 'seen in last hour' : 'idle')) + '</div>').join('') + '</div>').join('') + '</details>'
-            + '<p class="runson-label">Excluded cloud runners: ' + Number(d.excluded_cloud) + '</p>'
-            + '<p class="runson-label">' + (d.jobs_today == null ? 'Jobs today: n/a · ' + runsonEscape(d.jobs_today_reason) : Number(d.jobs_today) + ' jobs today') + '</p>';
+                    + ' · ' + (r.busy ? 'busy' : (history ? 'seen in last hour' : 'idle')) + '</div>').join('') + '</div>').join('') + '</details>';
     }).catch(() => { document.getElementById('local-runners-body').innerHTML = '<p>Could not establish local runners</p>'; });
 }
 
 // --- Polling control: pause everything when the tab isn't visible, resume ---
 // --- with an immediate refresh when it becomes visible again.              ---
-let statusTimer = null, fleetTimer = null, historyTimer = null, energyTimer = null, ciQueueTimer = null, routeHealthTimer = null, fleetStatsTimer = null, modelServingTimer = null, shipFlowTimer = null, runsonTimer = null, localRunnersTimer = null;
+let statusTimer = null, fleetTimer = null, historyTimer = null, energyTimer = null, ciQueueTimer = null, routeHealthTimer = null, modelServingTimer = null, shipFlowTimer = null, runsonTimer = null, localRunnersTimer = null;
 
 function startPolling() {
     if (!localRunnersTimer) localRunnersTimer = setInterval(refreshLocalRunners, 60000);
@@ -6964,7 +6921,6 @@ function startPolling() {
     if (!shipFlowTimer) shipFlowTimer = setInterval(refreshShipFlow, 60000);     // /api/pipeline is cached 45 seconds
     if (!runsonTimer) runsonTimer = setInterval(refreshRunsOn, 120000);           // matches AWS cache TTL
     if (!routeHealthTimer) routeHealthTimer = setInterval(refreshRouteHealth, 30000);
-    if (!fleetStatsTimer) fleetStatsTimer = setInterval(refreshFleetStats, 60000); // matches backend cache TTL
     if (!modelServingTimer) modelServingTimer = setInterval(refreshModelServing, 60000); // matches sampler cadence
 }
 
@@ -6990,7 +6946,6 @@ function stopPolling() {
     clearInterval(shipFlowTimer); shipFlowTimer = null;
     clearInterval(runsonTimer); runsonTimer = null;
     clearInterval(routeHealthTimer); routeHealthTimer = null;
-    clearInterval(fleetStatsTimer); fleetStatsTimer = null;
     clearInterval(modelServingTimer); modelServingTimer = null;
 }
 
@@ -7150,7 +7105,7 @@ document.addEventListener('visibilitychange', () => {
         [['refresh', refresh], ['refreshFleet', refreshFleet], ['refreshHistory', refreshHistory],
          ['refreshEnergy', refreshEnergy], ['refreshCiQueue', refreshCiQueue],
          ['refreshShipFlow', refreshShipFlow], ['refreshRunsOn', refreshRunsOn], ['refreshLocalRunners', refreshLocalRunners],
-         ['refreshRouteHealth', refreshRouteHealth], ['refreshFleetStats', refreshFleetStats],
+         ['refreshRouteHealth', refreshRouteHealth],
          ['refreshModelServing', refreshModelServing]].forEach(([n, f]) => {
             try { f(); } catch (err) { console.error('[dashboard] ' + n + ' failed on resume:', err); }
         });
@@ -7220,7 +7175,6 @@ function refreshPanel(button, loaderName) {
         refreshShipFlow: refreshShipFlow,
         refreshCiQueue: refreshCiQueue,
         refreshRouteHealth: refreshRouteHealth,
-        refreshFleetStats: refreshFleetStats,
         refreshHistory: refreshHistory,
         refreshEnergy: refreshEnergy,
         refreshLocalRunners: refreshLocalRunners,
@@ -7301,7 +7255,6 @@ safeCall('refreshShipFlow', refreshShipFlow);
 safeCall('refreshRunsOn', refreshRunsOn);
 safeCall('refreshLocalRunners', refreshLocalRunners);
 safeCall('refreshRouteHealth', refreshRouteHealth);
-safeCall('refreshFleetStats', refreshFleetStats);
 // first serving refresh waits for the target cards (built by refresh()) to exist
 setTimeout(() => safeCall('refreshModelServing', refreshModelServing), 5000);
 renderLastUpdated();
