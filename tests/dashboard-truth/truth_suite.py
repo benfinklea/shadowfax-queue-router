@@ -481,8 +481,15 @@ def check_pipeline() -> None:
             if job:
                 last = {"sha": (workflow.get("head_sha") or "")[:9], "at": job.get("completed_at") or workflow.get("updated_at")}
                 break
-        emit("PASS" if last and d.get("last_deploy_sha") == last["sha"] else "FAIL", "pipeline.last_deploy_sha", d.get("last_deploy_sha"), last)
-        emit("PASS" if last and d.get("last_deploy_at") == last["at"] else "FAIL", "pipeline.last_deploy_at", d.get("last_deploy_at"), last)
+        if last:
+            emit("PASS" if d.get("last_deploy_sha") == last["sha"] else "FAIL",
+                 "pipeline.last_deploy_sha", d.get("last_deploy_sha"), last)
+            emit("PASS" if d.get("last_deploy_at") == last["at"] else "FAIL",
+                 "pipeline.last_deploy_at", d.get("last_deploy_at"), last)
+        else:
+            unread = "no successful deploy job in the probed workflow runs; GitHub instrument unread, not a dashboard mismatch"
+            emit("WARN", "pipeline.last_deploy_sha", d.get("last_deploy_sha"), "unreadable", unread)
+            emit("WARN", "pipeline.last_deploy_at", d.get("last_deploy_at"), "unreadable", unread)
     except Exception as exc:
         emit("FAIL", "pipeline.direct_github", d, "gh api failed", str(exc))
     try:
@@ -697,6 +704,15 @@ def check_tps_dials(page: str) -> None:
              row["rendered"], row["expected"], "headless DOM; payload=" + json.dumps(row["payload"]))
 
 
+# Signals that only exist if the headless render completes. When it does not, each is
+# reported as not-evaluated rather than silently omitted - see the handler at the end of
+# check_rendering(). Keep this list in step with the emits inside that function.
+RENDER_DEPENDENT_SIGNALS = (
+    "runson.budget_strip.rendered",
+    "runson.budget_strip.no_eternal_placeholder",
+)
+
+
 def check_rendering() -> None:
     try:
         code, body = http("/")
@@ -885,7 +901,23 @@ console.log(JSON.stringify({
             "rendered values or dimmed n/a; never loading/measuring",
         )
     except Exception as exc:
-        emit("FAIL", "page.render", "unavailable", "HTTP 200 + valid JS", str(exc))
+        try:
+            probe_code, _ = http("/", 15)
+        except Exception:
+            probe_code = 0
+        if probe_code == 200:
+            cause = f"the page still serves 200; this is a harness failure, not a dashboard outage: {exc}"
+            emit("WARN", "page.render", "harness-failed", "HTTP 200 + valid JS", cause)
+        else:
+            cause = f"page probe returned {probe_code}: {exc}"
+            emit("FAIL", "page.render", "unavailable", "HTTP 200 + valid JS", cause)
+        # Anything downstream of the render never ran. Say so per signal rather than
+        # letting it disappear from the report.
+        emitted = {r["signal"] for r in results}
+        for signal in RENDER_DEPENDENT_SIGNALS:
+            if signal not in emitted:
+                emit("WARN", signal, "not-evaluated", "requires the headless render",
+                     f"skipped because the render step did not complete: {cause}")
     r = api.get("runson", {})
     if r.get("available"):
         ok = all(k in r for k in (
