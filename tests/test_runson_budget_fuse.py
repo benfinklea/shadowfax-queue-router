@@ -193,3 +193,82 @@ class EnforcementTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StaleFigureTests(unittest.TestCase):
+    """A figure whose date we cannot vouch for must never trip the gate.
+
+    THIS IS NOT HYPOTHETICAL. At 07:49Z on 2026-09-05 the router served spent_today =
+    $33.16 and spent_month = $37.06. Read directly, the cache behind them had been
+    fetched at 9:22 PM CDT on 9/4 and its own daily series ended:
+
+        2026-09-03  $3.90
+        2026-09-04  $33.16     <- this is what "spent_today" was
+        (no 2026-09-05 row at all)
+
+    Without the date guard, the first evaluation after deploy compares 33.16 to the $25
+    cap, trips, and PATCHes RUNSON_GATE_SHARDS to false - silently undoing Ben's 1:50 AM
+    order ("turn aws back on. we need the runners") on the strength of yesterday's
+    number. The fuse is one-directional by design, so nothing would have turned it back
+    on. The guard that stops spending must be at least as careful as the spending.
+    """
+
+    def test_yesterdays_figure_does_not_trip(self):
+        # KILLS: the `if figure_date is not None and today is not None and ... != ...`
+        # branch in runson_budget_verdict. Delete it and this goes red.
+        state, reason = qr.runson_budget_verdict(
+            33.1618, 37.0605, None, figure_date="2026-09-04", today="2026-09-05")
+        self.assertEqual(state, "unreadable", reason)
+        self.assertIn("2026-09-04", reason)
+
+    def test_undated_figure_does_not_trip(self):
+        # A number with no date is not a measurement of today. KILLS: the
+        # `if figure_date is None and today is not None` branch.
+        state, _ = qr.runson_budget_verdict(99.0, 99.0, None, figure_date=None, today="2026-09-05")
+        self.assertEqual(state, "unreadable")
+
+    def test_todays_figure_over_budget_still_trips(self):
+        # The guard must not become a way to never trip. Same numbers, correct date.
+        state, reason = qr.runson_budget_verdict(
+            33.1618, 37.0605, None, figure_date="2026-09-05", today="2026-09-05")
+        self.assertEqual(state, "tripped", reason)
+
+    def test_todays_figure_under_budget_is_ok(self):
+        state, _ = qr.runson_budget_verdict(
+            4.00, 12.00, None, figure_date="2026-09-05", today="2026-09-05")
+        self.assertEqual(state, "ok")
+
+    def test_figure_date_comes_from_the_last_dated_row(self):
+        # KILLS: _runson_figure_date's use of the LAST dated row. Taking the first row
+        # would report 2026-09-01 and every evaluation would read as stale forever -
+        # which fails safe, but silently disables the fuse.
+        costs = {"daily_spend": [
+            {"date": "2026-09-03", "spend": 3.8987},
+            {"date": "2026-09-04", "spend": 33.1618},
+        ]}
+        self.assertEqual(qr._runson_figure_date(costs), "2026-09-04")
+
+    def test_missing_or_undated_series_yields_none(self):
+        self.assertIsNone(qr._runson_figure_date({}))
+        self.assertIsNone(qr._runson_figure_date({"daily_spend": [{"spend": 1.0}]}))
+        self.assertIsNone(qr._runson_figure_date(None))
+
+
+class FuseIsNotReaderGatedTests(unittest.TestCase):
+    """The fuse must evaluate whether or not anyone is looking at the dashboard.
+
+    The original wiring evaluated the fuse only inside _runson_fetch, which the
+    background loop calls only while _runson_should_warm() is true - and that is true
+    only for RUNSON_WARM_IDLE_AFTER (20 minutes) after the last dashboard READ. The guard
+    therefore went dormant 20 minutes after the last human closed the tab, which is
+    exactly the overnight window it exists for, while still rendering as armed.
+    """
+
+    def test_an_independent_fuse_loop_exists(self):
+        # KILLS: runson_fuse_loop itself, and its thread start.
+        self.assertTrue(callable(getattr(qr, "runson_fuse_loop", None)),
+                        "runson_fuse_loop must exist - the fuse cannot ride the warm loop")
+
+    def test_fuse_interval_is_independent_of_the_warm_idle_window(self):
+        self.assertLess(qr.RUNSON_FUSE_INTERVAL, qr.RUNSON_WARM_IDLE_AFTER,
+                        "the fuse must evaluate more often than the warm loop goes idle")

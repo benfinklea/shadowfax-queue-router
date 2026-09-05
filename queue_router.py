@@ -1939,6 +1939,10 @@ RUNSON_WARM_INTERVAL = 60   # seconds between background warm passes
 # dashboard would be roughly 980 passes a day of billed reads for nobody. After this
 # long with no reader the loop idles, and the next reader re-arms it.
 RUNSON_WARM_IDLE_AFTER = 20 * 60  # seconds
+# The budget fuse runs on its OWN cadence, deliberately not the warm loop's. See
+# runson_fuse_loop for why. Five minutes costs nothing: the Cost Explorer read behind it
+# is cached for six hours, so almost every pass is a cache hit and an arithmetic compare.
+RUNSON_FUSE_INTERVAL = 5 * 60  # seconds
 # Watched dashboards now need one real observation every minute for the runner
 # sparkline, even when the 120-second API snapshot is still fresh.
 runson_last_read_at = 0.0
@@ -1963,7 +1967,8 @@ RUNSON_DAILY_BUDGET_USD = 25.0
 RUNSON_MONTHLY_BUDGET_USD = 500.0
 
 
-def runson_budget_verdict(spent_today, spent_month, cost_error=None):
+def runson_budget_verdict(spent_today, spent_month, cost_error=None,
+                          figure_date=None, today=None):
     """Decide whether RunsOn may keep spending. Pure, so the thresholds are testable.
 
     Returns (state, reason) where state is "ok", "tripped" or "unreadable".
@@ -1972,7 +1977,29 @@ def runson_budget_verdict(spent_today, spent_month, cost_error=None):
     what has been spent, and continuing to burn against an unknown is the one mistake
     that costs money rather than time. This mirrors SPEND_ON_UNREADABLE_POOL=false in the
     lane keeper: unreadable is not healthy, and None is never zero.
+
+    AND A STALE FIGURE IS NOT A READABLE ONE. `figure_date` is the day the number
+    actually describes; `today` is the day we are budgeting. If they differ, this refuses
+    to act rather than trip.
+
+    That is not hypothetical. At 07:49Z on 2026-09-05 the router served spent_today =
+    $33.16, and the cache behind it had been fetched at 9:22 PM CDT on 9/4 - the figure
+    was SEPTEMBER 4th's spend, and its own daily series had no 9/5 row at all. Without
+    this check, the first evaluation after deploy compares 33.16 against the $25 cap,
+    trips, and PATCHes RUNSON_GATE_SHARDS to false - silently undoing the order Ben gave
+    at 1:50 AM ("turn aws back on. we need the runners") on the strength of yesterday's
+    number. And because the fuse is deliberately one-directional, nothing would turn it
+    back on.
+
+    Tripping the gate is a real action with a real cost. It must never be taken on a
+    figure whose date we cannot vouch for.
     """
+    if figure_date is not None and today is not None and str(figure_date) != str(today):
+        return "unreadable", (
+            f"cost figure is for {figure_date}, not {today}; refusing to act on a stale day"
+        )
+    if figure_date is None and today is not None:
+        return "unreadable", "cost figure carries no date; refusing to act on an undated number"
     if cost_error:
         return "unreadable", f"cost read failed ({cost_error}); refusing to spend against an unknown"
     if spent_today is None or spent_month is None:
@@ -2461,7 +2488,8 @@ def _runson_fetch():
                 },
                 "budget_actuals": (ce_costs or {}).get("budget_actuals", {}),
                 "fuse": _runson_fuse_step(
-                    costs.get("spent_today"), costs.get("spent_month"), cost_error
+                    costs.get("spent_today"), costs.get("spent_month"), cost_error,
+                    figure_date=_runson_figure_date(costs), today=str(today_ct),
                 ),
                 "generated_at": datetime.now(timezone.utc).isoformat(),
             }
@@ -2542,14 +2570,29 @@ def _runson_annotate(data, ts):
     return {**data, "cache_age_seconds": round(age, 1), "stale": age >= RUNSON_CACHE_TTL}
 
 
-def _runson_fuse_step(spent_today, spent_month, cost_error):
+def _runson_figure_date(costs):
+    """The day the spend figure actually describes: the last dated row in the series.
+
+    Returns None when the series is missing or undated - and None means the verdict
+    refuses to act, which is the correct direction for a control that turns capacity off.
+    """
+    try:
+        series = (costs or {}).get("daily_spend") or []
+        dated = [r.get("date") for r in series if isinstance(r, dict) and r.get("date")]
+        return dated[-1] if dated else None
+    except Exception:
+        return None
+
+
+def _runson_fuse_step(spent_today, spent_month, cost_error, figure_date=None, today=None):
     """Evaluate the budget and trip the gate if needed. Returns the payload block.
 
     Wrapped so a failure here can never take down /api/runson. A cost guard that turns
     into an outage is a worse trade than the spend it was guarding against.
     """
     try:
-        state, reason = runson_budget_verdict(spent_today, spent_month, cost_error)
+        state, reason = runson_budget_verdict(spent_today, spent_month, cost_error,
+                                              figure_date=figure_date, today=today)
         gate = (get_runson_gate_shards() or {}).get("gate_shards", "unknown")
         action, detail = runson_enforce_budget(state, reason, gate)
         return {
@@ -2558,6 +2601,7 @@ def _runson_fuse_step(spent_today, spent_month, cost_error):
             "gate_at_evaluation": gate,
             "action": action,
             "detail": detail,
+            "figure_date": figure_date,
             "daily_limit": RUNSON_DAILY_BUDGET_USD,
             "monthly_limit": RUNSON_MONTHLY_BUDGET_USD,
             "enforced": True,
@@ -2725,6 +2769,51 @@ def _runson_should_warm():
     with runson_cache_lock:
         idle = time.time() - runson_last_read_at
     return idle <= RUNSON_WARM_IDLE_AFTER
+
+
+def runson_fuse_loop():
+    """Evaluate the spend fuse on a fixed cadence, whether or not anyone is watching.
+
+    THIS EXISTS BECAUSE THE FUSE CANNOT RIDE ON THE WARM LOOP. runson_warm_loop only
+    refreshes while _runson_should_warm() is true, and that is true only for
+    RUNSON_WARM_IDLE_AFTER (20 minutes) after the last dashboard READ. A fuse evaluated
+    inside that loop therefore goes dormant 20 minutes after the last human closes the
+    tab - which is precisely the overnight window where an unattended spend runs away and
+    the guard is worth having. It would have read as armed on the dashboard the whole
+    time, because the dashboard is exactly what keeps it alive.
+
+    That is the same shape as the $15/day "fuse" this PR replaced: a control that is only
+    a label. Fixing the label while leaving the evaluation reader-gated would have shipped
+    the identical defect with better wording.
+
+    Cheap by construction: the CE read behind it is cached for RUNSON_COST_CACHE_TTL (six
+    hours), so a five-minute pass is nearly always a cache hit plus a float compare. It
+    does not add Cost Explorer charges.
+
+    KNOWN LIMIT, stated rather than hidden: because that cache is six hours deep, the
+    figure this fuse compares against can lag real spend by up to six hours. It bounds a
+    runaway; it does not stop one within the hour. Narrowing that needs a cheaper spend
+    signal than Cost Explorer - the RunsOn workflow-jobs table gives instance-hours for
+    free - and that is a follow-up, not a reason to withhold the guard.
+    """
+    while True:
+        time.sleep(RUNSON_FUSE_INTERVAL)
+        try:
+            # Central, not UTC, and not a guess: the daily budget is Ben's day, and
+            # this is the same expression _runson_fetch uses at line ~2328. A fuse that
+            # rolled its "today" at 7 PM CT would reset the budget mid-evening.
+            today_ct = datetime.now(ZoneInfo("America/Chicago")).date()
+            try:
+                ce_costs, cost_error = _runson_ce_cost_data(today_ct, None)
+            except Exception as exc:
+                ce_costs, cost_error = None, f"cost_cache_{type(exc).__name__}"
+            costs = ce_costs or {}
+            _runson_fuse_step(costs.get("spent_today"), costs.get("spent_month"), cost_error,
+                              figure_date=_runson_figure_date(costs), today=str(today_ct))
+        except Exception:
+            # Never let the guard's own failure kill its thread - a fuse that dies
+            # silently is indistinguishable from one that never trips.
+            logger.exception("RunsOn fuse pass failed; will retry next interval")
 
 
 def runson_warm_loop():
@@ -7724,6 +7813,11 @@ if __name__ == "__main__":
     # hourly dash-truth run on its 20s budget (shadowfax-queue-router#5).
     runson_thread = threading.Thread(target=runson_warm_loop, daemon=True)
     runson_thread.start()
+
+    # The spend fuse gets its OWN thread on its own cadence. It must not depend on
+    # anyone having the dashboard open - see runson_fuse_loop.
+    runson_fuse_thread = threading.Thread(target=runson_fuse_loop, name="runson-fuse", daemon=True)
+    runson_fuse_thread.start()
 
     # ComfyUI watchdog (auto-restart if down) — OFF BY DEFAULT.
     #
