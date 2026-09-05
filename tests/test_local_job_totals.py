@@ -33,6 +33,9 @@ class LocalJobTotalsTest(unittest.TestCase):
             with patch.object(q, 'CI_TIMING_STATE', root), patch.object(q, 'runner_reads', cache), patch.object(q.requests, 'get') as get:
                 result = q._local_jobs_today([], now)
                 self.assertEqual((result['jobs_today'], result['jobs_done']), (3, 3))
+                self.assertEqual(len(result['jobs_smoothed']), 61)
+                self.assertEqual(result['jobs_smoothed'][-1]['ts'], now.isoformat())
+                self.assertAlmostEqual(result['jobs_smoothed'][-1]['n'], 2 / 3)
                 get.assert_not_called()
 
     def test_missing_records_are_unknown(self):
@@ -40,4 +43,5 @@ class LocalJobTotalsTest(unittest.TestCase):
             result = q._local_jobs_today([])
             self.assertIsNone(result['jobs_today'])
             self.assertIsNone(result['jobs_done'])
+            self.assertEqual(result['jobs_smoothed'], [])
             get.assert_not_called()

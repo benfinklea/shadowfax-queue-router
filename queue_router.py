@@ -4138,7 +4138,8 @@ def _local_jobs_today(runners, now=None):
 
     try:
         # CT days can span two UTC months; files are partitioned by completion.
-        months = {start.strftime('%Y-%m'), now.strftime('%Y-%m')}
+        months = {start.strftime('%Y-%m'), now.strftime('%Y-%m'),
+                  (now - timedelta(hours=1)).strftime('%Y-%m')}
         for month in sorted(months):
             with (CI_TIMING_STATE / f'jobs-{month}.jsonl').open() as stream:
                 for line in stream:
@@ -4152,7 +4153,7 @@ def _local_jobs_today(runners, now=None):
                         continue  # The collector may be appending its final line.
     except OSError:
         logger.warning('Local CI timing records unavailable')
-        return dict(jobs_today=None, jobs_done=None, jobs_today_reason='Timing records unavailable',
+        return dict(jobs_today=None, jobs_done=None, jobs_smoothed=[], jobs_today_reason='Timing records unavailable',
                     jobs_count_note='Timing records unavailable')
 
     # Snapshot shared responses without triggering a read or extending polling.
@@ -4169,7 +4170,15 @@ def _local_jobs_today(runners, now=None):
                        job.get('labels') or [], started, completed)
             except (ValueError, KeyError, TypeError):
                 continue
-    return dict(jobs_today=sum(start <= begun <= now for begun, _ in jobs.values() if begun),
+    # Reconstruct observed concurrent jobs at one-minute intervals, without polling.
+    series = []
+    for minute in range(61):
+        ts = now - timedelta(minutes=60 - minute)
+        series.append({'ts': ts.isoformat(), 'n': sum(
+            begun <= ts and (ended is None or ts < ended)
+            for begun, ended in jobs.values() if begun)})
+    return dict(jobs_smoothed=_smooth_runson_runners(series),
+                jobs_today=sum(start <= begun <= now for begun, _ in jobs.values() if begun),
                 jobs_done=sum(start <= ended <= now for _, ended in jobs.values() if ended),
                 jobs_today_reason=None, jobs_count_note='today CT · observed jobs',
                 jobs_latest_completed=latest.isoformat() if latest else None)
@@ -5353,15 +5362,15 @@ text-transform:uppercase;color:#c7cee0;margin-top:4px}
 /* Two bands only (Ben, 2026-09-02: "7 pieces of data and 2 charts" must not stack four rows deep):
    band 1 = live runners, jobs, trial clock, credits on one line;
    band 2 = spend today/month with fuse bars as a column beside the two charts, chart captions folded into the title line. */
-#runson-card .runson-grid{display:flex;flex-wrap:wrap;gap:4px 16px;align-items:flex-start}
-#runson-card .runson-live{min-width:0;display:flex;flex-direction:column}
+#runson-card .runson-grid,#local-runners-card .runson-grid{display:flex;flex-wrap:wrap;gap:4px 16px;align-items:flex-start}
+#runson-card .runson-live,#local-runners-card .runson-live{min-width:0;display:flex;flex-direction:column}
 /* Keep the count aligned to its label even when the runner details are wider. */
-#runson-card .runson-total{display:inline-grid;width:max-content}
-#runson-card .runson-count{font-size:1.15em;line-height:1.05;text-align:right}
-#runson-card .runson-label{font-size:.68em;margin-top:2px;line-height:1.1}
+#runson-card .runson-total,#local-runners-card .runson-total{display:inline-grid;width:max-content}
+#runson-card .runson-count,#local-runners-card .runson-count{font-size:1.15em;line-height:1.05;text-align:right}
+#runson-card .runson-label,#local-runners-card .runson-label{font-size:.68em;margin-top:2px;line-height:1.1}
 /* The count row shares the label's width; its number stays at the right edge. */
-#runson-card .runson-count{display:flex;align-items:center;justify-content:flex-end;gap:6px;color:var(--neon-cyan)}
-#runson-card .runson-count .runson-live-spark{flex:1 1 60px;min-width:60px;width:0;height:1.05em;overflow:visible}
+#runson-card .runson-count,#local-runners-card .runson-count{display:flex;align-items:center;justify-content:flex-end;gap:6px;color:var(--neon-cyan)}
+#runson-card .runson-count .runson-live-spark,#local-runners-card .runson-count .runson-live-spark{flex:1 1 60px;min-width:60px;width:0;height:1.05em;overflow:visible}
 #runson-card .runson-runners{gap:3px;margin-top:2px}
 #runson-card .runson-runner{padding:0 5px;font-size:.6em}
 #runson-card .runson-runners-details{margin-top:2px}
@@ -5370,10 +5379,10 @@ text-transform:uppercase;color:#c7cee0;margin-top:4px}
 #runson-card .runson-runners-details summary::before{content:'▸ ';display:inline-block}
 #runson-card .runson-runners-details[open] summary::before{content:'▾ '}
 #runson-card .runson-runners-details[open] .runson-runners{margin-top:3px}
-#runson-card .runson-flow{gap:5px}
-#runson-card .runson-flow-cell b{font-size:1.15em}
-#runson-card .runson-flow-cell span{font-size:.68em;margin-top:2px}
-#runson-card .runson-flow-arrow{font-size:.95em;padding-bottom:9px}
+#runson-card .runson-flow,#local-runners-card .runson-flow{gap:5px}
+#runson-card .runson-flow-cell b,#local-runners-card .runson-flow-cell b{font-size:1.15em}
+#runson-card .runson-flow-cell span,#local-runners-card .runson-flow-cell span{font-size:.68em;margin-top:2px}
+#runson-card .runson-flow-arrow,#local-runners-card .runson-flow-arrow{font-size:.95em;padding-bottom:9px}
 #runson-card .runson-fact b{font-size:.92em;line-height:1.05}
 #runson-card .runson-fact span{font-size:.72em;line-height:1.1;display:block;margin-top:2px;white-space:nowrap}
 #runson-card .runson-budget{width:auto;margin:0;padding:0 8px 0 0;border:0;border-right:1px solid #252e47;display:grid;grid-template-columns:1fr;gap:2px;align-content:space-between;align-self:stretch}
@@ -5448,13 +5457,13 @@ color:#889;display:flex;justify-content:space-between;font-family:'Orbitron',mon
    exactly this on 2026-09-01, so the stranded case is coloured and spelled out. */
 .runson-flow{display:flex;align-items:center;gap:14px}
 .runson-flow-cell{display:flex;flex-direction:column;align-items:center}
-.runson-flow-cell b{font-size:1.9em;line-height:1;font-family:'Orbitron',monospace}
+.runson-flow-cell b{color:#fff;font-size:1.9em;line-height:1;font-family:'Orbitron',monospace}
 .runson-flow-cell span{font-size:0.85em;color:#c7cee0;letter-spacing:1px;text-transform:uppercase;margin-top:4px;white-space:nowrap}
 .runson-flow-arrow{font-size:1.5em;color:#4b5563;line-height:1;padding-bottom:14px}
 /* Tried > 0 with done == 0 means RunsOn accepted work and no machine ever started.
    That is a failure that reads as success on a bare count - Ben was misled by
    exactly this on 2026-09-01 while an AWS SCP denied ec2:CreateFleet. */
-.runson-flow.runson-stranded .runson-flow-cell:last-child b{color:var(--neon-red);text-shadow:0 0 8px #ff004488}
+.runson-flow.runson-stranded .runson-flow-cell:last-child b{color:#fff;text-shadow:none}
 .runson-flow.runson-stranded .runson-flow-cell:last-child span{color:var(--neon-red)}
 .runson-flow.runson-stranded .runson-flow-arrow{color:var(--neon-red)}
 /* Last-updated stamp: proves the page is live. If this stops ticking, the
@@ -6998,7 +7007,7 @@ function runsonDailySpendChart(rows) {
         + '<line x1="0" y1="68" x2="300" y2="68" stroke="#30394f"/>' + bars + '</svg>';
 }
 
-function runsonLiveSpark(series) {
+function runsonLiveSpark(series, tip = 'Live RunsOn machines, last 60 minutes, smoothed with a 5-minute moving average.') {
     if (!series || series.length < 2) return '';
     // shipStage's sparkHtml is a bar chart; use the credits chart's SVG approach.
     const times = series.map(p => Date.parse(p.ts));
@@ -7011,7 +7020,6 @@ function runsonLiveSpark(series) {
         span ? 18 - 16 * (n - low) / span : 10
     ]);
     const last = points[points.length - 1];
-    const tip = 'Live RunsOn machines, last 60 minutes, smoothed with a 5-minute moving average.';
     return '<svg class="runson-live-spark" viewBox="0 0 100 20" preserveAspectRatio="none" role="img" aria-label="' + tip + '">'
         + '<title>' + tip + '</title><polyline points="' + points.map(p => p.join(',')).join(' ')
         + '" fill="none" stroke="currentColor" stroke-width="1.5" vector-effect="non-scaling-stroke"/>'
@@ -7087,6 +7095,17 @@ function refreshRunnerJobs() {
     return runnerJobsPending;
 }
 
+function runnerJobFlow(tried, done) {
+    const doneKnown = done !== null && done !== undefined;
+    const stranded = doneKnown && tried > 0 && Number(done) === 0;
+    const colour = capacityColour(Number(done) > 4 ? 8 : Number(done), [0, 1, 4, 8]);
+    return '<div class="runson-flow' + (stranded ? ' runson-stranded' : '') + '">'
+        + '<div class="runson-flow-cell"><b>' + (tried == null ? 'n/a' : Number(tried)) + '</b><span>jobs tried</span></div>'
+        + '<div class="runson-flow-arrow" style="color:' + colour + '">&rarr;</div>'
+        + '<div class="runson-flow-cell"><b>' + (doneKnown ? Number(done) : '?') + '</b><span>jobs done</span></div>'
+        + '</div>';
+}
+
 function refreshRunsOn() {
     refreshRunnerJobs();
     fetch('/api/runson').then(r => r.json()).then(d => {
@@ -7137,17 +7156,7 @@ function refreshRunsOn() {
         body.innerHTML = '<div class="runson-grid">'
             + '<div class="runson-live"><div class="runson-total"><div class="runson-count' + (count === 0 ? ' zero' : '') + '\">' + runsonLiveSpark(d.live_runners_smoothed) + '<span>' + count + '</span></div>'
             + '<div class="runson-label">live runners</div></div>' + (count === 0 ? '' : runnerDetail) + '</div>'
-            + (function(){
-                var tried = Number(d.jobs_today || 0);
-                var doneKnown = (d.jobs_done !== null && d.jobs_done !== undefined);
-                var done = doneKnown ? Number(d.jobs_done) : null;
-                var stranded = doneKnown && tried > 0 && done === 0;
-                return '<div class="runson-flow' + (stranded ? ' runson-stranded' : '') + '">'
-                  + '<div class="runson-flow-cell"><b>' + tried + '</b><span>jobs tried</span></div>'
-                  + '<div class="runson-flow-arrow">&rarr;</div>'
-                  + '<div class="runson-flow-cell"><b>' + (doneKnown ? done : '?') + '</b><span>jobs done</span></div>'
-                  + '</div>';
-              })()
+            + runnerJobFlow(d.jobs_today, d.jobs_done)
             + '<div class="runson-fact"><b>' + Number(d.trial_days_remaining || 0) + ' days</b><span>to $'
             + Number(d.subscription_usd_per_year || 350) + '/yr · ' + runsonEscape(d.trial_charge_date || '2026-09-30') + '</span></div>'
             + '</div>' + visuals;
@@ -7170,9 +7179,11 @@ function refreshLocalRunners() {
         if (!d.available) { body.innerHTML = '<p class="runson-warning">' + runsonEscape(d.error || 'Could not establish local runners') + '</p>'; return; }
         const history = d.source === 'job_history';
         const count = value => value == null ? 'n/a' : Number(value);
-        body.innerHTML = '<div class="runner-facts fleet-job-tiles">'
-            + [['live runners', d.busy], ['jobs tried', d.jobs_today], ['jobs done', d.jobs_done]].map(([label, value]) =>
-                '<div class="runson-fact"><b>' + count(value) + '</b><span>' + label + '</span></div>').join('') + '</div>'
+        body.innerHTML = '<div class="runson-grid">'
+            + '<div class="runson-live"><div class="runson-total"><div class="runson-count' + (busy === 0 ? ' zero' : '') + '">'
+            + runsonLiveSpark(d.jobs_smoothed, 'Observed self-hosted jobs running, last 60 minutes, smoothed with a 5-minute moving average. Timing collector may lag.')
+            + '<span>' + count(d.busy) + '</span></div><div class="runson-label">live runners</div></div></div>'
+            + runnerJobFlow(d.jobs_today, d.jobs_done) + '</div>'
             + '<div class="fleet-job-note" title="Observed self-hosted jobs in armbrain; timing collector may lag. Live runners is current busy inventory.">'
             + runsonEscape(d.jobs_count_note || '') + '</div>'
             + (history ? '<p class="runson-label">' + runsonEscape(d.caption) + '</p>' : '')
