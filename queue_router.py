@@ -7,6 +7,7 @@ Receives ComfyUI workflows and routes them to the best available GPU.
 import json
 import os
 import re
+import shlex
 import sqlite3
 import subprocess
 import uuid
@@ -738,6 +739,101 @@ def init_db():
             payload TEXT NOT NULL
         )
     """)
+    # SHIP-SPARK (council dispatch 20260905): 12-hour, 5-minute-sampled history
+    # of each shipping-row box's headline number, for the per-box sparkline.
+    # Never back-filled - a fresh table means every sparkline starts empty and
+    # fills in over the next 12 hours, per the dispatch's honesty requirement.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS ship_history (
+            repo TEXT NOT NULL DEFAULT 'armbrain-io/armbrain',
+            ts INTEGER NOT NULL,
+            key TEXT NOT NULL,
+            value REAL,
+            oldest_min REAL,
+            cls TEXT,
+            PRIMARY KEY (repo, ts, key)
+        )
+    """)
+    # Index created below, AFTER the migration block confirms the column exists -
+    # on a pre-existing live table (no repo column yet), creating it here would
+    # run before the migration and fail with "no such column: repo".
+    # SHIP-SPARK-2 (council dispatch 20260905, Ben 11:12 AM CDT): per-PR green-wait
+    # timing, keyed by PR number. A merged=1 row is PERMANENT (a merged PR's review,
+    # head commit, and queue-entry time never change again - never refetched once
+    # cached). A merged=0 row is a live PR (queued or green-waiting) and is re-read
+    # after GREEN_WAIT_CACHE_TTL because its eligibility can still move.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS pr_wait_cache (
+            repo TEXT NOT NULL DEFAULT 'armbrain-io/armbrain',
+            number INTEGER NOT NULL,
+            merged INTEGER NOT NULL DEFAULT 0,
+            added_to_queue_at TEXT,
+            approved_at TEXT,
+            head_committer_at TEXT,
+            eligible_at TEXT,
+            excluded_reason TEXT,
+            cached_at TEXT NOT NULL,
+            PRIMARY KEY (repo, number)
+        )
+    """)
+    # SHIP-SPARK-3: a pre-existing single-repo table has PK(number) alone - PR #42 in
+    # a second repo would silently collide with armbrain's #42. Migrate once: rename,
+    # recreate with the repo-aware PK above, copy every existing row in as GITHUB_CI_REPO
+    # (the only repo this table ever tracked before today), drop the old table.
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(pr_wait_cache)").fetchall()]
+    if "repo" not in cols and cols:
+        conn.execute("ALTER TABLE pr_wait_cache RENAME TO pr_wait_cache_pre_repo")
+        conn.execute("""
+            CREATE TABLE pr_wait_cache (
+                repo TEXT NOT NULL DEFAULT 'armbrain-io/armbrain',
+                number INTEGER NOT NULL,
+                merged INTEGER NOT NULL DEFAULT 0,
+                added_to_queue_at TEXT,
+                approved_at TEXT,
+                head_committer_at TEXT,
+                eligible_at TEXT,
+                excluded_reason TEXT,
+                cached_at TEXT NOT NULL,
+                PRIMARY KEY (repo, number)
+            )
+        """)
+        conn.execute("""
+            INSERT INTO pr_wait_cache (repo, number, merged, added_to_queue_at, approved_at,
+                head_committer_at, eligible_at, excluded_reason, cached_at)
+            SELECT 'armbrain-io/armbrain', number, merged, added_to_queue_at, approved_at,
+                head_committer_at, eligible_at, excluded_reason, cached_at
+            FROM pr_wait_cache_pre_repo
+        """)
+        conn.execute("DROP TABLE pr_wait_cache_pre_repo")
+    # SHIP-SPARK-3 item 3: ship_history gains a repo column, and - unlike a plain
+    # ADD COLUMN - its PRIMARY KEY must change from (ts, key) to (repo, ts, key),
+    # because two repos sampling the same key on the same 5-minute tick would
+    # otherwise collide on ts+key alone and silently overwrite each other's row.
+    # SQLite cannot ALTER a primary key, so this is the same rename/recreate/
+    # copy/drop migration as pr_wait_cache above, existing rows tagged GITHUB_CI_REPO
+    # (the only repo this table ever tracked before today).
+    ship_cols = [r[1] for r in conn.execute("PRAGMA table_info(ship_history)").fetchall()]
+    if "repo" not in ship_cols and ship_cols:
+        conn.execute("ALTER TABLE ship_history RENAME TO ship_history_pre_repo")
+        conn.execute("""
+            CREATE TABLE ship_history (
+                repo TEXT NOT NULL DEFAULT 'armbrain-io/armbrain',
+                ts INTEGER NOT NULL,
+                key TEXT NOT NULL,
+                value REAL,
+                oldest_min REAL,
+                cls TEXT,
+                PRIMARY KEY (repo, ts, key)
+            )
+        """)
+        conn.execute("""
+            INSERT INTO ship_history (repo, ts, key, value, oldest_min, cls)
+            SELECT 'armbrain-io/armbrain', ts, key, value, oldest_min, cls FROM ship_history_pre_repo
+        """)
+        conn.execute("DROP TABLE ship_history_pre_repo")
+    # Safe unconditionally here: by this point the table either was freshly
+    # created with the repo column above, or just finished migrating to have it.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ship_history_repo_key_ts ON ship_history(repo, key, ts)")
     conn.commit()
     conn.close()
 
@@ -1780,7 +1876,7 @@ def get_gateway_key():
     """Fleet gateway master key (static; re-checked occasionally in case it rotates)."""
     return _read_remote_env_value("LITELLM_MASTER_KEY", GATEWAY_KEY_ENV_PATH, ttl=1800)
 
-ci_queue_cache = {"data": None, "ts": 0.0}
+ci_queue_cache = {}  # SHIP-SPARK-3: repo -> slot
 ci_queue_cache_lock = threading.Lock()
 
 # MERGE LANE (council 136cx part 4). Its OWN cache and its own TTL, deliberately NOT
@@ -1790,7 +1886,7 @@ ci_queue_cache_lock = threading.Lock()
 #
 # 60 seconds costs at most 120 requests/hour and is far finer than the thing it watches:
 # the starvation this strip exists to surface ran for over 80 minutes.
-merge_lane_cache = {"data": None, "ts": 0.0}
+merge_lane_cache = {}  # SHIP-SPARK-3: repo -> slot
 merge_lane_cache_lock = threading.Lock()
 MERGE_LANE_CACHE_TTL = 60
 MERGE_LANE_LABEL = "merge-reserved"
@@ -1879,18 +1975,20 @@ def _runner_budget(headers, calls=None):
     return response.json()['resources']['core']['remaining']
 
 
-def _runner_run_jobs(run_id, headers, calls=None):
+def _runner_run_jobs(run_id, headers, calls=None, repo=None):
+    repo = repo or GITHUB_CI_REPO
     if _runner_budget(headers, calls) < 1000:
         raise ValueError('GitHub budget below 1,000 remaining')
-    return _runner_read(('jobs', run_id),
-        f'https://api.github.com/repos/{GITHUB_CI_REPO}/actions/runs/{run_id}/jobs',
+    return _runner_read(('jobs', repo, run_id),
+        f'https://api.github.com/repos/{repo}/actions/runs/{run_id}/jobs',
         headers, RUNNER_JOBS_TTL, calls, {'filter': 'latest', 'per_page': 100})
 
 
-def _runner_active_runs(headers, calls=None):
+def _runner_active_runs(headers, calls=None, repo=None):
+    repo = repo or GITHUB_CI_REPO
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=48)).strftime('%Y-%m-%dT%H:%M:%SZ')
-    return _runner_read('active_runs',
-        f'https://api.github.com/repos/{GITHUB_CI_REPO}/actions/runs',
+    return _runner_read(('active_runs', repo),
+        f'https://api.github.com/repos/{repo}/actions/runs',
         headers, CI_QUEUE_CACHE_TTL, calls,
         {'status': 'in_progress', 'per_page': 100, 'created': f'>={cutoff}'})
 
@@ -1977,7 +2075,7 @@ def api_runner_jobs():
     return jsonify(get_runner_jobs())
 
 
-def get_merge_lane_status():
+def get_merge_lane_status(repo=None):
     """The reserved merge lane: depth, oldest wait, merges last hour, lane runners.
 
     WHY THIS STRIP EXISTS. On 2026-09-05 fifteen branches starved the merge queue's top
@@ -1989,11 +2087,18 @@ def get_merge_lane_status():
     fact; a zero invented from a failed request is a lie that looks like that fact. The
     shared token hit zero twice tonight, so this is not hypothetical - the UI renders None
     as "unknown" and colours it neutral rather than red.
+
+    SHIP-SPARK-3: `repo` defaults to GITHUB_CI_REPO (armbrain) for backward compatibility;
+    every other listed repo gets its own cache slot so switching never bleeds numbers
+    across repos. A repo with no merge queue reads depth=None (see api_pipeline's n/a
+    rendering), not an error - GraphQL legitimately returns a null mergeQueue there.
     """
+    repo = repo or GITHUB_CI_REPO
     now = time.time()
     with merge_lane_cache_lock:
-        if merge_lane_cache["data"] is not None and (now - merge_lane_cache["ts"]) < MERGE_LANE_CACHE_TTL:
-            return merge_lane_cache["data"]
+        slot = _repo_slot(merge_lane_cache, repo, lambda: {"data": None, "ts": 0.0})
+        if slot["data"] is not None and (now - slot["ts"]) < MERGE_LANE_CACHE_TTL:
+            return slot["data"]
 
     result = {
         "available": False, "depth": None, "oldest_awaiting_min": None,
@@ -2004,31 +2109,36 @@ def get_merge_lane_status():
     if not token:
         result["error"] = "no GitHub token"
         with merge_lane_cache_lock:
-            merge_lane_cache.update(data=result, ts=now)
+            merge_lane_cache[repo] = {"data": result, "ts": now}
         return result
 
     headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
-    owner, _, name = GITHUB_CI_REPO.partition("/")
+    owner, _, name = repo.partition("/")
 
     # One GraphQL call: queue depth and the oldest entry still waiting on checks.
+    # A repo with no merge queue configured returns mergeQueue: null - not an
+    # error, just "not configured here" (SHIP-SPARK-3 item 4).
     try:
         q = ('{repository(owner:"%s",name:"%s"){mergeQueue{entries(first:50)'
              '{nodes{state enqueuedAt}}}}}' % (owner, name))
         r = requests.post("https://api.github.com/graphql", headers=headers,
                           json={"query": q}, timeout=10)
         if r.ok:
-            nodes = (((r.json().get("data") or {}).get("repository") or {}).get("mergeQueue")
-                     or {}).get("entries", {}).get("nodes") or []
-            result["depth"] = len(nodes)
-            waiting = sorted(n["enqueuedAt"] for n in nodes
-                             if n.get("state") == "AWAITING_CHECKS" and n.get("enqueuedAt"))
-            if waiting:
-                from datetime import datetime, timezone as _tz
-                t0 = datetime.fromisoformat(waiting[0].replace("Z", "+00:00"))
-                result["oldest_awaiting_min"] = int(
-                    (datetime.now(_tz.utc) - t0).total_seconds() // 60)
+            mq = ((r.json().get("data") or {}).get("repository") or {}).get("mergeQueue")
+            if mq is None:
+                result["lane_state"] = "no-merge-queue"
             else:
-                result["oldest_awaiting_min"] = 0
+                nodes = mq.get("entries", {}).get("nodes") or []
+                result["depth"] = len(nodes)
+                waiting = sorted(n["enqueuedAt"] for n in nodes
+                                 if n.get("state") == "AWAITING_CHECKS" and n.get("enqueuedAt"))
+                if waiting:
+                    from datetime import datetime, timezone as _tz
+                    t0 = datetime.fromisoformat(waiting[0].replace("Z", "+00:00"))
+                    result["oldest_awaiting_min"] = int(
+                        (datetime.now(_tz.utc) - t0).total_seconds() // 60)
+                else:
+                    result["oldest_awaiting_min"] = 0
         else:
             result["error"] = f"graphql HTTP {r.status_code}"
     except Exception as exc:
@@ -2039,7 +2149,7 @@ def get_merge_lane_status():
         from datetime import datetime, timedelta, timezone as _tz
         since = (datetime.now(_tz.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
         r = requests.get("https://api.github.com/search/issues", headers=headers,
-                         params={"q": f"repo:{GITHUB_CI_REPO} is:pr is:merged merged:>={since}",
+                         params={"q": f"repo:{repo} is:pr is:merged merged:>={since}",
                                  "per_page": 1}, timeout=10)
         if r.ok:
             result["merged_last_hour"] = r.json().get("total_count", 0)
@@ -2053,20 +2163,25 @@ def get_merge_lane_status():
     # costs ZERO requests and is honest; polling for a label nobody carries would spend
     # budget to learn something already known.
     result["lane_runners"] = None
-    result["lane_state"] = "not-configured"
+    if result["lane_state"] != "no-merge-queue":
+        result["lane_state"] = "not-configured"
 
     result["available"] = result["depth"] is not None or result["merged_last_hour"] is not None
     with merge_lane_cache_lock:
-        merge_lane_cache.update(data=result, ts=now)
+        merge_lane_cache[repo] = {"data": result, "ts": now}
     return result
 
 
-def get_ci_queue_status(force_refresh=False):
-    """Current GitHub Actions queue depth and job-level activity for armbrain."""
+def get_ci_queue_status(repo=None, force_refresh=False):
+    """Current GitHub Actions queue depth and job-level activity for the given repo
+    (defaults to GITHUB_CI_REPO/armbrain - SHIP-SPARK-3 adds the repo dimension,
+    each with its own cache slot so the CI/CD row never mixes counts across repos)."""
+    repo = repo or GITHUB_CI_REPO
     now = time.time()
     with ci_queue_cache_lock:
-        if not force_refresh and ci_queue_cache["data"] is not None and (now - ci_queue_cache["ts"]) < CI_QUEUE_CACHE_TTL:
-            return ci_queue_cache["data"]
+        slot = _repo_slot(ci_queue_cache, repo, lambda: {"data": None, "ts": 0.0})
+        if not force_refresh and slot["data"] is not None and (now - slot["ts"]) < CI_QUEUE_CACHE_TTL:
+            return slot["data"]
 
     # Multiple page/API callers can arrive together after expiry. Only one may
     # refresh; waiters re-use its atomic snapshot instead of racing and later
@@ -2074,16 +2189,19 @@ def get_ci_queue_status(force_refresh=False):
     ci_queue_refresh_lock.acquire()
     now = time.time()
     with ci_queue_cache_lock:
-        if not force_refresh and ci_queue_cache["data"] is not None and (now - ci_queue_cache["ts"]) < CI_QUEUE_CACHE_TTL:
+        slot = _repo_slot(ci_queue_cache, repo, lambda: {"data": None, "ts": 0.0})
+        if not force_refresh and slot["data"] is not None and (now - slot["ts"]) < CI_QUEUE_CACHE_TTL:
             ci_queue_refresh_lock.release()
-            return ci_queue_cache["data"]
+            return slot["data"]
 
-    result = {"available": False, "queued": 0, "in_progress": 0, "repo": GITHUB_CI_REPO}
+    result = {"available": False, "queued": 0, "in_progress": 0, "repo": repo,
+              "oldest_queued_min": None, "oldest_queued_run_id": None, "oldest_queued_run_attempt": None}
+              # SHIP-OLDEST-2: None = unknown, never 0. run_id/run_attempt make the age auditable.
     token = get_gh_ci_token()
     if token:
         try:
             headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
-            base = f"https://api.github.com/repos/{GITHUB_CI_REPO}/actions/runs"
+            base = f"https://api.github.com/repos/{repo}/actions/runs"
             # GitHub can strand queued runs when a branch disappears. Keep those
             # visible as orphans, but exclude them from the live queue-depth signal.
             from datetime import timezone
@@ -2095,11 +2213,20 @@ def get_ci_queue_status(force_refresh=False):
                 headers=headers,
                 timeout=8,
             )
-            ip = _runner_active_runs(headers)
+            ip = _runner_active_runs(headers, repo=repo)
             if q.ok and ip.ok:
                 result["available"] = True
                 result["queued"] = q.json().get("total_count", 0)
                 result["in_progress"] = ip.json().get("total_count", 0)
+                # SHIP-OLDEST-2: how long the oldest still-queued run has waited to start, from
+                # the queued page already in hand (100 newest queued runs of the last 48 h).
+                # GitHub keeps created_at from attempt 1 across re-runs, so a re-queued run
+                # (run_attempt > 1) is aged from updated_at instead - the moment it was
+                # actually re-queued - not the original, stale creation time.
+                # None when nothing is queued or the page is unreadable.
+                (result["oldest_queued_min"], result["oldest_queued_run_id"],
+                 result["oldest_queued_run_attempt"]) = _oldest_queued_run(
+                    q.json().get("workflow_runs") or [])
 
                 # A workflow run may contain many concurrent jobs. Count the jobs
                 # actually running so the dashboard reflects fleet workload.
@@ -2107,7 +2234,7 @@ def get_ci_queue_status(force_refresh=False):
                     active_jobs = 0
                     active_runners = set()
                     for run in (ip.json().get("workflow_runs") or [])[:12]:
-                        jobs = _runner_run_jobs(run['id'], headers)
+                        jobs = _runner_run_jobs(run['id'], headers, repo=repo)
                         if not jobs.ok:
                             continue
                         for job in jobs.json().get("jobs", []):
@@ -2169,10 +2296,48 @@ def get_ci_queue_status(force_refresh=False):
             logger.warning(f"CI queue check failed: {e}")
 
     with ci_queue_cache_lock:
-        ci_queue_cache["data"] = result
-        ci_queue_cache["ts"] = time.time()
+        ci_queue_cache[repo] = {"data": result, "ts": time.time()}
     ci_queue_refresh_lock.release()
     return result
+
+# SHIP-GAME item 8: get_ci_queue_status's own up-to-12 per-run jobs_url lookups
+# measured 5.4s cold (isolated process, empty cache) - on top of the pipeline
+# fetch itself, this alone blows the "cold read under 5s" bar. Only the TRUE-COLD
+# case (never fetched this process's lifetime) gets deferred to a background
+# thread; the normal 2s-TTL renewal path is unchanged - SHIP-SPARK-3 deliberately
+# made that tight for freshness on this volatile a number, and this dispatch is
+# only about the one-time cold-boot block, not that ongoing design.
+ci_queue_cold_inflight = {}
+ci_queue_cold_inflight_lock = threading.Lock()
+
+
+def get_ci_queue_status_fast(repo=None, force_refresh=False):
+    repo = repo or GITHUB_CI_REPO
+    if force_refresh:
+        return get_ci_queue_status(repo=repo, force_refresh=True)
+    with ci_queue_cache_lock:
+        slot = _repo_slot(ci_queue_cache, repo, lambda: {"data": None, "ts": 0.0})
+        cold = slot["data"] is None
+    if not cold:
+        return get_ci_queue_status(repo=repo)
+
+    def _background_refresh():
+        try:
+            get_ci_queue_status(repo=repo, force_refresh=True)
+        except Exception:
+            logger.exception("SHIP-GAME background ci_queue refresh failed for %s", repo)
+        finally:
+            with ci_queue_cold_inflight_lock:
+                ci_queue_cold_inflight.pop(repo, None)
+
+    with ci_queue_cold_inflight_lock:
+        if not ci_queue_cold_inflight.get(repo):
+            ci_queue_cold_inflight[repo] = True
+            threading.Thread(target=_background_refresh, daemon=True, name=f"ship-game-ciqueue-refresh-{repo}").start()
+
+    return {"available": False, "queued": 0, "in_progress": 0, "repo": repo,
+            "oldest_queued_min": None, "oldest_queued_run_id": None, "oldest_queued_run_attempt": None}
+
 
 runson_cache = {"data": None, "ts": 0.0}
 runson_cache_lock = threading.Lock()
@@ -4004,37 +4169,21 @@ def get_target_status(target_name, target_config, fast=False):
 AGENTS_CACHE_TTL = 60
 agents_cache = {"data": None, "ts": 0.0}
 agents_cache_lock = threading.Lock()
+AGENT_FLEET_HOSTS = {
+    "frodo": FLEET_IPS["frodo"],
+    "pippen": FLEET_IPS["pippen"],
+}
+AGENT_FLEET_TIMEOUT = 6
+AGENT_TMUX_FORMAT = "#{session_name}\t#{window_name}\t#{pane_pid}"
 
 
-def _agent_windows():
-    """Read Ben's default tmux server; count windows, including pane root workers."""
-    cp = subprocess.run(["tmux", "-S", f"/tmp/tmux-{os.getuid()}/default",
-                         "list-windows", "-a", "-F",
-                         "#{session_name}\t#{window_name}\t#{pane_pid}"],
-                        capture_output=True, text=True, timeout=10, check=True)
-    children, processes = {}, {}
-    boot = time.time() - float(Path('/proc/uptime').read_text().split()[0])
-    ticks = os.sysconf('SC_CLK_TCK')
-    for path in Path('/proc').glob('[0-9]*/stat'):
-        try:
-            raw = path.read_text()
-            fields = raw[raw.rfind(')') + 2:].split()
-            pid = int(path.parent.name)
-            comm = raw[raw.find('(') + 1:raw.rfind(')')]
-            # comm may be truncated; executable basename identifies native Codex.
-            try:
-                exe = Path(os.readlink(path.parent / 'exe')).name
-            except OSError:
-                exe = comm
-            processes[pid] = (fields[0] not in ('Z', 'X') and
-                              (comm in ('claude', 'codex', 'node') or
-                               exe in ('claude', 'codex', 'node')),
-                              boot + int(fields[19]) / ticks)
-            children.setdefault(int(fields[1]), []).append(pid)
-        except (OSError, ValueError, IndexError):
-            continue  # A process exiting during the census is ordinary.
+def _agent_process_rows(processes, tmux_output, host, listed_is_live=False):
+    """Turn a host's tmux windows and process census into agent rows."""
+    children = {}
+    for pid, (_, _, ppid) in processes.items():
+        children.setdefault(ppid, []).append(pid)
     rows = []
-    for line in cp.stdout.splitlines():
+    for line in tmux_output.splitlines():
         session, window, root = line.split('\t')
         issue = re.fullmatch(r'issue-(\d+)(-fp)?', window) if session == 'codex' else None
         shepherd = re.fullmatch(r'WORK-shepherd-(\d+)', window)
@@ -4062,13 +4211,76 @@ def _agent_windows():
             if pid in seen:
                 continue
             seen.add(pid)
-            worker, started = processes.get(pid, (False, None))
+            worker, started, _ = processes.get(pid, (False, None, None))
             if worker:
                 starts.append(started)
             pending.extend(children.get(pid, []))
         rows.append({'window': window, 'session': session, 'kind': kind,
-                     'target': target, 'live': bool(starts), 'square': 'fleet',
+                     'target': target, 'live': listed_is_live or bool(starts), 'square': 'fleet',
+                     'host': host,
                      'started_at': datetime.fromtimestamp(min(starts), timezone.utc).isoformat() if starts else None})
+    return rows
+
+
+def _remote_agent_windows(host, address):
+    """Read one remote tmux server; a listed lane is the remote live signal."""
+    remote_command = (
+        "tmux -S /tmp/tmux-$(id -u)/default list-windows -a -F "
+        + shlex.quote(AGENT_TMUX_FORMAT)
+    )
+    cp = subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", address,
+         remote_command],
+        capture_output=True, text=True, timeout=AGENT_FLEET_TIMEOUT, check=True)
+    return _agent_process_rows({}, cp.stdout, host, listed_is_live=True)
+
+
+def _agent_windows():
+    """Read Ben's default tmux server fleet; include pane-root workers."""
+    deadline = time.monotonic() + AGENT_FLEET_TIMEOUT
+    executor = ThreadPoolExecutor(max_workers=len(AGENT_FLEET_HOSTS))
+    futures = {
+        executor.submit(_remote_agent_windows, host, address): host
+        for host, address in AGENT_FLEET_HOSTS.items()
+    }
+    cp = subprocess.run(["tmux", "-S", f"/tmp/tmux-{os.getuid()}/default",
+                         "list-windows", "-a", "-F",
+                         AGENT_TMUX_FORMAT],
+                        capture_output=True, text=True, timeout=10, check=True)
+    processes = {}
+    boot = time.time() - float(Path('/proc/uptime').read_text().split()[0])
+    ticks = os.sysconf('SC_CLK_TCK')
+    for path in Path('/proc').glob('[0-9]*/stat'):
+        try:
+            raw = path.read_text()
+            fields = raw[raw.rfind(')') + 2:].split()
+            pid = int(path.parent.name)
+            comm = raw[raw.find('(') + 1:raw.rfind(')')]
+            # comm may be truncated; executable basename identifies native Codex.
+            try:
+                exe = Path(os.readlink(path.parent / 'exe')).name
+            except OSError:
+                exe = comm
+            processes[pid] = (fields[0] not in ('Z', 'X') and
+                              (comm in ('claude', 'codex', 'node') or
+                               exe in ('claude', 'codex', 'node')),
+                              boot + int(fields[19]) / ticks,
+                              int(fields[1]))
+        except (OSError, ValueError, IndexError):
+            continue  # A process exiting during the census is ordinary.
+    rows = _agent_process_rows(processes, cp.stdout, 'gandalf')
+    done, pending = wait(futures, timeout=max(0, deadline - time.monotonic()))
+    for future in done:
+        host = futures[future]
+        try:
+            rows.extend(future.result())
+        except Exception as exc:
+            logger.warning("Agent tmux read failed for %s: %s", host, type(exc).__name__)
+    for future in pending:
+        logger.warning("Agent tmux read failed for %s: exceeded %ss ceiling",
+                       futures[future], AGENT_FLEET_TIMEOUT)
+        future.cancel()
+    executor.shutdown(wait=False, cancel_futures=True)
     return rows
 
 
@@ -4155,6 +4367,96 @@ def api_agents():
     except Exception:
         logger.exception('Could not establish live tmux agents')
         return _fresh_jsonify({'error': 'Could not establish live tmux agents'}, disposition, 'agents'), 503
+
+
+# SHIP-GAME items 2/3/7 (Ben 11:30 AM CDT, council build): one robot per
+# running worker - "running" = a live issue/PR lane (the same live-lane
+# instrument the 🤖 dropdown already uses: get_agents(), square not empty and
+# not 'fleet'). Each worker's build STAGE is elapsed time against a flat
+# 60-minute nominal, split into six 10-minute buckets - no per-lane historical
+# duration instrument exists anywhere in this file today, so this is the
+# honest, stated, monotonic fallback the dispatch allows ("if no duration
+# instrument exists, use elapsed minutes against a 60-minute nominal and say
+# so"). A lane that disappears between polls either completed (it had a PR
+# number attached - target.pr, or an issue lane whose matched PR showed up in
+# linked_prs) or was blocked/killed (it did not) - tracked here, in-process,
+# across polls, since a fresh page load has no prior frame to diff against and
+# item 7 asks for a replay-able completions list.
+SHIP_WORKER_NOMINAL_MIN = 60.0
+SHIP_WORKER_STAGES = 6
+SHIP_COMPLETIONS_WINDOW_S = 15 * 60
+_ship_worker_state = {}   # worker id (tmux window name) -> last-seen info
+_ship_completions = []    # [{id, pr, at}], pruned to the last 15 minutes
+_ship_worker_lock = threading.Lock()
+
+
+def _ship_worker_running(agent):
+    return bool(agent.get('live')) and agent.get('square') and agent['square'] != 'fleet'
+
+
+def _build_ship_workers_and_completions(agents):
+    now = time.time()
+    now_dt = datetime.now(timezone.utc)
+    current_ids = set()
+    workers = []
+    live_window_counts = {}
+    for agent in agents:
+        if _ship_worker_running(agent):
+            live_window_counts[agent['window']] = live_window_counts.get(agent['window'], 0) + 1
+    with _ship_worker_lock:
+        for agent in agents:
+            if not _ship_worker_running(agent):
+                continue
+            window = agent['window']
+            host = agent.get('host', 'gandalf')
+            wid = f"{host}:{window}" if live_window_counts[window] > 1 else window
+            current_ids.add(wid)
+            target = agent.get('target') or {}
+            issue = target.get('issue')
+            linked = agent.get('linked_prs') or []
+            pr = target.get('pr') if 'pr' in target else (linked[0] if linked else None)
+            started_at = agent.get('started_at')
+            elapsed_min = None
+            if started_at:
+                try:
+                    started = datetime.fromisoformat(started_at.replace('Z', '+00:00'))
+                    elapsed_min = max(0.0, (now_dt - started).total_seconds() / 60.0)
+                except Exception:
+                    elapsed_min = None
+            if elapsed_min is None:
+                stage = SHIP_WORKER_STAGES  # unknown age: show the lane as fully underway, never guess a start
+            else:
+                bucket_min = SHIP_WORKER_NOMINAL_MIN / SHIP_WORKER_STAGES
+                stage = min(SHIP_WORKER_STAGES, int(elapsed_min // bucket_min) + 1)
+            _ship_worker_state[wid] = {'issue': issue, 'pr': pr, 'last_seen': now}
+            workers.append({
+                'id': wid,
+                'host': host,
+                'window': window,
+                'issue': issue,
+                'pr': pr,
+                'started_at': started_at,
+                'elapsed_min': round(elapsed_min, 1) if elapsed_min is not None else None,
+                'stage': stage,
+                'status': 'building',
+            })
+
+        gone = [wid for wid in _ship_worker_state if wid not in current_ids]
+        for wid in gone:
+            info = _ship_worker_state.pop(wid)
+            if info.get('pr'):
+                _ship_completions.append({'id': wid, 'pr': info['pr'], 'at': now_dt.isoformat()})
+        cutoff = now - SHIP_COMPLETIONS_WINDOW_S
+        _ship_completions[:] = [c for c in _ship_completions
+                                 if _iso_epoch(c['at']) is not None and _iso_epoch(c['at']) > cutoff]
+    return workers, list(_ship_completions)
+
+
+def _iso_epoch(iso_str):
+    try:
+        return datetime.fromisoformat(iso_str.replace('Z', '+00:00')).timestamp()
+    except Exception:
+        return None
 
 
 # Organization inventory and job history use the same installation token as CI reads.
@@ -4376,13 +4678,792 @@ def api_local_runners():
 
 # ── Shipping pipeline snapshot (ported forward from bak-20260725; Gemini fleet monitor consumes /api/pipeline) ──
 PIPELINE_CACHE_TTL = 45  # seconds - must match CI_QUEUE_CACHE_TTL so ci_running measurement scope is consistent
-pipeline_cache = {"data": None, "ts": 0.0}
-pipeline_cache_lock = threading.Lock()
-pipeline_gh_failing_since = None
-pipeline_last_good = None
+# SHIP-SPARK-3: every one of this section's caches is now keyed by repo (dict of
+# repo -> slot) instead of a single slot, so switching the dropdown never serves
+# armbrain's numbers for another repo, or vice versa. _repo_slot() is the shared
+# get-or-create helper; callers still hold the existing lock around each access.
+def _repo_slot(cache, repo, factory):
+    if repo not in cache:
+        cache[repo] = factory()
+    return cache[repo]
 
-def _get_shipping_readiness(token):
-    """Read the oldest 100 open PRs and the main merge queue together."""
+pipeline_cache = {}  # repo -> {"data":..., "ts":...}
+pipeline_cache_lock = threading.Lock()
+pipeline_gh_failing_since = {}  # repo -> iso string or None
+pipeline_last_good = {}  # repo -> last good result dict
+
+# SHIP-PIPES (council dispatch 20260905): per-arrow throughput for the shipping
+# row. Rates move slowly hour to hour, so this gets its own 300s+ cache rather
+# than piggybacking on the 45s pipeline cache.
+ARROW_RATE_CACHE_TTL = 300  # seconds
+arrow_rate_cache = {}  # repo -> slot
+arrow_rate_cache_lock = threading.Lock()
+ARROW_RUNS_PAGE_CAP = 5  # 5 x per_page=100 = 500 runs/hour ceiling before we admit truncation
+
+# SHIP-OLDEST (council dispatch 20260905, Ben's order 8:57 AM CDT): every shipping-row
+# box is coloured by the age of the OLDEST item sitting in it. Two of those ages need
+# GitHub calls that the 45 s pipeline cache would otherwise repeat 80x/hour, so they get
+# their own 300 s cache here: the oldest open non-draft PR (one search call) and the
+# number of commits on main newer than the deployed SHA (one compare call). 2 calls x
+# 12 refreshes/hour = 24 calls/hour added to the shared token. Every value fails to
+# None, never to 0 - an unknown must not render as "fresh".
+SHIP_OLDEST_CACHE_TTL = 300  # seconds
+ship_oldest_cache = {"prs": {}, "ahead": {}}  # each: repo -> slot
+ship_oldest_cache_lock = threading.Lock()
+
+# SHIP-SPARK (council dispatch 20260905, Ben's order 11:09 AM CDT): a 12-hour,
+# 5-minute-sampled sparkline above every shipping-row box. The sampler below
+# reads ONLY the already-cached pipeline snapshot (pipeline_cache["data"]) -
+# it never calls GitHub itself, so this feature adds zero steady-state calls.
+# SHIP_HISTORY_THRESHOLDS is a hand-kept Python twin of the client's own
+# SHIP_OLDEST_THRESHOLDS (search that name in the HTML template) - used only
+# to classify a sample's stored colour; the live boxes still classify
+# themselves client-side from oldest_min, so the two can never disagree about
+# what is showing RIGHT NOW, only (rarely) about a colour recorded 5+ minutes ago.
+SHIP_HISTORY_SAMPLE_S = 300  # 5 minutes -> 144 points over 12 hours
+SHIP_HISTORY_WINDOW_S = 12 * 60 * 60
+SHIP_HISTORY_KEYS = ("issues", "prs", "ci", "green", "queue", "merged", "deploy")
+SHIP_HISTORY_THRESHOLDS = {
+    "prs":    (2 * 24 * 60, 5 * 24 * 60),
+    "ci":     (5, 15),
+    "green":  (30, 2 * 60),
+    "queue":  (15, 45),
+    "merged": (30, 90),
+    "deploy": (4 * 60, 8 * 60),  # Ben 11:12 AM 9/5: under 4h is green; yellow from 4h, red from 8h, only while commits wait
+}
+
+
+def _ship_history_cls(key, minutes):
+    """green/yellow/red by minutes under SHIP_HISTORY_THRESHOLDS; 'neutral' for
+    a key with no threshold (issues) or an unknown age."""
+    t = SHIP_HISTORY_THRESHOLDS.get(key)
+    if t is None or minutes is None:
+        return "neutral"
+    m = float(minutes)
+    return "green" if m < t[0] else ("yellow" if m < t[1] else "red")
+
+
+def _sample_ship_history(repo=None):
+    """One sample per shipping-row box, taken from whatever /api/pipeline
+    snapshot is already cached for this repo - never a fresh GitHub call.
+    Skipped entirely if nothing has been cached yet (server just started, or
+    this repo has never been fetched). Values fail to None (skip that key's
+    row this cycle), never 0. SHIP-SPARK-3: repo defaults to armbrain so the
+    original single-repo behavior is unchanged for anyone still calling it bare."""
+    repo = repo or GITHUB_CI_REPO
+    with pipeline_cache_lock:
+        slot = pipeline_cache.get(repo)
+        d = slot["data"] if slot else None
+    if not d or not d.get("available"):
+        return
+    merged_since_min = _minutes_since(d.get("last_merge_at"))
+    deploy_since_min = _minutes_since(d.get("last_deploy_at"))
+    waiting = d.get("deploy_commits_waiting")
+    deploy_cls = ("neutral" if waiting is None
+                  else (_ship_history_cls("deploy", deploy_since_min) if waiting > 0 else "green"))
+
+    def aged(key, count, min_val):
+        return _ship_history_cls(key, min_val) if (count or 0) > 0 else "neutral"
+
+    samples = [
+        ("issues", d.get("issues_open"), None, "neutral"),
+        ("prs", d.get("prs_open"), d.get("prs_oldest_min"), aged("prs", d.get("prs_open"), d.get("prs_oldest_min"))),
+        ("ci", d.get("ci_queued"), d.get("ci_oldest_min"), aged("ci", d.get("ci_queued"), d.get("ci_oldest_min"))),
+        ("green", d.get("green_waiting"), d.get("green_oldest_min"), aged("green", d.get("green_waiting"), d.get("green_oldest_min"))),
+        ("queue", d.get("queue_depth"), d.get("queue_oldest_min"), aged("queue", d.get("queue_depth"), d.get("queue_oldest_min"))),
+        ("merged", d.get("merged_today"), merged_since_min, _ship_history_cls("merged", merged_since_min)),
+        ("deploy", d.get("deploys_today"), deploy_since_min, deploy_cls),
+    ]
+    now_ts = int(time.time())
+    cutoff = now_ts - SHIP_HISTORY_WINDOW_S
+    with sqlite3.connect(CONFIG["db_path"]) as conn:
+        conn.execute("DELETE FROM ship_history WHERE repo = ? AND ts < ?", (repo, cutoff))
+        for key, value, oldest_min, cls in samples:
+            if value is None:
+                continue
+            conn.execute(
+                "INSERT OR REPLACE INTO ship_history (repo, ts, key, value, oldest_min, cls) VALUES (?, ?, ?, ?, ?, ?)",
+                (repo, now_ts, key, float(value), oldest_min, cls))
+
+
+def ship_history_sampler_loop():
+    """SHIP-SPARK background sampler: every SHIP_HISTORY_SAMPLE_S, snapshot
+    whatever the pipeline cache already holds for every TRACKED repo (SHIP-SPARK-3:
+    the repo list, capped at SHIP_REPO_LIST_MAX). Never issues a GitHub call - it
+    only reads pipeline_cache, which the 45s/10min refreshers below keep warm."""
+    while True:
+        try:
+            for repo in _get_tracked_repo_names():
+                _sample_ship_history(repo)
+        except Exception as e:
+            logger.warning(f"ship-history sampler failed: {e}")
+        time.sleep(SHIP_HISTORY_SAMPLE_S)
+
+
+def _get_ship_spark12h(repo=None):
+    """The last 12 hours of samples per shipping-row box for one repo, oldest first."""
+    repo = repo or GITHUB_CI_REPO
+    cutoff = int(time.time()) - SHIP_HISTORY_WINDOW_S
+    with sqlite3.connect(CONFIG["db_path"]) as conn:
+        rows = conn.execute(
+            "SELECT ts, key, value, oldest_min, cls FROM ship_history "
+            "WHERE repo = ? AND ts >= ? ORDER BY key, ts", (repo, cutoff)).fetchall()
+    out = {k: [] for k in SHIP_HISTORY_KEYS}
+    for ts, key, value, oldest_min, cls in rows:
+        if key in out:
+            out[key].append({"t": ts, "v": value, "oldest_min": oldest_min, "cls": cls})
+    return out
+
+
+# SHIP-SPARK-3 (council dispatch 20260905, Ben's order 11:26 AM CDT): which
+# Armbrain repos the CI/CD row's dropdown offers. `repo` is the FULL "owner/repo"
+# string everywhere in this file (matching GITHUB_CI_REPO) - the short "name" used
+# in the dropdown/URL/localStorage is only a display/API convenience, converted
+# via _repo_full_name/_repo_short_name at the boundary (api_pipeline, the repos
+# endpoint, the client). Every repo-keyed cache and DB column in this file uses
+# the FULL name, so armbrain's own pre-existing 12h sparkline history (migrated
+# under GITHUB_CI_REPO, not the short 'armbrain') is never orphaned by this change.
+SHIP_ORG = GITHUB_CI_REPO.split("/")[0]
+SHIP_REPO_LIST_TTL = 3600  # seconds - council item 1: refresh the repo list every 60 minutes
+SHIP_REPO_LIST_MAX = 8  # council item 3: cap N at the 8 most recently pushed
+SHIP_REPO_PUSHED_WITHIN_DAYS = 14
+repo_list_cache = {"data": None, "ts": 0.0}
+repo_list_cache_lock = threading.Lock()
+# repo (full name) -> {"tracked_since": iso, "last_refresh": iso or None} - purely
+# bookkeeping for /api/pipeline/repos, not a cache of the payload itself.
+repo_track_state = {}
+repo_track_state_lock = threading.Lock()
+
+
+def _get_repo_list(force_refresh=False):
+    """The repo list the dropdown offers: not archived, pushed within
+    SHIP_REPO_PUSHED_WITHIN_DAYS days, capped at the SHIP_REPO_LIST_MAX most
+    recently pushed. One GitHub call (orgs/<org>/repos?sort=pushed), cached
+    SHIP_REPO_LIST_TTL. Returns [{name, full_name, pushed_at, default_branch}],
+    newest-pushed first, GITHUB_CI_REPO always present even if it fell outside
+    the window (the dropdown must never lose its own default selection). On a
+    failed refresh, serves the last good list rather than an empty dropdown."""
+    now = time.time()
+    with repo_list_cache_lock:
+        if not force_refresh and repo_list_cache["data"] is not None and (now - repo_list_cache["ts"]) < SHIP_REPO_LIST_TTL:
+            return repo_list_cache["data"]
+    fallback_default = [{"name": GITHUB_CI_REPO.split("/")[1], "full_name": GITHUB_CI_REPO,
+                          "pushed_at": None, "default_branch": "main"}]
+    token = get_gh_ci_token()
+    if not token:
+        with repo_list_cache_lock:
+            if repo_list_cache["data"] is None:
+                repo_list_cache.update(data=fallback_default, ts=now)
+            return repo_list_cache["data"]
+    try:
+        headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
+        r = requests.get(f"https://api.github.com/orgs/{SHIP_ORG}/repos",
+                          params={"sort": "pushed", "direction": "desc", "per_page": 50},
+                          headers=headers, timeout=10)
+        r.raise_for_status()
+        cutoff = datetime.now(timezone.utc) - timedelta(days=SHIP_REPO_PUSHED_WITHIN_DAYS)
+        repos, saw_default = [], False
+        for repo in r.json():
+            if repo.get("archived"):
+                continue
+            pushed_at = repo.get("pushed_at")
+            if not pushed_at:
+                continue
+            try:
+                pushed_dt = datetime.fromisoformat(pushed_at.replace("Z", "+00:00"))
+            except Exception:
+                continue
+            if pushed_dt < cutoff:
+                continue
+            full_name = repo.get("full_name")
+            if full_name == GITHUB_CI_REPO:
+                saw_default = True
+            repos.append({"name": repo.get("name"), "full_name": full_name,
+                           "pushed_at": pushed_at, "default_branch": repo.get("default_branch") or "main"})
+        repos.sort(key=lambda x: x["pushed_at"], reverse=True)
+        repos = repos[:SHIP_REPO_LIST_MAX]
+        if not any(x["full_name"] == GITHUB_CI_REPO for x in repos):
+            # The dashboard's own default selection must always be choosable,
+            # even on a quiet day it fell outside the 14-day/8-cap window.
+            repos = ([r for r in repos if r["full_name"] != GITHUB_CI_REPO][:SHIP_REPO_LIST_MAX - 1]
+                      + fallback_default)
+        if not repos:
+            repos = fallback_default
+        with repo_list_cache_lock:
+            repo_list_cache.update(data=repos, ts=time.time())
+        return repos
+    except Exception as e:
+        logger.warning(f"ship-repo-list refresh failed: {e}")
+        with repo_list_cache_lock:
+            if repo_list_cache["data"] is None:
+                repo_list_cache.update(data=fallback_default, ts=now)
+            return repo_list_cache["data"]
+
+
+def _get_tracked_repo_names():
+    """Full 'owner/repo' names currently in the dropdown - what the background
+    tracker and the sampler iterate over."""
+    return [r["full_name"] for r in _get_repo_list()]
+
+
+def _repo_full_name(name_or_full):
+    """Accept either a short name ('armbrain') or a full 'owner/repo' string from
+    the client and resolve it against the current repo list; unknown short names
+    fall back to SHIP_ORG/<name> (still usable - GitHub 404s honestly if wrong)."""
+    if "/" in name_or_full:
+        return name_or_full
+    for r in _get_repo_list():
+        if r["name"] == name_or_full:
+            return r["full_name"]
+    return f"{SHIP_ORG}/{name_or_full}"
+
+
+def _repo_default_branch(full_name):
+    for r in _get_repo_list():
+        if r["full_name"] == full_name:
+            return r["default_branch"]
+    return "main"
+
+
+REPO_TRACK_REFRESH_INTERVAL = 600  # seconds (council item 3: every 10 minutes)
+# GitHub's SEARCH endpoint has its own 30-requests/minute budget, entirely
+# separate from the 5,000/hour core budget this file otherwise tracks - a full
+# repo refresh costs ~9-10 search calls (issues_open, prs_open, merged_last_hour,
+# 6x daily spark, prs_oldest_min). Refreshing 8 repos back-to-back with no gap
+# would burn 70-80 search calls in a few seconds and start 403ing before the
+# core-budget arithmetic even notices. This stagger keeps at most one repo's
+# worth of search calls landing per ~45s window, leaving headroom for whichever
+# repo a live browser has open (its own 45s poll uses the same search budget).
+REPO_TRACK_STAGGER_S = 45
+
+
+def _repo_background_tracker_loop():
+    """SHIP-SPARK-3 item 3: keeps every listed repo's /api/pipeline payload no
+    older than REPO_TRACK_REFRESH_INTERVAL, independent of whether any browser
+    is currently displaying it - so switching the dropdown never waits on a cold
+    GitHub read. The currently-viewed repo gets fresher data anyway from the
+    live client's own 45s polling loop; this loop is the floor, not the ceiling."""
+    while True:
+        pass_started = time.monotonic()
+        try:
+            repos = _get_tracked_repo_names()
+            for i, repo in enumerate(repos):
+                if i > 0:
+                    time.sleep(REPO_TRACK_STAGGER_S)
+                branch = _repo_default_branch(repo)
+                now_iso = datetime.now(timezone.utc).isoformat()
+                with repo_track_state_lock:
+                    st = repo_track_state.setdefault(repo, {"tracked_since": now_iso, "last_refresh": None})
+                try:
+                    get_pipeline_status(repo=repo, default_branch=branch, force_refresh=True)
+                    with repo_track_state_lock:
+                        st["last_refresh"] = datetime.now(timezone.utc).isoformat()
+                except Exception as e:
+                    logger.warning(f"repo background tracker failed for {repo}: {e}")
+        except Exception as e:
+            logger.warning(f"repo background tracker loop failed: {e}")
+        # The staggered pass itself takes (N-1) x REPO_TRACK_STAGGER_S seconds -
+        # subtract that so each repo's OWN cadence stays close to 10 minutes,
+        # not 10 minutes plus however long the stagger added.
+        elapsed = time.monotonic() - pass_started
+        time.sleep(max(30, REPO_TRACK_REFRESH_INTERVAL - elapsed))
+
+
+@app.route("/api/pipeline/repos", methods=["GET"])
+def api_pipeline_repos():
+    """Council item 5: the dropdown's own list, each with when it was first
+    tracked and when its background payload was last refreshed."""
+    out = []
+    with repo_track_state_lock:
+        state_snapshot = dict(repo_track_state)
+    for r in _get_repo_list():
+        st = state_snapshot.get(r["full_name"], {})
+        out.append({
+            "name": r["name"],
+            "pushed_at": r["pushed_at"],
+            "default_branch": r["default_branch"],
+            "tracked_since": st.get("tracked_since"),
+            "last_refresh": st.get("last_refresh"),
+        })
+    return jsonify(out)
+
+
+def _minutes_since(iso):
+    """Whole minutes elapsed since an ISO-8601 timestamp (GitHub's ...Z form);
+    None when the timestamp is absent or unreadable - never 0 for unknown."""
+    if not iso:
+        return None
+    try:
+        t = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        return max(0, int((datetime.now(timezone.utc) - t).total_seconds() // 60))
+    except Exception:
+        return None
+
+
+def _oldest_minutes(timestamps):
+    """Age in minutes of the EARLIEST timestamp in an iterable (unreadable entries
+    ignored); None when nothing usable is present."""
+    ages = [m for m in (_minutes_since(t) for t in timestamps) if m is not None]
+    return max(ages) if ages else None
+
+
+def _ci_queued_since(run):
+    """The honest 'waiting since' timestamp for a queued workflow run (SHIP-OLDEST-2):
+    GitHub keeps created_at from attempt 1 across re-runs, so a re-queued run
+    (run_attempt > 1) reads as ancient forever unless aged from updated_at - the
+    moment it was actually re-queued - instead."""
+    if (run.get("run_attempt") or 1) > 1:
+        return run.get("updated_at")
+    return run.get("created_at")
+
+
+def _oldest_queued_run(runs):
+    """The queued run that has waited longest by _ci_queued_since. Returns
+    (age_minutes, run_id, run_attempt), all None when no run has a usable
+    timestamp - never 0 standing in for unknown."""
+    best = None
+    for run in runs:
+        age = _minutes_since(_ci_queued_since(run))
+        if age is None:
+            continue
+        if best is None or age > best[0]:
+            best = (age, run.get("id"), run.get("run_attempt") or 1)
+    return best if best else (None, None, None)
+
+
+def _get_prs_oldest_min(headers, repo, force_refresh=False):
+    """Age in minutes of the oldest OPEN, non-draft PR by created_at. One search call
+    (sorted created asc, per_page=1), cached SHIP_OLDEST_CACHE_TTL per repo. None on
+    failure and None when no such PR exists (the box then holds nothing to be old)."""
+    now = time.time()
+    with ship_oldest_cache_lock:
+        slot = _repo_slot(ship_oldest_cache["prs"], repo, lambda: {"data": None, "ts": 0.0})
+        if not force_refresh and slot["ts"] and (now - slot["ts"]) < SHIP_OLDEST_CACHE_TTL:
+            return slot["data"]
+    value = None
+    try:
+        r = requests.get("https://api.github.com/search/issues", params={
+            "q": f"repo:{repo} type:pr is:open -is:draft",
+            "sort": "created", "order": "asc", "per_page": 1,
+        }, headers=headers, timeout=8)
+        if r.ok:
+            items = r.json().get("items") or []
+            value = _minutes_since(items[0].get("created_at")) if items else None
+        else:
+            logger.warning("ship-oldest prs search: HTTP %s", r.status_code)
+    except Exception as e:
+        logger.warning(f"ship-oldest prs search failed: {e}")
+    with ship_oldest_cache_lock:
+        ship_oldest_cache["prs"][repo] = {"data": value, "ts": time.time()}
+    return value
+
+
+def _get_deploy_commits_waiting(headers, deployed_sha, repo, default_branch="main", force_refresh=False):
+    """Commits on the repo's default branch that the last production deploy does not
+    contain: compare <deployed-sha>...<default_branch>, read ahead_by, and the OLDEST
+    such commit's committer date (compare's commits[] array is chronological
+    oldest-first - verified live against armbrain-io/armbrain 2026-09-05: commits[0]
+    was the earliest of the ahead-by set). One call, cached SHIP_OLDEST_CACHE_TTL per
+    repo and keyed by the SHA (a new deploy refreshes at once). Returns
+    (count, oldest_commit_at_iso); both None when unknown, never 0/"" standing in for
+    unknown."""
+    if not deployed_sha:
+        return None, None
+    now = time.time()
+    with ship_oldest_cache_lock:
+        slot = _repo_slot(ship_oldest_cache["ahead"], repo, lambda: {"data": None, "ts": 0.0, "sha": None})
+        if (not force_refresh and slot["sha"] == deployed_sha and slot["ts"]
+                and (now - slot["ts"]) < SHIP_OLDEST_CACHE_TTL):
+            return slot["data"], slot.get("oldest_at")
+    value = None
+    oldest_at = None
+    try:
+        r = requests.get(f"https://api.github.com/repos/{repo}/compare/{deployed_sha}...{default_branch}",
+                         params={"per_page": 1}, headers=headers, timeout=8)
+        if r.ok:
+            body = r.json()
+            ahead = body.get("ahead_by")
+            value = int(ahead) if isinstance(ahead, int) else None
+            commits = body.get("commits") or []
+            if commits:
+                oldest_at = (commits[0].get("commit") or {}).get("committer", {}).get("date")
+        else:
+            logger.warning("ship-oldest deploy compare: HTTP %s", r.status_code)
+    except Exception as e:
+        logger.warning(f"ship-oldest deploy compare failed: {e}")
+    with ship_oldest_cache_lock:
+        ship_oldest_cache["ahead"][repo] = {"data": value, "ts": time.time(), "sha": deployed_sha, "oldest_at": oldest_at}
+    return value, oldest_at
+
+
+def _next_odd_tick_ct(now_utc=None):
+    """Next odd Central-Time hour's :03 mark, strictly after now - the REAL tick
+    schedule (SHIP-SPARK-3 FIRST ITEM, council 12:30 PM CDT 2026-09-05, correcting
+    SHIP-SPARK-2's guess of :20): crontab runs deploy-tick-backstop.sh at :03 and
+    :25 every hour, but the script itself exits immediately unless the Central-Time
+    hour is odd (`(( CT_HOUR % 2 == 1 )) || exit 0`), so the primary tick is :03 of
+    each odd CT hour and :25 is its same-hour retry. Mapped to America/Chicago
+    wall-clock, DST-proof for the same reason the guard itself is: no UTC offset is
+    ever baked in, so this needs no maintenance across a CDT/CST flip."""
+    from zoneinfo import ZoneInfo
+    CT = ZoneInfo("America/Chicago")
+    now = (now_utc or datetime.now(timezone.utc)).astimezone(CT)
+    candidate = now.replace(minute=3, second=0, microsecond=0)
+    if candidate <= now:
+        candidate += timedelta(hours=1)
+    while candidate.hour % 2 == 0:
+        candidate += timedelta(hours=1)
+    return candidate.astimezone(timezone.utc)
+
+
+DEPLOY_WORKFLOW_CACHE_TTL = 3600  # workflow definitions change rarely - one call/hour/repo at most
+deploy_workflow_cache = {}  # repo -> {"ids": [...], "ts": ...}
+deploy_workflow_cache_lock = threading.Lock()
+
+
+def _resolve_deploy_workflow(repo, headers):
+    """Which workflow id(s) count as 'the deploy workflow' for this repo (SHIP-SPARK-3
+    item 4). armbrain has a known id (255384592, gateway-deploy.yml carries both the
+    Pre-Merge Gate and the deploy job) - no call needed. Every OTHER repo: any workflow
+    whose name or path contains 'deploy' (case-insensitive), from the one-time workflow
+    list (cached DEPLOY_WORKFLOW_CACHE_TTL). Empty list = no deploy-ish workflow on this
+    repo -> the box reads n/a (deploy_configured=False)."""
+    if repo == GITHUB_CI_REPO:
+        return [255384592]
+    now = time.time()
+    with deploy_workflow_cache_lock:
+        slot = deploy_workflow_cache.get(repo)
+        if slot and (now - slot["ts"]) < DEPLOY_WORKFLOW_CACHE_TTL:
+            return slot["ids"]
+    ids = []
+    try:
+        r = requests.get(f"https://api.github.com/repos/{repo}/actions/workflows",
+                          params={"per_page": 100}, headers=headers, timeout=8)
+        if r.ok:
+            for wf in r.json().get("workflows", []):
+                name = (wf.get("name") or "").lower()
+                path = (wf.get("path") or "").lower()
+                if "deploy" in name or "deploy" in path:
+                    ids.append(wf.get("id"))
+        else:
+            logger.warning("deploy workflow resolve (%s): HTTP %s", repo, r.status_code)
+    except Exception as e:
+        logger.warning(f"deploy workflow resolve ({repo}) failed: {e}")
+    with deploy_workflow_cache_lock:
+        deploy_workflow_cache[repo] = {"ids": ids, "ts": now}
+    return ids
+
+
+def _get_deploy_state(headers, deploy_commits_waiting, oldest_waiting_commit_at, repo, deploy_workflow_ids):
+    """SHIP-SPARK-3 FIRST ITEM (council, 12:30 PM CDT 2026-09-05): shipping|held|
+    stalled|current, read from the deploy workflow's ACTUAL run state plus the real
+    odd-CT-hour :03 tick schedule (see _next_odd_tick_ct). Adds up to 2 GitHub calls
+    per pipeline refresh: one runs-list read (filtered client-side to push/schedule/
+    workflow_dispatch, newest first), and - only when that list shows something
+    active - one jobs read on that single run.
+
+    Fixes SHIP-SPARK-2's bug: that version called anything "stalled" once a flat
+    30-minute grace after ANY past odd tick elapsed, regardless of when the
+    waiting commit actually landed - making stalled the default state for ~75%
+    of every 2h window even while the cadence was working exactly as designed
+    (Ben saw this live at 12:26 PM CDT: 11:03 AM tick shipped a464b994, next
+    tick 1:03 PM, box read STALLED anyway). Correct semantics:
+      held    = no tick has passed since the OLDEST waiting commit landed on
+                main, OR the most recent tick passed less than 30 min ago
+                (grace) - a commit landing at 11:30 AM is held until 1:33 PM.
+      stalled = a tick passed more than 30 min ago while commits were already
+                waiting AND no deploy run has started since that tick.
+
+    SHIP-SPARK-3 item 4: the odd-CT-hour tick cadence is armbrain's OWN deploy-guard
+    schedule (deploy-tick-backstop.sh's cron) - no other repo has it, so held/stalled
+    are only ever computed for GITHUB_CI_REPO. Every other repo can still show
+    "shipping" (an observed in-progress run) or "current" (nothing waiting); absent
+    those, deploy_state stays None and deploy_configured tells the client whether
+    that's "no deploy-ish workflow at all" (n/a) or "a workflow exists, just no known
+    cadence to call held/stalled from" (falls back to the age-only Last: render)."""
+    result = {"deploy_state": None, "deploy_next_tick_at": None,
+              "deploy_run_id": None, "deploy_run_state": None, "deploy_run_sha": None,
+              "deploy_configured": bool(deploy_workflow_ids)}
+    if repo == GITHUB_CI_REPO:
+        result["deploy_next_tick_at"] = _next_odd_tick_ct().isoformat()
+    if not deploy_workflow_ids:
+        return result
+    workflow_id = deploy_workflow_ids[0]
+    try:
+        r = requests.get(f"https://api.github.com/repos/{repo}/actions/workflows/{workflow_id}/runs",
+                          params={"per_page": 30}, headers=headers, timeout=8)
+        r.raise_for_status()
+        runs = [run for run in r.json().get("workflow_runs", [])
+                if run.get("event") in ("push", "schedule", "workflow_dispatch")]
+        active = next((run for run in runs if run.get("status") in ("in_progress", "queued")), None)
+        if active is not None:
+            jr = requests.get(active["jobs_url"], params={"per_page": 100}, headers=headers, timeout=8)
+            jr.raise_for_status()
+            deploy_job = next((j for j in jr.json().get("jobs", []) if j.get("name") == "deploy"), None)
+            if deploy_job and deploy_job.get("status") in ("in_progress", "queued"):
+                result["deploy_state"] = "shipping"
+                result["deploy_run_id"] = active.get("id")
+                result["deploy_run_state"] = deploy_job.get("status")
+                result["deploy_run_sha"] = (active.get("head_sha") or "")[:9]
+                return result
+        newest = runs[0] if runs else None
+        if newest is not None:
+            result["deploy_run_id"] = newest.get("id")
+            result["deploy_run_state"] = newest.get("status") if newest.get("status") != "completed" else newest.get("conclusion")
+        if deploy_commits_waiting is None:
+            return result  # unknown - state stays None; client falls back to its own rendering
+        if deploy_commits_waiting <= 0:
+            result["deploy_state"] = "current"
+            return result
+        if repo != GITHUB_CI_REPO:
+            return result  # no known cadence off armbrain - stay None, client falls back honestly
+        next_tick = _iso_to_dt(result["deploy_next_tick_at"])
+        last_tick = next_tick - timedelta(hours=2)
+        now = datetime.now(timezone.utc)
+        grace = now < last_tick + timedelta(minutes=30)
+        oldest_at = _iso_to_dt(oldest_waiting_commit_at) if oldest_waiting_commit_at else None
+        # No commit timestamp available (compare call failed/empty despite a
+        # positive count) -> can't prove a tick passed since it landed, so fall
+        # back to held rather than risk a false stalled.
+        tick_passed_since_landing = oldest_at is not None and oldest_at <= last_tick
+        if grace or not tick_passed_since_landing:
+            result["deploy_state"] = "held"
+        else:
+            run_after_tick = (newest is not None and newest.get("created_at")
+                               and _iso_to_dt(newest["created_at"]) > last_tick)
+            result["deploy_state"] = "held" if run_after_tick else "stalled"
+    except Exception as e:
+        logger.warning(f"deploy state lookup failed ({repo}): {e}")
+    return result
+
+
+def _run_pr_keys(run):
+    """Distinct-PR identity for a workflow run: the real PR number when GitHub
+    attached one, else the head branch as an approximate stand-in (SHIP-PIPES-2,
+    per dispatch: 'each run carries pull_requests[].number or the head branch')."""
+    prs = run.get("pull_requests") or []
+    if prs:
+        return {("pr", pr.get("number")) for pr in prs}
+    branch = run.get("head_branch")
+    return {("branch", branch)} if branch else set()
+
+
+def _get_arrow_rates(repo=None, force_refresh=False):
+    """PRs/hour that crossed each shipping-row edge in the last 60 minutes.
+    SHIP-PIPES-2 (Ben, 8:56 AM CDT 2026-09-05): every arrow must speak the same
+    unit - PRs/hour - not a mix of PR counts and workflow-run counts (one PR
+    push starts several runs: gate, secret scan, semgrep, ...). One paginated
+    /actions/runs fetch (created in the last hour, capped at ARROW_RUNS_PAGE_CAP
+    pages) is reused for BOTH prs-ci (distinct PRs among all those runs) and
+    ci-green (distinct PRs among the subset that are a successful run of the
+    Pre-Merge Gate workflow, id 255384592 on armbrain) - ci-green adds zero
+    extra calls. SHIP-SPARK-3: cached per repo."""
+    repo = repo or GITHUB_CI_REPO
+    now = time.time()
+    with arrow_rate_cache_lock:
+        slot = _repo_slot(arrow_rate_cache, repo, lambda: {"data": None, "ts": 0.0})
+        if not force_refresh and slot["data"] is not None and (now - slot["ts"]) < ARROW_RATE_CACHE_TTL:
+            return slot["data"]
+
+    rates = {"pr_created_hour": None, "runs_created_hour": None, "runs_success_hour": None,
+              "runs_pages_fetched": 0, "runs_truncated": False}
+    token = get_gh_ci_token()
+    if token:
+        headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
+        hour_ago = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        try:
+            r = requests.get("https://api.github.com/search/issues", params={
+                "q": f"repo:{repo} type:pr created:>={hour_ago}", "per_page": 1,
+            }, headers=headers, timeout=8)
+            if r.ok:
+                rates["pr_created_hour"] = r.json().get("total_count")
+            else:
+                logger.warning("arrow rate pr_created_hour: HTTP %s", r.status_code)
+        except Exception as e:
+            logger.warning(f"arrow rate pr_created_hour failed: {e}")
+
+        runs, pages_fetched, truncated, fetch_ok = [], 0, False, True
+        try:
+            for page in range(1, ARROW_RUNS_PAGE_CAP + 1):
+                r = requests.get(f"https://api.github.com/repos/{repo}/actions/runs", params={
+                    "created": f">={hour_ago}", "per_page": 100, "page": page,
+                }, headers=headers, timeout=8)
+                if not r.ok:
+                    logger.warning("arrow rate runs page %s: HTTP %s", page, r.status_code)
+                    fetch_ok = pages_fetched > 0  # partial data from earlier pages still usable
+                    break
+                pages_fetched += 1
+                page_runs = r.json().get("workflow_runs", [])
+                runs.extend(page_runs)
+                if len(page_runs) < 100:
+                    break
+                if page == ARROW_RUNS_PAGE_CAP:
+                    truncated = True
+        except Exception as e:
+            logger.warning(f"arrow rate runs fetch failed: {e}")
+            fetch_ok = pages_fetched > 0
+
+        if fetch_ok:
+            all_keys, gate_keys = set(), set()
+            # "ci-green" tracks armbrain's specific Pre-Merge Gate workflow (id
+            # 255384592). No other repo has that id, so counting 0 matches there
+            # would silently read as "nothing went green" rather than "we don't
+            # know which workflow is this repo's green gate" - stays None instead.
+            for run in runs:
+                keys = _run_pr_keys(run)
+                all_keys |= keys
+                if repo == GITHUB_CI_REPO and run.get("workflow_id") == 255384592 and run.get("conclusion") == "success":
+                    gate_keys |= keys
+            rates["runs_created_hour"] = len(all_keys)
+            rates["runs_success_hour"] = len(gate_keys) if repo == GITHUB_CI_REPO else None
+            rates["runs_pages_fetched"] = pages_fetched
+            rates["runs_truncated"] = truncated
+        else:
+            logger.warning("arrow rate runs_created_hour/runs_success_hour: fetch failed, no pages returned")
+
+    with arrow_rate_cache_lock:
+        arrow_rate_cache[repo] = {"data": rates, "ts": time.time()}
+    return rates
+
+# SHIP-GAME item 8: same stale-while-revalidate treatment as
+# get_pipeline_status_fast, and for the same reason - a cold arrow_rate_cache
+# means up to 6 sequential GitHub calls (1 search + up to 5 paginated
+# actions/runs pages) inline in the request handler. arrow_rate_cache itself
+# already keeps its previous value past TTL (only overwritten on a fresh
+# fetch), so "last known" here is just the cache slot's existing data,
+# regardless of age - no separate last-good dict needed.
+arrow_rate_fetch_inflight = {}
+arrow_rate_fetch_inflight_lock = threading.Lock()
+
+
+def _get_arrow_rates_fast(repo=None, force_refresh=False):
+    repo = repo or GITHUB_CI_REPO
+    if force_refresh:
+        return _get_arrow_rates(repo=repo, force_refresh=True)
+
+    now = time.time()
+    with arrow_rate_cache_lock:
+        slot = _repo_slot(arrow_rate_cache, repo, lambda: {"data": None, "ts": 0.0})
+        fresh = slot["data"] is not None and (now - slot["ts"]) < ARROW_RATE_CACHE_TTL
+        stale_data = slot["data"]
+
+    if fresh:
+        return slot["data"]
+
+    def _background_refresh():
+        try:
+            _get_arrow_rates(repo=repo, force_refresh=True)
+        except Exception:
+            logger.exception("SHIP-GAME background arrow-rate refresh failed for %s", repo)
+        finally:
+            with arrow_rate_fetch_inflight_lock:
+                arrow_rate_fetch_inflight.pop(repo, None)
+
+    with arrow_rate_fetch_inflight_lock:
+        if not arrow_rate_fetch_inflight.get(repo):
+            arrow_rate_fetch_inflight[repo] = True
+            threading.Thread(target=_background_refresh, daemon=True, name=f"ship-game-arrow-refresh-{repo}").start()
+
+    if stale_data is not None:
+        return stale_data
+    return {"pr_created_hour": None, "runs_created_hour": None, "runs_success_hour": None,
+            "runs_pages_fetched": 0, "runs_truncated": False}
+
+
+def _drain_hours(backlog, rate):
+    """None (unavailable) beats any number - a stalled arrow with a pile behind
+    it outranks a slow-but-moving one, per SHIP-PIPES bottleneck rule."""
+    if backlog in (None, 0):
+        return 0
+    if rate in (None, 0):
+        return None
+    return backlog / rate
+
+
+def _ship_game_rate_label(rate):
+    """SHIP-GAME item 1 (Ben 11:30 AM CDT + council build): '3/hour' - one
+    decimal place under 10, a plain integer at/above 10, '?/hour' when the
+    instrument is unavailable. A whole number under 10 (3.0) prints as '3',
+    matching Ben's own literal example, not '3.0'."""
+    if rate is None:
+        return "?/hour"
+    r = float(rate)
+    if r < 10:
+        v = round(r, 1)
+        text = str(int(v)) if v == int(v) else ("%.1f" % v)
+    else:
+        text = str(int(round(r)))
+    return text + "/hour"
+
+
+def _ship_game_drain_label(drain_hours):
+    """Same text the row's own shipDrainText() renders client-side - kept in
+    lockstep so the server-provided label and the client's own fallback never
+    disagree. Always plain grey text server-side too - this label never colors
+    itself red; the arrow's own glow still carries the bottleneck alarm."""
+    if drain_hours is None:
+        return "stalled"
+    n = round(float(drain_hours) * 10) / 10
+    if n == int(n):
+        n = int(n)
+    return f"{n}h to drain"
+
+
+def _build_ship_arrows(result, rates):
+    """One object per shipping-row arrow, in row order, for the /api/pipeline
+    'arrows' field. Backlog = count in the box to the arrow's left, from
+    fields _get_pipeline_status/api_pipeline already populated in result."""
+    merged_hour = result.get("merged_last_hour")
+    ci_queued, ci_running = result.get("ci_queued"), result.get("ci_running")
+    ci_backlog = (ci_queued + ci_running) if ci_queued is not None and ci_running is not None else None
+    override = os.environ.get("SHIP_PIPES_FORCE_ARROW")  # dispatch step 4: manual known-positive test
+    # SHIP-PIPES-2 change 3 known-positive test: SHIP_PIPES_FORCE_RATE selects which
+    # forced rate rides with the override - "1" (measured slow -> red, h to drain),
+    # "0" (measured stall -> red, "stalled"), "null" (unavailable -> grey "?", never red).
+    override_rate_raw = os.environ.get("SHIP_PIPES_FORCE_RATE", "1")
+    override_rate = None if override_rate_raw == "null" else int(override_rate_raw)
+    # SHIP-PIPES-2 change 4: every description states its unit (PRs/hour) and
+    # source in plain words, so the row compares one unit of work left to right.
+    specs = [
+        ("issues-prs", "PRs opened in the last hour, from GitHub search (click the button for live agent lanes)", rates.get("pr_created_hour"), result.get("issues_open")),
+        ("prs-ci", "Distinct PRs with a CI run started this hour, from GitHub's workflow-runs list", rates.get("runs_created_hour"), result.get("prs_open")),
+        ("ci-green", "Distinct PRs with a green Pre-Merge Gate run this hour (workflow 255384592), from GitHub's workflow-runs list", rates.get("runs_success_hour"), ci_backlog),
+        ("green-inline", "Green eligible PRs not yet enqueued (approx., via merges/hr)", merged_hour, result.get("green_waiting")),
+        ("inline-merged", "Merge queue entries (approx., via merges/hr)", merged_hour, result.get("queue_depth")),
+        ("merged-deploy", "Production deploy workflows (no hourly deploy-rate instrument yet - only daily counts)", None, result.get("merged_today")),
+    ]
+    arrows = []
+    for key, description, rate, backlog in specs:
+        if override:
+            # Zero every other arrow's backlog so the known-positive test shows
+            # exactly one forced arrow, per SHIP-PIPES dispatch step 4, regardless
+            # of what live GitHub data happens to look like at test time.
+            backlog, rate = (20, override_rate) if key == override else (0, rate)
+        drain_hours = _drain_hours(backlog, rate)
+        arrows.append({
+            "key": key,
+            "description": description,
+            "rate_per_hour": rate,
+            "backlog": backlog,
+            "drain_hours": drain_hours,
+            # SHIP-GAME item 1/7: only arrows[0] (issues-prs) is council-specified
+            # to show these ("3/hour" inside the arrow, "102h to drain" outside
+            # and above it, always grey) - computed for every arrow anyway since
+            # it's free, but the client only renders it for the first one.
+            "label": _ship_game_rate_label(rate),
+            "drain_label": _ship_game_drain_label(drain_hours),
+        })
+    return arrows
+
+def _get_shipping_readiness(token, repo=None, default_branch="main"):
+    """Read the oldest 100 open PRs and the repo's merge queue together.
+    SHIP-SPARK-3 item 4: mergeQueue(branch: default_branch) legitimately returns
+    null on a repo with no merge queue configured - that is "n/a", not a failed
+    read, so it no longer raises. A TRUNCATED queue (hasNextPage) still raises:
+    that IS a failed read, we cannot establish who's queued from a partial page."""
+    repo = repo or GITHUB_CI_REPO
     env = dict(os.environ, GH_TOKEN=token)
     def gh_json(args):
         cp = subprocess.run(["gh", *args], env=env, capture_output=True,
@@ -4392,23 +5473,33 @@ def _get_shipping_readiness(token):
             raise ValueError("GitHub green-waiting query failed")
         return value
 
-    prs = gh_json(["pr", "list", "--repo", GITHUB_CI_REPO, "--state", "open",
+    prs = gh_json(["pr", "list", "--repo", repo, "--state", "open",
                    "--limit", "100", "--search", "sort:created-asc", "--json",
-                   "number,title,isDraft,reviewDecision,mergeable,mergeStateStatus,labels"])
-    owner, name = GITHUB_CI_REPO.split("/")
-    query = '''query($owner:String!,$name:String!){
-      repository(owner:$owner,name:$name){mergeQueue(branch:"main"){
-        entries(first:100){nodes{state pullRequest{number title}} pageInfo{hasNextPage}}
+                   "number,title,isDraft,reviewDecision,mergeable,mergeStateStatus,labels,updatedAt"])
+    owner, name = repo.split("/")
+    query = '''query($owner:String!,$name:String!,$branch:String!){
+      repository(owner:$owner,name:$name){mergeQueue(branch:$branch){
+        entries(first:100){nodes{state enqueuedAt pullRequest{number title}} pageInfo{hasNextPage}}
       }}
     }'''
-    queue = gh_json(["api", "graphql", "-f", "query=" + query,
-                     "-f", "owner=" + owner, "-f", "name=" + name])["data"]["repository"]["mergeQueue"]
-    if queue is None or queue["entries"]["pageInfo"]["hasNextPage"]:
-        # An absent or truncated queue cannot establish that a PR is not queued.
-        raise ValueError("Could not establish the complete main merge queue")
-    queue_prs = [{"number": entry["pullRequest"]["number"], "title": entry["pullRequest"]["title"], "state": entry["state"]}
-                 for entry in queue["entries"]["nodes"]]
+    queue = gh_json(["api", "graphql", "-f", "query=" + query, "-f", "owner=" + owner,
+                     "-f", "name=" + name, "-f", "branch=" + default_branch])["data"]["repository"]["mergeQueue"]
+    has_merge_queue = queue is not None
+    if has_merge_queue and queue["entries"]["pageInfo"]["hasNextPage"]:
+        # A TRUNCATED queue cannot establish that a PR is not queued - a real failure.
+        raise ValueError("Could not establish the complete merge queue")
+    queue_prs = ([{"number": entry["pullRequest"]["number"], "title": entry["pullRequest"]["title"], "state": entry["state"]}
+                 for entry in queue["entries"]["nodes"]] if has_merge_queue else [])
     queued = {entry["number"] for entry in queue_prs}
+    # SHIP-OLDEST: age of the oldest queue entry of ANY state (enqueuedAt). Kept out of the
+    # queue_prs dicts themselves: the dashboard-truth suite compares those against its own
+    # {number, title, state} probe with plain equality.
+    queue_nodes = queue["entries"]["nodes"] if has_merge_queue else []
+    queue_oldest_min = _oldest_minutes(entry.get("enqueuedAt") for entry in queue_nodes)
+    # SHIP-SPARK-2: enqueuedAt per PR number, straight from this same GraphQL read
+    # (zero extra calls) - the "added to the merge queue" time for a PR still
+    # queued, so the green-wait average never has to re-fetch it via the timeline.
+    queue_enqueued_at = {entry["pullRequest"]["number"]: entry["enqueuedAt"] for entry in queue_nodes}
     # Drafts are unfinished; unapproved PRs still need review; non-MERGEABLE
     # (including UNKNOWN) PRs have not established merge readiness.
     # Only CLEAN establishes green checks; BLOCKED and UNSTABLE are not green.
@@ -4423,16 +5514,23 @@ def _get_shipping_readiness(token):
             and pr["number"] not in queued
             and not held.intersection(label["name"].lower() for label in pr["labels"])]
 
-    return waiting, queue_prs
+    # SHIP-OLDEST: how long the oldest green-eligible PR has waited, measured since its
+    # last activity (updatedAt is the honest proxy for "became eligible").
+    waiting_numbers = {pr["number"] for pr in waiting}
+    green_oldest_min = _oldest_minutes(pr.get("updatedAt") for pr in prs if pr["number"] in waiting_numbers)
+
+    return waiting, queue_prs, {"queue_oldest_min": queue_oldest_min, "green_oldest_min": green_oldest_min,
+                                "queue_enqueued_at": queue_enqueued_at, "has_merge_queue": has_merge_queue}
 
 
-def _get_merged_today_prs(headers, today):
+def _get_merged_today_prs(headers, today, repo=None):
     """Return the complete search result in merge-time order, never a partial count."""
+    repo = repo or GITHUB_CI_REPO
     items = []
     page = 1
     while True:
         r = requests.get("https://api.github.com/search/issues", params={
-            "q": f"repo:{GITHUB_CI_REPO} type:pr merged:>={today}",
+            "q": f"repo:{repo} type:pr merged:>={today}",
             "per_page": 100, "page": page,
         }, headers=headers, timeout=8)
         r.raise_for_status()
@@ -4451,18 +5549,205 @@ def _get_merged_today_prs(headers, today):
     return [{"number": p["number"], "title": p["title"]} for p in items]
 
 
-def get_pipeline_status(force_refresh=False):
-    """Shipping-pipeline snapshot for armbrain: issues -> PRs -> CI -> green waiting
-    -> in line -> merged today. Read-only GitHub queries, cached with PIPELINE_CACHE_TTL."""
+# SHIP-SPARK-2 (council dispatch 20260905, Ben 11:12 AM CDT): the "green waiting"
+# box's Ave: sub-line - mean wait, in minutes, of every PR that entered today's
+# merge queue (merged-today PRs + PRs currently queued) plus every PR currently
+# green-waiting and not yet queued. Its own 300 s cache, separate from the 45 s
+# pipeline cache, because the first look at any PR costs 2 GitHub calls (reviews,
+# commits) - a merged PR's row is then frozen forever in pr_wait_cache; a live
+# (queued/green-waiting) PR's row is simply re-read once this cache expires, at
+# most every 300 s, never on every 45 s pipeline refresh.
+GREEN_WAIT_CACHE_TTL = 300  # seconds
+green_wait_cache = {}  # SHIP-SPARK-3: repo -> slot
+green_wait_cache_lock = threading.Lock()
+GREEN_WAIT_TOOLTIP_CAP = 12
+
+
+def _iso_to_dt(iso):
+    """Parse a GitHub ISO-8601 timestamp to an aware UTC datetime, or None."""
+    if not iso:
+        return None
+    try:
+        t = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+        return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def _pr_wait_cache_row(repo, number):
+    with sqlite3.connect(CONFIG["db_path"]) as conn:
+        row = conn.execute(
+            "SELECT merged, added_to_queue_at, approved_at, head_committer_at, eligible_at, "
+            "excluded_reason, cached_at FROM pr_wait_cache WHERE repo = ? AND number = ?",
+            (repo, number)).fetchone()
+    if row is None:
+        return None
+    keys = ("merged", "added_to_queue_at", "approved_at", "head_committer_at", "eligible_at",
+            "excluded_reason", "cached_at")
+    return dict(zip(keys, row))
+
+
+def _pr_wait_cache_store(repo, number, merged, added_to_queue_at, approved_at, head_committer_at,
+                          eligible_at, excluded_reason):
+    with sqlite3.connect(CONFIG["db_path"]) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO pr_wait_cache (repo, number, merged, added_to_queue_at, approved_at, "
+            "head_committer_at, eligible_at, excluded_reason, cached_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (repo, number, int(merged), added_to_queue_at, approved_at, head_committer_at, eligible_at,
+             excluded_reason, datetime.now(timezone.utc).isoformat()))
+
+
+def _get_pr_eligibility(number, headers, repo):
+    """Last APPROVED review's submitted_at, and the head commit's committer
+    date, for one PR - 2 GitHub calls (reviews, commits), each per_page=100.
+    Returns (approved_at, head_committer_at); either may be None."""
+    approved_at = None
+    r = requests.get(f"https://api.github.com/repos/{repo}/pulls/{number}/reviews",
+                      params={"per_page": 100}, headers=headers, timeout=8)
+    r.raise_for_status()
+    for review in r.json():
+        if review.get("state") == "APPROVED" and review.get("submitted_at"):
+            if approved_at is None or review["submitted_at"] > approved_at:
+                approved_at = review["submitted_at"]
+    head_committer_at = None
+    r = requests.get(f"https://api.github.com/repos/{repo}/pulls/{number}/commits",
+                      params={"per_page": 100}, headers=headers, timeout=8)
+    r.raise_for_status()
+    commits = r.json()
+    if commits:
+        head_committer_at = (commits[-1].get("commit", {}).get("committer", {}) or {}).get("date")
+    return approved_at, head_committer_at
+
+
+def _get_pr_added_to_queue_at(number, headers, repo):
+    """The added_to_merge_queue event's created_at from this PR's timeline -
+    paginated, only ever called for a MERGED PR (a still-queued PR's queue-entry
+    time comes free from the GraphQL mergeQueue read instead). Takes the LAST
+    such event (a PR kicked out and re-added shows the re-add, not the first try)."""
+    added_at = None
+    page = 1
+    while page <= 10:  # 1000 timeline events on one PR would be a different problem
+        r = requests.get(f"https://api.github.com/repos/{repo}/issues/{number}/timeline",
+                          params={"per_page": 100, "page": page}, headers=headers, timeout=8)
+        r.raise_for_status()
+        events = r.json()
+        for ev in events:
+            if ev.get("event") == "added_to_merge_queue" and ev.get("created_at"):
+                added_at = ev["created_at"]
+        if len(events) < 100:
+            break
+        page += 1
+    return added_at
+
+
+def _get_pr_wait_entry(number, headers, merged, enqueued_at_hint, repo):
+    """One PR's wait-cache row: the permanent row if this PR is merged and
+    already cached, else freshly fetched (and, only if merged, cached forever)."""
+    cached = _pr_wait_cache_row(repo, number)
+    if cached and cached["merged"]:
+        return cached
+    approved_at, head_committer_at = _get_pr_eligibility(number, headers, repo)
+    excluded_reason = None if approved_at else "no approval"
+    eligible_at = None
+    if approved_at:
+        eligible_at = approved_at
+        if head_committer_at and head_committer_at > eligible_at:
+            eligible_at = head_committer_at
+    added_to_queue_at = enqueued_at_hint
+    if merged and added_to_queue_at is None:
+        added_to_queue_at = _get_pr_added_to_queue_at(number, headers, repo)
+    _pr_wait_cache_store(repo, number, merged, added_to_queue_at, approved_at, head_committer_at,
+                         eligible_at, excluded_reason)
+    return {"merged": int(merged), "added_to_queue_at": added_to_queue_at, "approved_at": approved_at,
+            "head_committer_at": head_committer_at, "eligible_at": eligible_at,
+            "excluded_reason": excluded_reason}
+
+
+def _compute_green_wait(headers, merged_today_prs, queue_prs, queue_enqueued_at, green_waiting_prs, repo):
+    """SHIP-SPARK-2: mean wait (minutes) of every PR that entered today's merge
+    queue (merged-today + currently-queued) plus every currently green-waiting
+    PR not yet queued. Returns (avg_min, n, excluded, detail); detail is
+    [{number, title, wait_min}], newest-referenced-event first, capped at
+    GREEN_WAIT_TOOLTIP_CAP."""
+    now = datetime.now(timezone.utc)
+    seen = set()
+    detail = []
+    excluded = 0
+
+    def add(number, title, merged, hint, wait_ref):
+        nonlocal excluded
+        if number in seen:
+            return
+        seen.add(number)
+        entry = _get_pr_wait_entry(number, headers, merged=merged, enqueued_at_hint=hint, repo=repo)
+        eligible = _iso_to_dt(entry["eligible_at"])
+        end = wait_ref(entry)
+        if entry["excluded_reason"] or eligible is None or end is None:
+            excluded += 1
+            return
+        wait_min = max(0.0, (end - eligible).total_seconds() / 60.0)
+        detail.append({"number": number, "title": title, "wait_min": wait_min, "ts": end})
+
+    for pr in merged_today_prs:
+        add(pr["number"], pr["title"], True, queue_enqueued_at.get(pr["number"]),
+            lambda e: _iso_to_dt(e["added_to_queue_at"]))
+    for pr in queue_prs:
+        add(pr["number"], pr["title"], False, queue_enqueued_at.get(pr["number"]),
+            lambda e: _iso_to_dt(e["added_to_queue_at"]))
+    for pr in green_waiting_prs:
+        add(pr["number"], pr["title"], False, None, lambda e: now)
+
+    detail.sort(key=lambda d: d["ts"], reverse=True)
+    n = len(detail)
+    avg_min = round(sum(d["wait_min"] for d in detail) / n) if n else None
+    for d in detail:
+        d.pop("ts")
+    return avg_min, n, excluded, detail[:GREEN_WAIT_TOOLTIP_CAP]
+
+
+def get_green_wait_stats(headers, merged_today_prs, queue_prs, queue_enqueued_at, green_waiting_prs,
+                          repo=None, force_refresh=False):
+    """Cached (GREEN_WAIT_CACHE_TTL, per repo) wrapper around _compute_green_wait -
+    on failure, serves the last good value rather than a false zero."""
+    repo = repo or GITHUB_CI_REPO
+    now = time.time()
+    with green_wait_cache_lock:
+        slot = _repo_slot(green_wait_cache, repo, lambda: {"data": None, "ts": 0.0})
+        if not force_refresh and slot["data"] is not None and (now - slot["ts"]) < GREEN_WAIT_CACHE_TTL:
+            return slot["data"]
+    try:
+        avg_min, n, excluded, detail = _compute_green_wait(
+            headers, merged_today_prs, queue_prs, queue_enqueued_at, green_waiting_prs, repo)
+        data = {"green_wait_avg_min": avg_min, "green_wait_n": n, "green_wait_excluded": excluded,
+                "green_wait_prs": detail}
+    except Exception as e:
+        logger.warning(f"green-wait computation failed: {e}")
+        with green_wait_cache_lock:
+            stale = _repo_slot(green_wait_cache, repo, lambda: {"data": None, "ts": 0.0})["data"]
+        return stale or {"green_wait_avg_min": None, "green_wait_n": None,
+                          "green_wait_excluded": None, "green_wait_prs": []}
+    with green_wait_cache_lock:
+        green_wait_cache[repo] = {"data": data, "ts": time.time()}
+    return data
+
+
+def get_pipeline_status(repo=None, default_branch=None, force_refresh=False):
+    """Shipping-pipeline snapshot for one repo: issues -> PRs -> CI -> green waiting
+    -> in line -> merged today. Read-only GitHub queries, cached with PIPELINE_CACHE_TTL
+    per repo. SHIP-SPARK-3: repo/default_branch default to GITHUB_CI_REPO/main so every
+    pre-existing caller (bare get_pipeline_status()) is unchanged."""
+    repo = repo or GITHUB_CI_REPO
+    default_branch = default_branch or "main"
     now = time.time()
     with pipeline_cache_lock:
-        if not force_refresh and pipeline_cache["data"] is not None and (now - pipeline_cache["ts"]) < PIPELINE_CACHE_TTL:
-            return pipeline_cache["data"]
+        slot = _repo_slot(pipeline_cache, repo, lambda: {"data": None, "ts": 0.0})
+        if not force_refresh and slot["data"] is not None and (now - slot["ts"]) < PIPELINE_CACHE_TTL:
+            return slot["data"]
 
-    global pipeline_gh_failing_since, pipeline_last_good
     result = {
         "available": False,
-        "repo": GITHUB_CI_REPO,
+        "repo": repo,
+        "default_branch": default_branch,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
     github_reads_ok = False
@@ -4471,9 +5756,21 @@ def get_pipeline_status(force_refresh=False):
     if token:
         try:
             headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
-            result["green_waiting_prs"], result["queue_prs"] = _get_shipping_readiness(token)
+            result["green_waiting_prs"], result["queue_prs"], ship_oldest = _get_shipping_readiness(
+                token, repo=repo, default_branch=default_branch)
             result["queue_depth"] = len(result["queue_prs"])
             result["green_waiting"] = len(result["green_waiting_prs"])
+            # Reuse the merge-lane instrument's own cached oldest-wait figure rather than
+            # spending a second GraphQL call - it fails to None, never to 0, on a bad read.
+            # Only meaningful when this repo actually has a merge queue (item 4).
+            result["oldest_awaiting_min"] = (get_merge_lane_status(repo=repo).get("oldest_awaiting_min")
+                                              if ship_oldest.get("has_merge_queue") else None)
+            # SHIP-OLDEST: ages of the oldest merge-queue entry and of the oldest green-eligible
+            # PR (computed inside _get_shipping_readiness from data it already fetched), plus
+            # the oldest open non-draft PR (one search call on its own 300 s cache).
+            result.update(ship_oldest)
+            queue_enqueued_at = result.pop("queue_enqueued_at", {})  # SHIP-SPARK-2: internal only, not part of the payload
+            result["prs_oldest_min"] = _get_prs_oldest_min(headers, repo, force_refresh=force_refresh)
             # "Today" is CENTRAL TIME (Ben's day), not UTC - counters were resetting at 7pm CT.
             from zoneinfo import ZoneInfo
             from datetime import timedelta
@@ -4490,17 +5787,25 @@ def get_pipeline_status(force_refresh=False):
                     logger.warning("GitHub search_count fetch failed: HTTP %s", r.status_code)
                     return None
                 return r.json().get("total_count", 0)
-            result["issues_open"] = search_count(f"repo:{GITHUB_CI_REPO} type:issue state:open")
-            result["prs_open"] = search_count(f"repo:{GITHUB_CI_REPO} type:pr state:open")
-            result["merged_today_prs"] = _get_merged_today_prs(headers, today)
+            result["issues_open"] = search_count(f"repo:{repo} type:issue state:open")
+            result["prs_open"] = search_count(f"repo:{repo} type:pr state:open")
+            result["merged_today_prs"] = _get_merged_today_prs(headers, today, repo=repo)
             result["merged_today"] = len(result["merged_today_prs"])
+            # SHIP-SPARK-2: green-wait Ave: line, its own 300 s cache (see get_green_wait_stats).
+            green_wait = get_green_wait_stats(headers, result["merged_today_prs"], result["queue_prs"],
+                                               queue_enqueued_at, result["green_waiting_prs"],
+                                               repo=repo, force_refresh=force_refresh)
+            result["green_wait_avg_min"] = green_wait["green_wait_avg_min"]
+            result["green_wait_n"] = green_wait["green_wait_n"]
+            result["green_wait_excluded"] = green_wait["green_wait_excluded"]
+            result["green_wait_prs"] = green_wait["green_wait_prs"]
             # merged in last 60 minutes
             hour_ago = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
-            result["merged_last_hour"] = search_count(f"repo:{GITHUB_CI_REPO} type:pr merged:>={hour_ago}")
+            result["merged_last_hour"] = search_count(f"repo:{repo} type:pr merged:>={hour_ago}")
             # most recent merge timestamp
             result["last_merge_at"] = None
             try:
-                r = requests.get(f"https://api.github.com/repos/{GITHUB_CI_REPO}/pulls",
+                r = requests.get(f"https://api.github.com/repos/{repo}/pulls",
                                  params={"state": "closed", "sort": "updated", "direction": "desc", "per_page": 30},
                                  headers=headers, timeout=8)
                 if r.ok:
@@ -4516,80 +5821,35 @@ def get_pipeline_status(force_refresh=False):
             for i in range(6, 0, -1):
                 d0 = (now_ct - timedelta(days=i)).replace(hour=0, minute=0, second=0, microsecond=0)
                 d1 = d0 + timedelta(days=1)
-                q = (f"repo:{GITHUB_CI_REPO} type:pr merged:{d0.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}"
+                q = (f"repo:{repo} type:pr merged:{d0.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}"
                      f"..{d1.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}")
                 count = search_count(q)
                 spark.append(count if count is not None else 0)
             spark.append(result.get("merged_today") or 0)
             result["merged_spark"] = spark
-            ci = get_ci_queue_status(force_refresh=force_refresh)
+            ci = get_ci_queue_status(repo=repo, force_refresh=force_refresh)
             result["ci_queued"] = ci.get("queued", 0) if ci.get("available") else None
             # The shipping strip is a workflow-run count, matching the queued
             # number and allowing an exact, bounded-cost GitHub verification.
             # Job/runner detail remains available on /api/ci_queue.
             result["ci_running"] = ci.get("in_progress", 0) if ci.get("available") else None
-            # deploys today (Gateway Deploy workflow - paginated & filtered in Central Time)
+            result["ci_oldest_min"] = ci.get("oldest_queued_min") if ci.get("available") else None  # SHIP-OLDEST
+            result["ci_oldest_run_id"] = ci.get("oldest_queued_run_id") if ci.get("available") else None  # SHIP-OLDEST-2
+            result["ci_oldest_run_attempt"] = ci.get("oldest_queued_run_attempt") if ci.get("available") else None
+            # SHIP-SPARK-3 item 4: which workflow (if any) counts as "the deploy
+            # workflow" for this repo - armbrain's known id, or a name/path match
+            # on any other repo, or none at all (n/a, see _get_deploy_state).
+            deploy_workflow_ids = _resolve_deploy_workflow(repo, headers)
+            # deploys today (paginated & filtered in Central Time) - only meaningful
+            # when this repo actually has a deploy-ish workflow.
             week_start = (now_ct - timedelta(days=6)).replace(hour=0, minute=0, second=0, microsecond=0)
             dep_ok = dep_fail = dep_live = 0
             live_started_min = None
             dep_days = [0] * 7
-            deploy_url = f"https://api.github.com/repos/{GITHUB_CI_REPO}/actions/workflows/gateway-deploy.yml/runs"
-            for page in (1, 2, 3):
-                r = requests.get(deploy_url, params={"created": f">={week_start.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}", "per_page": 100, "page": page}, headers=headers, timeout=8)
-                if not r.ok:
-                    github_fetches_ok = False
-                    logger.warning("GitHub deploy-runs fetch failed: HTTP %s", r.status_code)
-                    break
-                runs = r.json().get("workflow_runs", [])
-                if not runs:
-                    break
-                for run in runs:
-                    run_ct = None
-                    try:
-                        run_ct = datetime.strptime(run.get("created_at"), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).astimezone(CT)
-                    except Exception:
-                        pass
-                    if run_ct is None:
-                        continue
-                    days_ago = (now_ct.date() - run_ct.date()).days
-                    idx = 6 - days_ago
-                    is_today = (run_ct.date() == now_ct.date())
-                    # Only count ACTUAL production deploy triggers (push to main or workflow_dispatch).
-                    # Exclude merge_group, pull_request, and scheduled test-runs from deploy counters (Ben 2026-08-07).
-                    if run.get("event") not in ("push", "workflow_dispatch"):
-                        continue
-                    if run.get("status") == "completed" and run.get("conclusion") == "success":
-                        if 0 <= idx <= 6:
-                            dep_days[idx] += 1
-                        if is_today:
-                            dep_ok += 1
-                    elif run.get("status") != "completed":
-                        if is_today:
-                            dep_live += 1
-                            try:
-                                t = datetime.strptime(run.get("run_started_at") or run.get("created_at"), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-                                m = int((datetime.now(timezone.utc) - t).total_seconds() // 60)
-                                live_started_min = m if live_started_min is None else min(live_started_min, m)
-                            except Exception:
-                                pass
-                    elif run.get("conclusion") not in ("cancelled", "skipped"):
-                        if is_today:
-                            dep_fail += 1
-            result["deploys_spark"] = dep_days
-            result.update({"deploys_ok_today": dep_ok, "deploys_failed_today": dep_fail,
-                           "deploys_in_flight": dep_live, "deploy_started_min": live_started_min})
-            # Last REAL deployment: newest completed run whose `deploy` JOB
-            # succeeded (a green run can be validation-only with deploy
-            # skipped, so run conclusion alone is not enough).
-            try:
-                found = False
-                for page in (1, 2):
-                    if found:
-                        break
-                    r = requests.get(f"https://api.github.com/repos/{GITHUB_CI_REPO}/actions/workflows/gateway-deploy.yml/runs",
-                                     params={"status": "completed", "branch": "main",
-                                             "per_page": 100, "page": page},
-                                     headers=headers, timeout=8)
+            if deploy_workflow_ids:
+                deploy_url = f"https://api.github.com/repos/{repo}/actions/workflows/{deploy_workflow_ids[0]}/runs"
+                for page in (1, 2, 3):
+                    r = requests.get(deploy_url, params={"created": f">={week_start.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}", "per_page": 100, "page": page}, headers=headers, timeout=8)
                     if not r.ok:
                         github_fetches_ok = False
                         logger.warning("GitHub deploy-runs fetch failed: HTTP %s", r.status_code)
@@ -4598,64 +5858,265 @@ def get_pipeline_status(force_refresh=False):
                     if not runs:
                         break
                     for run in runs:
-                        # scheduled guard ticks never run the deploy job — skip
-                        # them without burning a jobs API call (same event
-                        # filter the deploy-guard itself uses).
+                        run_ct = None
+                        try:
+                            run_ct = datetime.strptime(run.get("created_at"), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).astimezone(CT)
+                        except Exception:
+                            pass
+                        if run_ct is None:
+                            continue
+                        days_ago = (now_ct.date() - run_ct.date()).days
+                        idx = 6 - days_ago
+                        is_today = (run_ct.date() == now_ct.date())
+                        # Only count ACTUAL production deploy triggers (push to main or workflow_dispatch).
+                        # Exclude merge_group, pull_request, and scheduled test-runs from deploy counters (Ben 2026-08-07).
                         if run.get("event") not in ("push", "workflow_dispatch"):
                             continue
-                        jr = requests.get(run["jobs_url"], params={"per_page": 100},
-                                          headers=headers, timeout=8)
-                        if not jr.ok:
-                            github_fetches_ok = False
-                            logger.warning("GitHub deploy-jobs fetch failed: HTTP %s", jr.status_code)
-                            continue
-                        dep_job = next((j for j in jr.json().get("jobs", [])
-                                        if j.get("name") == "deploy" and j.get("conclusion") == "success"), None)
-                        if dep_job:
-                            result["last_deploy_at"] = dep_job.get("completed_at") or run.get("updated_at")
-                            result["last_deploy_sha"] = (run.get("head_sha") or "")[:9]
-                            found = True
+                        if run.get("status") == "completed" and run.get("conclusion") == "success":
+                            if 0 <= idx <= 6:
+                                dep_days[idx] += 1
+                            if is_today:
+                                dep_ok += 1
+                        elif run.get("status") != "completed":
+                            if is_today:
+                                dep_live += 1
+                                try:
+                                    t = datetime.strptime(run.get("run_started_at") or run.get("created_at"), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                                    m = int((datetime.now(timezone.utc) - t).total_seconds() // 60)
+                                    live_started_min = m if live_started_min is None else min(live_started_min, m)
+                                except Exception:
+                                    pass
+                        elif run.get("conclusion") not in ("cancelled", "skipped"):
+                            if is_today:
+                                dep_fail += 1
+            result["deploys_spark"] = dep_days
+            # SHIP-SPARK: "deployed today" box headline number - same count as
+            # deploys_ok_today (successful completed deploy runs today), under
+            # the name the brief's payload spec asked for.
+            result["deploys_today"] = dep_ok
+            result.update({"deploys_ok_today": dep_ok, "deploys_failed_today": dep_fail,
+                           "deploys_in_flight": dep_live, "deploy_started_min": live_started_min})
+            # Last REAL deployment: newest completed run whose `deploy` JOB
+            # succeeded (a green run can be validation-only with deploy
+            # skipped, so run conclusion alone is not enough).
+            if deploy_workflow_ids:
+                try:
+                    found = False
+                    for page in (1, 2):
+                        if found:
                             break
-            except Exception as e:
-                github_fetches_ok = False
-                logger.warning(f"last-deploy lookup failed: {e}")
+                        r = requests.get(f"https://api.github.com/repos/{repo}/actions/workflows/{deploy_workflow_ids[0]}/runs",
+                                         params={"status": "completed", "branch": default_branch,
+                                                 "per_page": 100, "page": page},
+                                         headers=headers, timeout=8)
+                        if not r.ok:
+                            github_fetches_ok = False
+                            logger.warning("GitHub deploy-runs fetch failed: HTTP %s", r.status_code)
+                            break
+                        runs = r.json().get("workflow_runs", [])
+                        if not runs:
+                            break
+                        for run in runs:
+                            # scheduled guard ticks never run the deploy job — skip
+                            # them without burning a jobs API call (same event
+                            # filter the deploy-guard itself uses).
+                            if run.get("event") not in ("push", "workflow_dispatch"):
+                                continue
+                            jr = requests.get(run["jobs_url"], params={"per_page": 100},
+                                              headers=headers, timeout=8)
+                            if not jr.ok:
+                                github_fetches_ok = False
+                                logger.warning("GitHub deploy-jobs fetch failed: HTTP %s", jr.status_code)
+                                continue
+                            dep_job = next((j for j in jr.json().get("jobs", [])
+                                            if j.get("name") == "deploy" and j.get("conclusion") == "success"), None)
+                            if dep_job:
+                                result["last_deploy_at"] = dep_job.get("completed_at") or run.get("updated_at")
+                                result["last_deploy_sha"] = (run.get("head_sha") or "")[:9]
+                                result["last_deploy_sha_full"] = run.get("head_sha")  # SHIP-OLDEST: exact base for the compare call
+                                found = True
+                                break
+                except Exception as e:
+                    github_fetches_ok = False
+                    logger.warning(f"last-deploy lookup failed: {e}")
+            # SHIP-OLDEST: commits on the default branch newer than the deployed SHA
+            # (compare ahead_by, its own 300 s cache). The client colours the deploy
+            # box by age only while this is > 0.
+            _deploy_waiting, _deploy_oldest_at = _get_deploy_commits_waiting(
+                headers, result.get("last_deploy_sha_full") or result.get("last_deploy_sha"),
+                repo, default_branch=default_branch, force_refresh=force_refresh)
+            result["deploy_commits_waiting"] = _deploy_waiting
+            # SHIP-SPARK-3 FIRST ITEM: deploy box semantics from the workflow's actual run
+            # state PLUS when the oldest waiting commit itself landed (see _get_deploy_state).
+            result.update(_get_deploy_state(headers, _deploy_waiting, _deploy_oldest_at, repo, deploy_workflow_ids))
             github_reads_ok = github_fetches_ok and all(result.get(field) is not None for field in (
                 "issues_open", "prs_open", "merged_today", "ci_queued", "ci_running"
             ))
         except Exception as e:
-            logger.warning(f"pipeline status failed: {e}")
+            logger.warning(f"pipeline status failed ({repo}): {e}")
 
     if github_reads_ok:
-        pipeline_gh_failing_since = None
+        with pipeline_cache_lock:
+            pipeline_gh_failing_since.pop(repo, None)
         result["available"] = True
         result["degraded"] = False
         result["generated_at"] = datetime.now(timezone.utc).isoformat()
-        pipeline_last_good = dict(result)
+        with pipeline_cache_lock:
+            pipeline_last_good[repo] = dict(result)
     else:
-        if pipeline_gh_failing_since is None:
-            pipeline_gh_failing_since = datetime.now(timezone.utc).isoformat()
-        if pipeline_last_good is not None:
-            result = dict(pipeline_last_good)
+        with pipeline_cache_lock:
+            if repo not in pipeline_gh_failing_since:
+                pipeline_gh_failing_since[repo] = datetime.now(timezone.utc).isoformat()
+            failing_since = pipeline_gh_failing_since[repo]
+            last_good = pipeline_last_good.get(repo)
+        if last_good is not None:
+            result = dict(last_good)
             result["degraded"] = True
-        result["gh_auth_failing_since"] = pipeline_gh_failing_since
+        result["gh_auth_failing_since"] = failing_since
 
     with pipeline_cache_lock:
-        pipeline_cache["data"] = result
-        pipeline_cache["ts"] = time.time()
+        pipeline_cache[repo] = {"data": result, "ts": time.time()}
     return result
+
+# SHIP-GAME item 8 (council, 1:27 PM CDT amendment): a cold get_pipeline_status()
+# runs ~30-45 sequential GitHub calls (measured live via an isolated process with
+# every in-memory cache empty: 56.5s total, 45 requests.get calls; the two
+# slowest were both inside the deploy-workflow block - a paginated
+# actions/workflows/.../runs fetch (page 3 alone: 5.1s) and the per-run
+# actions/runs/<id>/jobs lookup the "last REAL deployment" search makes once per
+# completed run until it finds one with a successful deploy job (worst single
+# call: 3.7s, and it is O(runs), not O(1)) - a synchronous HTTP request from
+# inside a Flask request handler that a browser's default (non-fresh) poll can
+# hang on for the full duration. Only ?fresh=1 (force_refresh=True, used by every
+# prior SHIP-* dispatch's own verification curls) keeps the old fully-blocking
+# behavior, since that is an explicit "wait for a real read" request. The normal
+# 45s poll path goes through this wrapper instead: any previously-cached payload
+# for this repo - fresh, merely expired, or the last-known-good snapshot - is
+# served immediately, and a background thread (deduplicated per repo via
+# pipeline_fetch_inflight so concurrent pollers don't pile up N redundant
+# fetches) does the real GitHub work and updates pipeline_cache/pipeline_last_good
+# for the NEXT poll to pick up. Only a true cold boot - this repo has never once
+# produced data in this process's lifetime, nor left anything in pipeline_last_good
+# - has nothing to serve immediately; that case returns an honest warming_up stub
+# instead of blocking, and is expected to resolve on the client's next poll.
+pipeline_fetch_inflight = {}  # repo -> True while a background refresh is running
+pipeline_fetch_inflight_lock = threading.Lock()
+
+
+def get_pipeline_status_fast(repo=None, default_branch=None, force_refresh=False):
+    repo = repo or GITHUB_CI_REPO
+    default_branch = default_branch or "main"
+    if force_refresh:
+        return get_pipeline_status(repo=repo, default_branch=default_branch, force_refresh=True)
+
+    now = time.time()
+    with pipeline_cache_lock:
+        slot = _repo_slot(pipeline_cache, repo, lambda: {"data": None, "ts": 0.0})
+        fresh = slot["data"] is not None and (now - slot["ts"]) < PIPELINE_CACHE_TTL
+        stale_data = slot["data"] if slot["data"] is not None else pipeline_last_good.get(repo)
+
+    if fresh:
+        return slot["data"]
+
+    def _background_refresh():
+        try:
+            get_pipeline_status(repo=repo, default_branch=default_branch, force_refresh=True)
+        except Exception:
+            logger.exception("SHIP-GAME background pipeline refresh failed for %s", repo)
+        finally:
+            with pipeline_fetch_inflight_lock:
+                pipeline_fetch_inflight.pop(repo, None)
+
+    with pipeline_fetch_inflight_lock:
+        if not pipeline_fetch_inflight.get(repo):
+            pipeline_fetch_inflight[repo] = True
+            threading.Thread(target=_background_refresh, daemon=True, name=f"ship-game-pipeline-refresh-{repo}").start()
+
+    if stale_data is not None:
+        result = dict(stale_data)
+        result["stale_while_revalidating"] = True
+        return result
+
+    return {
+        "available": False,
+        "repo": repo,
+        "default_branch": default_branch,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "warming_up": True,
+    }
 
 
 @app.route("/api/pipeline", methods=["GET"])
 def api_pipeline():
+    # SHIP-SPARK-3: ?repo=<name or owner/repo> selects which repo's row this
+    # returns; unknown repo (not in _get_repo_list()) is a 404, never a traceback
+    # and never a silent fallback to armbrain (council item 5).
+    repo_param = request.args.get("repo")
+    if repo_param:
+        known = _get_repo_list()
+        full = _repo_full_name(repo_param)
+        if not any(r["full_name"] == full for r in known):
+            return jsonify({"error": f"unknown repo '{repo_param}'"}), 404
+        repo = full
+        default_branch = _repo_default_branch(full)
+    else:
+        repo = GITHUB_CI_REPO
+        default_branch = _repo_default_branch(GITHUB_CI_REPO)
+
     # Pipeline metadata is relatively expensive and cached, but queue depth is
     # volatile. Overlay the short-lived CI snapshot so the strip does not keep
     # claiming a superseded running/queued count for the full pipeline TTL.
     force_refresh, disposition = _fresh_bypass("pipeline")
-    result = dict(get_pipeline_status(force_refresh=force_refresh))
-    ci = get_ci_queue_status()
+    # SHIP-GAME item 8: non-fresh reads (the browser's normal 45s poll) never
+    # block on a cold/expired cache - see get_pipeline_status_fast.
+    result = dict(get_pipeline_status_fast(repo=repo, default_branch=default_branch, force_refresh=force_refresh))
+    ci = get_ci_queue_status_fast(repo=repo)
     if ci.get("available"):
         result["ci_queued"] = ci.get("queued", 0)
         result["ci_running"] = ci.get("in_progress", 0)
+        result["ci_oldest_min"] = ci.get("oldest_queued_min")  # SHIP-OLDEST: same snapshot as the counts
+        result["ci_oldest_run_id"] = ci.get("oldest_queued_run_id")  # SHIP-OLDEST-2: auditable back to GitHub
+        result["ci_oldest_run_attempt"] = ci.get("oldest_queued_run_attempt")
+    rates = _get_arrow_rates_fast(repo=repo, force_refresh=force_refresh)
+    result["arrows"] = _build_ship_arrows(result, rates)
+    # SHIP-OLDEST: "minutes since" is computed at serve time so a cached snapshot still
+    # ages honestly; both fail to None when the timestamp is unknown. The setdefault loop
+    # guarantees every oldest field exists (None) even on a degraded or token-less read.
+    result["merged_since_min"] = _minutes_since(result.get("last_merge_at"))
+    result["deploy_since_min"] = _minutes_since(result.get("last_deploy_at"))
+    # SHIP-SPARK-2 known-positive test hook (temporary, removed after the dispatch's
+    # proof screenshots): forces the deploy box onto its age-only render (deploy_state
+    # = None) so the SHIP_OLDEST_THRESHOLDS colour boundaries can be proven directly,
+    # independent of the live deploy_state machine. Never set in normal operation.
+    _force_min = os.environ.get("SHIP_SPARK2_FORCE_DEPLOY_SINCE_MIN")
+    if _force_min is not None:
+        result["deploy_since_min"] = int(_force_min)
+        _force_waiting = os.environ.get("SHIP_SPARK2_FORCE_DEPLOY_WAITING")
+        if _force_waiting is not None:
+            result["deploy_commits_waiting"] = int(_force_waiting)
+        result["deploy_state"] = None
+    for field in ("prs_oldest_min", "ci_oldest_min", "ci_oldest_run_id", "ci_oldest_run_attempt",
+                  "green_oldest_min", "queue_oldest_min", "deploy_commits_waiting", "deploys_today",
+                  "green_wait_avg_min", "green_wait_n", "green_wait_excluded", "has_merge_queue",
+                  "deploy_state", "deploy_next_tick_at", "deploy_run_id", "deploy_run_state",
+                  "deploy_run_sha", "deploy_configured"):
+        result.setdefault(field, None)
+    result.setdefault("green_wait_prs", [])
+    # SHIP-SPARK: 12h/5-minute sparkline history per box - a plain SQLite read,
+    # zero GitHub calls, always attached even on a degraded pipeline read.
+    result["spark12h"] = _get_ship_spark12h(repo=repo)
+    # SHIP-SPARK-3: the repo the client just asked for, and the short name it can
+    # round-trip back into ?repo= / localStorage without knowing the org.
+    result["repo_full"] = repo
+    result["repo_name"] = repo.split("/")[-1]
+    # SHIP-GAME items 2/7: one robot per running worker (live issue/PR lane) -
+    # fleet-wide, not scoped to whichever repo the CI/CD row is currently
+    # showing (a live lane is a live lane regardless of which row is on screen).
+    try:
+        result["workers"], result["completions"] = _build_ship_workers_and_completions(get_agents())
+    except Exception:
+        logger.exception("SHIP-GAME could not establish live workers for the yard strip")
+        result["workers"], result["completions"] = [], []
     return _fresh_jsonify(result, disposition, "pipeline")
 
 
@@ -5179,19 +6640,6 @@ transition:border-color .18s,color .18s,box-shadow .18s,background .18s}
 box-shadow:0 0 10px rgba(255,0,68,.6)}
 .panel-fetched{position:absolute;top:10px;right:40px;z-index:4;color:#667;font-size:.58em;
 letter-spacing:.4px;white-space:nowrap;text-transform:lowercase}
-/* MERGE LANE strip (council 136cx part 4). Four cells, one question each.
-   Unknown is GREY, never green and never red: a failed read must not look like a
-   healthy zero, and "0 merged last hour" is a real alarm we must not counterfeit. */
-.ml-strip{display:flex;gap:10px;flex-wrap:wrap;margin:4px 0 2px}
-.ml-cell{flex:1 1 88px;min-width:88px;padding:8px 10px;border-radius:6px;background:#161b26;border:1px solid #232a38;text-align:center}
-.ml-num{font:700 1.5em 'Rajdhani',sans-serif;line-height:1.1}
-.ml-lab{font:500 .68em 'Rajdhani',sans-serif;letter-spacing:.6px;text-transform:uppercase;color:#8b93a7;margin-top:2px}
-.ml-ok .ml-num{color:#7ddc9a}
-.ml-bad{border-color:#7a2c34;background:#241419}
-.ml-bad .ml-num{color:#ff6b7a}
-.ml-unknown .ml-num{color:#8b93a7}
-.ml-note{font:500 .72em 'Rajdhani',sans-serif;color:#8b93a7;margin-top:6px}
-.ml-bad-note{color:#ff6b7a}
 .runson-account{color:#c7cee0;font:500 .72em 'Rajdhani',sans-serif;letter-spacing:.7px;
 text-shadow:none;text-transform:none;margin-left:8px}
 .panel-refresh-body{padding-right:34px}
@@ -5433,16 +6881,21 @@ font-size:0.72em;letter-spacing:2px;color:var(--neon-cyan);text-shadow:0 0 8px v
 padding-right:12px;white-space:nowrap}
 .ship-stage{background:rgba(255,255,255,0.025);border:1px solid #1e2942;border-radius:7px;
 padding:7px 14px;min-width:92px;text-align:center;display:flex;flex-direction:column;
-align-items:center;justify-content:center;gap:2px}
+align-items:center;justify-content:center;gap:2px;cursor:pointer}
 .ship-stage{position:relative}
-.ship-toggle{position:absolute;right:2px;top:1px;border:0;background:none;color:#c7cee0;cursor:pointer;padding:3px}
+/* SHIP-GAME item 0: the whole box is the click target now (no caret button) -
+   a visible focus ring is the keyboard-reachability signal the caret used to
+   carry via its own tab stop. */
+.ship-stage:focus-visible{outline:2px solid var(--neon-cyan);outline-offset:2px}
 .ship-dropdown{position:absolute;top:100%;right:0;z-index:20;background:#111827;border:1px solid #364563;border-radius:5px;padding:7px;min-width:240px;max-height:280px;overflow:auto;text-align:left;box-shadow:0 5px 15px #0008}
 .ship-dropdown[hidden]{display:none}
 .ship-stage{position:relative}
 .ship-agents{padding-bottom:6px;margin-bottom:5px;border-bottom:1px solid #364563}
 .ship-agent-row{font-size:12px;white-space:nowrap;padding:3px 0}
 .ship-agent-row a{color:var(--neon-cyan)}
-.ship-fleet{font-size:12px;color:#c7cee0;margin:-3px 0 9px}
+.ship-fleet{font-size:12px;color:#c7cee0;margin:0}
+.ship-fleet-row{display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap;margin:-3px 0 9px}
+.ship-legend{margin-left:auto;text-align:right;white-space:nowrap}
 .ship-pr{display:flex;gap:8px;white-space:nowrap;font-size:12px;padding:4px 0;color:#c7cee0}
 .ship-pr a{color:var(--neon-cyan)}
 .ship-pr .ship-sub{font-size:inherit}
@@ -5450,6 +6903,8 @@ align-items:center;justify-content:center;gap:2px}
 .ship-stage.merge-green{border-color:rgba(57,255,20,.8);background:rgba(57,255,20,.09)}
 .ship-stage.merge-yellow{border-color:rgba(255,255,0,.8);background:rgba(255,255,0,.09)}
 .ship-stage.merge-red{border-color:rgba(255,0,68,.85);background:rgba(255,0,68,.09)}
+/* SHIP-SPARK-2 item 6: the deploy box while a deploy run is actually shipping. */
+.ship-stage.merge-blue{border-color:rgba(0,168,255,.85);background:rgba(0,168,255,.1)}
 .ship-stage.merge-pulse{animation:merge-rate-pulse 4s ease-in-out infinite}
 @keyframes merge-rate-pulse{0%,100%{opacity:1}50%{opacity:.75}}
 @media(prefers-reduced-motion:reduce){.ship-stage.merge-pulse{animation:none}}
@@ -5467,6 +6922,28 @@ font-size:0.9em;text-shadow:0 0 8px var(--neon-magenta)}
 .ship-spark{display:flex;align-items:flex-end;gap:2px;height:11px;margin-top:3px}
 .ship-spark i{width:5px;background:var(--neon-cyan);box-shadow:0 0 4px var(--neon-cyan);
 border-radius:1px 1px 0 0;min-height:1px}
+/* SHIP-SPARK: 12h/5min history sparkline, one per shipping-row box, rendered
+   above the number (inside the box's own border - see shipStage's `hist` slot).
+   Height 22px matches the live-runners sparkline's measured rendered height
+   (21.7px, both the RunsOn and local-runners cards, at a 1400px viewport);
+   width is full-box-width, not a fixed px, because the box itself is not a
+   fixed width either (see the 900px breakpoint below). No animation, ever -
+   these are static per-refresh snapshots, so prefers-reduced-motion needs no
+   extra rule here. */
+.ship-history-spark{display:block;width:100%;height:22px}
+/* SHIP-SPARK-3 hover-tooltip fix: SHIP-SPARK/SHIP-SPARK-2 used a native SVG
+   <title> per column, which real hover shows fine but a headless-Chrome
+   screenshot can never capture (native title tooltips are painted by the OS
+   compositor, not the page's own paint tree - confirmed by both prior
+   deliverables). Same custom-div pattern as .vram-tooltip below: a single
+   fixed-position div, shown/positioned/hidden by JS on data-ship-tip hover,
+   so the bubble is real DOM the screenshot harness CAN see. */
+.ship-spark-tooltip{position:fixed;z-index:10000;background:var(--bg-card);border:1px solid var(--neon-cyan);
+border-radius:6px;padding:6px 10px;box-shadow:var(--glow-cyan),0 10px 30px rgba(0,0,0,0.8);
+font-family:'Rajdhani',sans-serif;color:#e0e0e0;font-size:13px;white-space:nowrap;
+pointer-events:none;opacity:0;display:none;transition:opacity 0.1s ease-in-out}
+.ship-spark-tooltip.visible{display:block;opacity:1}
+
 .monitor-glance-band{display:grid;grid-template-columns:minmax(720px,1.25fr) minmax(500px,.75fr);
 gap:10px;align-items:start;margin:10px 0}
 .monitor-glance-band>.card{margin:0}
@@ -5619,6 +7096,7 @@ color:#889;display:flex;justify-content:space-between;font-family:'Orbitron',mon
 /* Last-updated stamp: proves the page is live. If this stops ticking, the
    dashboard has gone stale - which is exactly the failure it exists to show. */
 .hdr-wrap{position:relative}
+.fleet-summary{position:absolute;top:8px;left:0;font-size:0.95em;color:#889;line-height:1.25}
 .last-updated{position:absolute;top:2px;right:0;font-family:'Rajdhani',sans-serif;
 font-size:0.62em;letter-spacing:1px;text-transform:uppercase;line-height:1.25;
 text-align:right;opacity:0.85;pointer-events:auto;white-space:nowrap}
@@ -5635,19 +7113,75 @@ letter-spacing:0;white-space:pre;width:22ch;text-align:right}
 .last-updated.aging .lu-time{color:var(--neon-yellow);text-shadow:0 0 6px #ffff0066}
 .last-updated.stale .lu-time{color:var(--neon-red);text-shadow:0 0 8px #ff004488}
 @media(max-width:767px){.last-updated{position:static;text-align:center;margin:-18px 0 14px}}
+@media(max-width:767px){.fleet-summary{position:static;text-align:center;margin:0 0 10px}}
 
 .monitor-glance-band{grid-template-columns:repeat(2,minmax(0,1fr));align-items:stretch}
 #glance-strip{grid-column:1/-1}
-.cicd-label{font-family:'Orbitron',monospace;color:var(--neon-cyan);text-shadow:0 0 10px var(--neon-cyan);font-size:1em;letter-spacing:2px;margin:0 0 10px}
+.cicd-label{font-family:'Orbitron',monospace;color:var(--neon-cyan);text-shadow:0 0 10px var(--neon-cyan);font-size:1em;letter-spacing:2px;margin:0 0 10px;display:inline-block}
+/* SHIP-SPARK-3: the repo switcher, right of the CI/CD heading - same dark-panel
+   chrome as .ship-dropdown (bg #111827, border #364563) so it reads as part of
+   the same row, not a foreign browser-native control. */
+.ship-repo-select{margin:0 0 10px 10px;background:#111827;color:var(--neon-cyan);border:1px solid #364563;
+border-radius:5px;padding:3px 8px;font-family:'Rajdhani',sans-serif;font-size:0.95em;cursor:pointer;
+vertical-align:middle}
+.ship-repo-select:hover{border-color:var(--neon-cyan)}
+.ship-repo-refreshing{margin-left:8px;color:var(--neon-yellow);font-family:'Rajdhani',sans-serif;
+font-size:0.85em;letter-spacing:0.5px;vertical-align:middle}
 .ship-flow{flex-wrap:nowrap;align-items:stretch}
 .ship-stage{flex:1 1 0;min-width:0;padding:8px 6px}
 .ship-cap{font-size:.65em;letter-spacing:1px}
 .ship-num.stamp{font-size:.85em}
-.ship-arrow{position:relative;flex:0 0 48px;align-self:center;justify-content:center;height:36px;padding:0 7px 0 2px;border:0;background:transparent;color:var(--arrow-color);cursor:pointer;font-size:11px;text-shadow:none}
+.ship-arrow{position:relative;flex:0 0 64px;align-self:center;justify-content:center;height:36px;padding:0 7px 0 2px;border:0;background:transparent;color:var(--arrow-color);cursor:pointer;font-size:11px;text-shadow:none}
 .ship-arrow-shape{filter:var(--arrow-glow,none)}
 .ship-arrow-shape{position:absolute;inset:0;width:100%;height:100%;fill:var(--arrow-color);fill-opacity:.09;stroke:var(--arrow-outline);stroke-width:1.5;stroke-linejoin:round;pointer-events:none}
-.ship-arrow-badge{position:relative;color:var(--arrow-color)}
+.ship-arrow-shape.pipe{stroke-dasharray:5 4;animation:ship-pipe-flow linear infinite;animation-duration:var(--pipe-duration,0s);animation-play-state:running}
+@keyframes ship-pipe-flow{to{stroke-dashoffset:-18}}
+.ship-arrow-badge{position:relative;z-index:1;display:inline-block;color:#8a94ad;background:rgba(6,10,20,.88);outline:1px solid #8a94ad;border-radius:4px;padding:2px 3px;font-size:11px;line-height:1.25;text-align:center;white-space:nowrap}
+.ship-arrow-badge b{display:block;font-weight:inherit}
+.ship-arrow-sub{display:block;font-size:.75em;color:#8992aa;text-shadow:none;margin-top:1px}
+.ship-arrow.bottleneck{animation:ship-arrow-bottleneck-pulse 1.6s ease-in-out infinite}
+@keyframes ship-arrow-bottleneck-pulse{0%,100%{filter:drop-shadow(0 0 4px var(--neon-red))}50%{filter:drop-shadow(0 0 11px var(--neon-red))}}
+@media(prefers-reduced-motion:reduce){.ship-arrow-shape.pipe{animation:none}.ship-arrow.bottleneck{animation:none}}
 .ship-arrow:focus-visible{outline:2px solid var(--arrow-color);outline-offset:2px}
+/* SHIP-GAME item 1 (Ben 11:30 AM + 12:32 PM CDT amendment): the drain figure
+   sits OUTSIDE and above the first arrow's top edge, small and grey - never
+   red, even when the arrow itself is glowing red as the bottleneck. */
+.ship-arrow-drainlabel{position:absolute;bottom:100%;left:50%;transform:translateX(-50%);
+white-space:nowrap;font-size:10px;line-height:1;color:#8a94ad;margin-bottom:3px;z-index:1}
+/* SHIP-GAME items 2-5: one robot+house per running worker, in a small "yard"
+   strip anchored under the first (issues->prs) arrow via JS position-sync
+   (positionShipYard) rather than being part of that arrow's own rebuilt HTML -
+   #ship-yard is a persistent sibling of #ship-flow (see the HTML template) so
+   robots, keyed by worker id, survive every 45s payload refresh untouched
+   (item 5) instead of being torn down and recreated with it. */
+.ship-yard{position:absolute;z-index:4;display:flex;flex-wrap:wrap;justify-content:center;
+gap:3px;max-width:230px;padding:3px 5px;background:rgba(10,14,24,.55);border-radius:6px;
+pointer-events:none}
+.ship-yard:empty{display:none}
+.ship-yard-more{font-size:10px;color:#8a94ad;align-self:center;white-space:nowrap;pointer-events:auto}
+.ship-worker{position:relative;display:flex;flex-direction:column;align-items:center;
+width:20px;cursor:default;pointer-events:auto}
+.ship-worker-house{width:20px;height:17px;display:block;overflow:visible}
+.ship-worker-bot{font-size:11px;line-height:1;margin-top:-3px;
+animation:ship-robot-idle 3s ease-in-out infinite;animation-delay:var(--bot-delay,0s)}
+@keyframes ship-robot-idle{0%,100%{transform:translateX(-3px)}50%{transform:translateX(3px)}}
+.ship-worker.ship-worker-blocked{animation:ship-worker-fade 1.6s ease-in forwards}
+.ship-worker.ship-worker-completing{animation:ship-worker-pop .5s ease-out}
+@keyframes ship-worker-pop{0%{transform:scale(1)}50%{transform:scale(1.4)}100%{transform:scale(1)}}
+@keyframes ship-worker-fade{0%{opacity:1}100%{opacity:0}}
+.ship-worker.ship-worker-gliding{position:absolute;top:0;left:50%;z-index:6;
+transition:transform 1.1s cubic-bezier(.3,.6,.4,1),opacity 1.1s linear .3s}
+@media(prefers-reduced-motion:reduce){
+  .ship-worker-bot{animation:none}
+  .ship-worker.ship-worker-blocked{animation:none;opacity:.35}
+  .ship-worker.ship-worker-completing{animation:none}
+  .ship-worker.ship-worker-gliding{transition:none}
+}
+/* SHIP-GAME item 3: a short "roll" flash on the PRS OPEN number the instant a
+   completed house's PR lands in that box. */
+.ship-num.ship-num-roll{animation:ship-num-roll .45s ease-out}
+@keyframes ship-num-roll{0%{transform:translateY(-7px);opacity:0}100%{transform:translateY(0);opacity:1}}
+@media(prefers-reduced-motion:reduce){.ship-num.ship-num-roll{animation:none}}
 #local-runners-card{padding:8px 12px 9px;min-width:0}
 #local-runners-card h3{font-size:.78em;margin:0 0 5px;letter-spacing:1.2px}
 .runner-facts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:12px}
@@ -5671,30 +7205,24 @@ letter-spacing:0;white-space:pre;width:22ch;text-align:right}
 .runner-job-row{display:grid;grid-template-columns:minmax(90px,1fr) 75px minmax(130px,2fr) 50px;gap:8px;border-bottom:1px solid #27304a;padding:5px 0;overflow-wrap:anywhere}
 .runner-job-row a{color:var(--neon-cyan)}
 </style></head>
-<body><div class="hdr-wrap"><h1>FLEET MONITOR</h1><div id="last-updated" class="last-updated" title="Time of the most recent successful data refresh. Green = fresh, amber = aging, red = this page has gone stale."><span class="lu-label">last updated</span><span class="lu-time" id="lu-time">connecting…</span></div></div>
-
-<div id="fleet-summary" style="margin:4px 0 14px 0;font-size:0.95em;color:#889">Loading fleet summary...</div>
+<body><div class="hdr-wrap"><h1>FLEET MONITOR</h1><div id="last-updated" class="last-updated" title="Time of the most recent successful data refresh. Green = fresh, amber = aging, red = this page has gone stale."><span class="lu-label">last updated</span><span class="lu-time" id="lu-time">connecting…</span></div><div id="fleet-summary" class="fleet-summary">Loading fleet summary...</div></div>
 
 <div class="monitor-glance-band">
 <div class=card id=glance-strip style="padding:9px 12px">
 <div class="panel-refresh-surface">
 <button type="button" class="panel-refresh-btn" data-panel="Shipping pipeline" title="Refresh this panel" aria-label="Refresh Shipping pipeline panel" onclick="refreshPanel(this, 'refreshShipFlow')">&#x21bb;</button>
 <h2 class="cicd-label">CI/CD</h2>
+<select id="ship-repo-select" class="ship-repo-select" aria-label="Choose which repo the CI/CD row shows" onchange="shipRepoChanged(this.value)"><option value="">loading repos…</option></select>
+<span id="ship-repo-refreshing" class="ship-repo-refreshing" hidden>refreshing…</span>
+<div class="ship-flow-wrap" style="position:relative">
 <div id="ship-flow" class="ship-flow panel-refresh-body"><span class="gdim">shipping pipeline…</span></div>
-<div class="ship-fleet">🤖 agent lane we run · ⚙ CI automation · ⚡ merge/deploy automation</div>
-<div id="ship-fleet" class="ship-fleet" aria-live="polite">🤖 working: checking agents…</div>
+<div id="ship-yard" class="ship-yard" aria-label="Robots building the next PR"></div>
+</div>
+<div class="ship-fleet-row"><div id="ship-fleet" class="ship-fleet" aria-live="polite">🤖 working: checking agents…</div><div class="ship-fleet ship-legend">🤖 agent lane we run · ⚙ CI automation · ⚡ merge/deploy automation · pipe width = PRs/hour · red = bottleneck (longest time to drain)</div></div>
 </div>
 
 </div>
 
-<!-- MERGE LANE (council 136cx part 4). Placed directly under CI/CD because the question
-     it answers - are merges actually moving - is the first thing anyone asks of that
-     section, and on 2026-09-05 nobody could answer it without going and looking. -->
-<div class=card id=merge-lane-card>
-<button type="button" class="panel-refresh-btn" data-panel="MERGE LANE" title="Refresh this panel" aria-label="Refresh MERGE LANE panel" onclick="refreshPanel(this, 'refreshMergeLane')">&#x21bb;</button>
-<h3>&#x26A1; MERGE LANE</h3>
-<div id="merge-lane-body" class="panel-refresh-body"><p>Loading...</p></div>
-</div>
 <div class=card id=runson-card>
 <button type="button" class="panel-refresh-btn" data-panel="AWS" title="Refresh this panel" aria-label="Refresh AWS panel" onclick="refreshPanel(this, 'refreshRunsOn')">&#x21bb;</button>
 <h3>☁️ AWS <span class="runson-account" id="runson-account">AWS account 930358782508</span></h3>
@@ -5907,6 +7435,140 @@ function sparkHtml(vals) {
         '<i style="height:' + Math.max(1, Math.round((v / peak) * 11)) + 'px"></i>').join('') + '</div>';
 }
 
+// SHIP-SPARK (council dispatch 20260905, Ben 11:09 AM CDT): a 12-hour, 5-minute
+// sampled sparkline drawn above every shipping-row box's number, coloured per
+// sample by the SAME green/yellow/red rule that colours the box itself
+// (SHIP_OLDEST_THRESHOLDS's Python twin classified each sample server-side -
+// see /api/pipeline's spark12h). Rendered size matches the live-runners
+// sparkline (measured live on gandalf.local:5000 at a 1400px viewport:
+// 108.7x21.7px in the RunsOn card, 91.6x21.7px in the local-runners card -
+// height is identical in both, 21.7px, so that is the one fixed dimension
+// carried over here (22px); width is left flexible/full-box-width because the
+// runners spark is itself flex-sized to whatever column holds it, not a fixed
+// px box, and a shipping-row box's own width already varies by breakpoint.
+const SHIP_HISTORY_SLOTS = 144;  // 12h at one sample per 5 minutes
+function shipHistoryTimeCT(epochSeconds) {
+    return new Date(epochSeconds * 1000).toLocaleTimeString('en-US',
+        {hour: 'numeric', minute: '2-digit', timeZone: 'America/Chicago'}).toLowerCase().replace(' ', '');
+}
+function shipHistorySpark(samples, key) {
+    const colour = {green: 'var(--neon-green)', yellow: 'var(--neon-yellow)',
+        red: 'var(--neon-red)', neutral: '#556b8a'};
+    const list = Array.isArray(samples) ? samples : [];
+    // Right-align to "now": today's newest sample always lands in the last
+    // slot; fewer than 144 samples means the earliest slots simply have none
+    // yet (SHIP-SPARK honesty rule - never back-fill from another source).
+    const slots = new Array(SHIP_HISTORY_SLOTS).fill(null);
+    for (let i = 0; i < list.length; i++) {
+        const idx = SHIP_HISTORY_SLOTS - list.length + i;
+        if (idx >= 0 && idx < SHIP_HISTORY_SLOTS) slots[idx] = list[i];
+    }
+    const values = list.map(p => Number(p.v)).filter(Number.isFinite);
+    const peak = Math.max(1, ...values);
+    const h = 22;
+    const yOf = v => h - Math.max(1, (Number(v) / peak) * (h - 2));
+    // SHIP-SPARK-2 (Ben 11:32 AM CDT: "I wanted a line graph"): one polyline
+    // per maximal run of same-colour segments, not bars. A segment between
+    // sample i-1 and i takes the colour of the LATER sample (i), so a bad
+    // stretch reads as a red run of line; a run's first point is the prior
+    // segment's end so adjacent colours still meet - one continuous line,
+    // striped by colour, with a gap only where the underlying data has one.
+    let polylines = '';
+    let run = null;
+    function flushRun() {
+        if (run && run.points.length > 1) {
+            polylines += '<polyline class="ship-history-line" points="'
+                + run.points.map(p => p[0] + ',' + p[1]).join(' ')
+                + '" fill="none" stroke="' + (colour[run.cls] || colour.neutral)
+                + '" stroke-width="1.5" vector-effect="non-scaling-stroke"/>';
+        }
+        run = null;
+    }
+    for (let i = 1; i < SHIP_HISTORY_SLOTS; i++) {
+        const prev = slots[i - 1], cur = slots[i];
+        if (!prev || !cur || !Number.isFinite(Number(prev.v)) || !Number.isFinite(Number(cur.v))) {
+            flushRun();
+            continue;
+        }
+        const cls = cur.cls || 'neutral';
+        const p0 = [i - 1, yOf(prev.v)], p1 = [i, yOf(cur.v)];
+        if (run && run.cls === cls) {
+            run.points.push(p1);
+        } else {
+            flushRun();
+            run = {cls: cls, points: [p0, p1]};
+        }
+    }
+    flushRun();
+    let rects = '';
+    for (let i = 0; i < SHIP_HISTORY_SLOTS; i++) {
+        const p = slots[i];
+        const tip = p
+            ? shipHistoryTimeCT(p.t) + ' · ' + p.v + (p.oldest_min !== null && p.oldest_min !== undefined ? ' · oldest: ' + shipOldestText(p.oldest_min) : '')
+            : 'no sample yet';
+        // Full-height, transparent hit target over the (often thin) line, so
+        // hovering anywhere in the column - not just on the line pixels -
+        // shows this sample's tooltip. SHIP-SPARK-3: data-ship-tip + the
+        // custom #ship-spark-tooltip div (see initShipSparkTooltip below),
+        // not a native SVG <title> - a native title never paints under a
+        // headless screenshot, so it could never be proven with a picture.
+        rects += '<rect x="' + i + '" y="0" width="1" height="' + h + '" fill="transparent" data-ship-tip="' + shipEscape(tip) + '"></rect>';
+    }
+    return '<svg class="ship-history-spark" data-key="' + key + '" viewBox="0 0 ' + SHIP_HISTORY_SLOTS + ' ' + h
+        + '" preserveAspectRatio="none" role="img" aria-label="Last 12 hours">' + polylines + rects + '</svg>';
+}
+
+// SHIP-SPARK-3 (carried gap from SHIP-SPARK): real hover proof for the sparkline
+// columns above. Same lazy-init custom-tooltip pattern as initVramTooltip below -
+// event delegation on [data-ship-tip], one shared fixed-position div, shown on
+// mouseover, tracked on mousemove, hidden on mouseout. This is real, screenshot-
+// able DOM, unlike the native <title> the two prior SHIP-SPARK dispatches used.
+let shipSparkTooltipEl = null;
+function initShipSparkTooltip() {
+    if (document.getElementById('ship-spark-tooltip')) return;
+    shipSparkTooltipEl = document.createElement('div');
+    shipSparkTooltipEl.id = 'ship-spark-tooltip';
+    shipSparkTooltipEl.className = 'ship-spark-tooltip';
+    document.body.appendChild(shipSparkTooltipEl);
+
+    document.addEventListener('mouseover', function(e) {
+        const el = e.target.closest('[data-ship-tip]');
+        if (el) showShipSparkTooltip(el, e);
+    });
+    document.addEventListener('mousemove', function(e) {
+        const el = e.target.closest('[data-ship-tip]');
+        if (el && shipSparkTooltipEl && shipSparkTooltipEl.classList.contains('visible')) {
+            positionShipSparkTooltip(e);
+        }
+    });
+    document.addEventListener('mouseout', function(e) {
+        const el = e.target.closest('[data-ship-tip]');
+        if (el) {
+            const related = e.relatedTarget ? e.relatedTarget.closest('[data-ship-tip]') : null;
+            if (related !== el) hideShipSparkTooltip();
+        }
+    });
+}
+function positionShipSparkTooltip(e) {
+    if (!shipSparkTooltipEl) return;
+    const padding = 14;
+    let left = e.clientX + padding, top = e.clientY + padding;
+    const rect = shipSparkTooltipEl.getBoundingClientRect();
+    if (left + rect.width > window.innerWidth - 10) left = e.clientX - rect.width - padding;
+    if (top + rect.height > window.innerHeight - 10) top = e.clientY - rect.height - padding;
+    shipSparkTooltipEl.style.left = Math.max(10, left) + 'px';
+    shipSparkTooltipEl.style.top = Math.max(10, top) + 'px';
+}
+function showShipSparkTooltip(el, e) {
+    if (!shipSparkTooltipEl) initShipSparkTooltip();
+    shipSparkTooltipEl.textContent = el.getAttribute('data-ship-tip') || '';
+    positionShipSparkTooltip(e);
+    shipSparkTooltipEl.classList.add('visible');
+}
+function hideShipSparkTooltip() {
+    if (shipSparkTooltipEl) shipSparkTooltipEl.classList.remove('visible');
+}
+
 let openShipDropdown = null;
 let shipAgents = null;
 function shipEscape(value) {
@@ -5920,16 +7582,64 @@ function shipShortTitle(title) {
     const space = cut.lastIndexOf(' ');
     return space > 0 ? cut.slice(0, space) : cut;
 }
+// SHIP-SPARK-2 item 7 (Ben 11:19 AM CDT, screenshot: the first pipe's 🤖 lanes
+// dropdown opened with its left edge past the viewport's left edge, text cut
+// off). The panel's CSS (top:100%; right:0) is fine for a box with room to its
+// left, but the FIRST box/pipe in the row has none - clamp after every open,
+// for both the box ▾ menus and the pipe/arrow dropdowns (same .ship-dropdown
+// element, same toggle path, so one clamp covers both).
+function clampShipDropdown(panel) {
+    // Clear any clamp left over from the last time this panel opened, so this
+    // measurement starts from the CSS default, not a stale offset.
+    panel.style.left = '';
+    panel.style.right = '';
+    panel.style.top = '';
+    panel.style.bottom = '';
+    const rect = panel.getBoundingClientRect();
+    const margin = 8;
+    let deltaX = 0;
+    if (rect.left < margin) deltaX = margin - rect.left;
+    else if (rect.right > window.innerWidth - margin) deltaX = (window.innerWidth - margin) - rect.right;
+    if (deltaX) {
+        panel.style.left = (panel.offsetLeft + deltaX) + 'px';
+        panel.style.right = 'auto';
+    }
+    if (rect.bottom > window.innerHeight - margin) {
+        panel.style.top = 'auto';
+        panel.style.bottom = '100%';
+    }
+}
 function toggleShipDropdown(key) {
     openShipDropdown = openShipDropdown === key ? null : key;
-    document.querySelectorAll('.ship-toggle, button.ship-arrow').forEach(button => {
-        const open = button.dataset.dropdown === openShipDropdown;
-        button.setAttribute('aria-expanded', String(open));
-        if (button.classList.contains('ship-toggle')) button.textContent = open ? '▴' : '▾';
-        const panel = document.getElementById(button.getAttribute('aria-controls'));
+    // SHIP-GAME item 0 (Ben 12:32 PM CDT): the whole box (.ship-stage,
+    // data-dropdown) replaces the old caret button as a toggle target -
+    // button.ship-arrow (the 🤖 pipe dropdown) still matches the same
+    // generic [data-dropdown] selector, unchanged behavior for it.
+    document.querySelectorAll('[data-dropdown]').forEach(el => {
+        const open = el.dataset.dropdown === openShipDropdown;
+        el.setAttribute('aria-expanded', String(open));
+        const panel = document.getElementById(el.getAttribute('aria-controls'));
+        if (!panel) return;
         panel.hidden = !open;
-        if (open) panel.scrollTop = 0;
+        if (open) { panel.scrollTop = 0; clampShipDropdown(panel); }
     });
+}
+// SHIP-GAME item 0: a click anywhere outside the currently-open box/arrow
+// closes it - the box's own onclick already handles a second click inside it
+// (toggleShipDropdown is a plain toggle either way).
+document.addEventListener('click', function(e) {
+    if (!openShipDropdown) return;
+    if (!e.target.closest('[data-dropdown="' + openShipDropdown + '"]')) toggleShipDropdown(openShipDropdown);
+});
+function shipStageKeydown(event, key) {
+    // Enter/Space toggles only when the BOX itself has focus, not a link or
+    // scrollable content inside its already-open popup (those keep their own
+    // native Enter/Space behavior).
+    if (event.target !== event.currentTarget) return;
+    if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        toggleShipDropdown(key);
+    }
 }
 function shipAgentRows(agents) {
     if (!agents.length) return '<div class="ship-agents"><strong>agents</strong><div>' + (shipAgents ? 'No live agents on this square' : 'Could not establish live agents') + '</div></div>';
@@ -5957,18 +7667,76 @@ function shipFleetRow() {
 }
 function shipDropdown(key, prs, agents) {
     const open = openShipDropdown === key;
-    return '<button type="button" class="ship-toggle" data-dropdown="' + key + '" aria-label="Toggle ' + key.replaceAll('-', ' ') + ' PRs" aria-controls="ship-list-' + key + '" aria-expanded="' + open + '" onclick="toggleShipDropdown(this.dataset.dropdown)">' + (open ? '▴' : '▾') + '</button>'
-        + '<div class="ship-dropdown" id="ship-list-' + key + '"' + (open ? '' : ' hidden') + '>'
+    // SHIP-GAME item 0: the ▾ caret button is gone - shipStage's own outer div
+    // is the click/keyboard target that opens this panel now.
+    return '<div class="ship-dropdown" id="ship-list-' + key + '"' + (open ? '' : ' hidden') + '>'
         + shipAgentRows(agents)
         + prs.map(pr => '<div class="ship-pr" data-pr-number="' + pr.number + '"><a href="https://github.com/armbrain-io/armbrain/pull/' + pr.number + '" target="_blank" rel="noopener">#' + pr.number + '</a><span>' + shipEscape(shipShortTitle(pr.title)) + '</span>'
             + (key === 'in-line' ? '<span class="ship-sub ' + (pr.state === 'UNMERGEABLE' ? 'hot' : '') + '">' + (pr.state === 'UNMERGEABLE' ? 'stuck' : 'testing') + '</span>' : '') + '</div>').join('') + '</div>';
 }
-function shipStage(num, cap, cls, sub, spark, help, stageCls, dropdownKey, prs) {
+// SHIP-OLDEST (council dispatch 20260905, Ben's order 8:57 AM CDT): each box below is
+// coloured green / yellow / red by the age in MINUTES of the OLDEST item sitting in it
+// (green below the first number, yellow below the second, red at or above it) and gets an
+// "oldest: 14m" sub-line. Ben tunes these numbers; nothing else has to change.
+// "issues open" is deliberately absent: the oldest open issue is months old by nature and
+// says nothing about flow, so that box keeps its neutral colour.
+const SHIP_OLDEST_THRESHOLDS = {
+    'prs open':      [2 * 24 * 60, 5 * 24 * 60],  // oldest open non-draft PR, by created time
+    'ci q/run':      [5, 15],                       // oldest QUEUED workflow run, waiting to start
+    'green waiting': [30, 2 * 60],                  // oldest green-eligible PR, since its last activity
+    'in queue':      [15, 45],                      // oldest merge-queue entry, since it was enqueued
+    'merged today':  [30, 90],                      // minutes since the LAST merge
+    'last deploy':   [4 * 60, 8 * 60],              // Ben 11:12 AM 9/5: under 4h is green; yellow from 4h, red from 8h, only while commits wait
+};
+function shipOldestText(min) {
+    // 14m -> 1h 12m past 60 min -> 2d 3h past 48 h; "?" when the instrument is unavailable.
+    if (min === null || min === undefined || isNaN(Number(min))) return '?';
+    const m = Math.max(0, Math.floor(Number(min)));
+    if (m >= 48 * 60) { const h = Math.floor((m % 1440) / 60); return Math.floor(m / 1440) + 'd' + (h ? ' ' + h + 'h' : ''); }
+    if (m >= 60) { const r = m % 60; return Math.floor(m / 60) + 'h' + (r ? ' ' + r + 'm' : ''); }
+    return m + 'm';
+}
+function shipOldestClass(box, min) {
+    // Box colour class for an age in minutes; '' (neutral) when the age is unknown.
+    const t = SHIP_OLDEST_THRESHOLDS[box];
+    if (!t || min === null || min === undefined || isNaN(Number(min))) return '';
+    const m = Number(min);
+    return m < t[0] ? 'merge-green' : (m < t[1] ? 'merge-yellow' : 'merge-red');
+}
+function shipOldestSub(count, min) {
+    // The "oldest:" sub-line: nothing when the box holds nothing, "oldest: ?" when unknown.
+    return Number(count) > 0 ? 'oldest: ' + shipOldestText(min) : '';
+}
+function shipOldestWords(box, what) {
+    // Plain-words definition + thresholds for the tooltip.
+    const t = SHIP_OLDEST_THRESHOLDS[box];
+    return ' Colour: ' + what + ' - green under ' + shipOldestText(t[0]) + ', yellow under ' + shipOldestText(t[1]) + ', red from ' + shipOldestText(t[1]) + '.';
+}
+function shipStage(num, cap, cls, sub, spark, help, stageCls, dropdownKey, prs, label, hist, sub2) {
     const agents = (shipAgents || []).filter(a => a.live && a.square === cap);
     const key = dropdownKey || cap.replaceAll(' ', '-').replaceAll('/', '-');
-    return '<div class="ship-stage ' + (stageCls || '') + '" data-square="' + cap + '"' + (help ? ' title="' + help.replace(/"/g, '') + '"' : '') + '><div class="ship-num ' + (cls || '') + '">' + num + '</div>'
-         + '<div class="ship-cap">' + cap + '</div>'
+    // SHIP-SPARK: the 12h history sparkline renders first, above the number,
+    // inside the box's own border - "above each box" without restructuring the
+    // row's flex layout (arrows stay aligned to the number/caption block).
+    // SHIP-GAME item 0 (Ben 12:32 PM CDT, screenshot cmux-drop-0a78f527...):
+    // the box itself is now the whole click target for its own dropdown - no
+    // separate caret button. role=button/tabindex so it's keyboard reachable;
+    // shipStageKeydown only acts on Enter/Space when the BOX (not a child link
+    // inside the open popup) has focus. toggleShipDropdown is a plain toggle,
+    // so a second click anywhere in the (now-open) box closes it, and the
+    // document click-listener above closes it on a click outside the box.
+    const open = openShipDropdown === key;
+    return '<div class="ship-stage ' + (stageCls || '') + '" data-square="' + cap + '" data-dropdown="' + key + '"'
+         + ' role="button" tabindex="0" aria-haspopup="true" aria-expanded="' + open + '" aria-controls="ship-list-' + key + '"'
+         + ' onclick="toggleShipDropdown(this.dataset.dropdown)" onkeydown="shipStageKeydown(event,this.dataset.dropdown)"'
+         + (help ? ' title="' + help.replace(/"/g, '') + '"' : '') + '>' + (hist || '')
+         + '<div class="ship-num ' + (cls || '') + '">' + num + '</div>'
+         + '<div class="ship-cap">' + (label || cap) + '</div>'
          + (sub ? '<div class="ship-sub">' + sub + '</div>' : '')
+         // SHIP-SPARK-2: a second, independent sub-line (e.g. green waiting's "Ave: 42m") -
+         // kept as its own div rather than concatenated onto `sub`, so it always reads as
+         // a distinct line, not just another " · "-joined clause of the first one.
+         + (sub2 ? '<div class="ship-sub">' + sub2 + '</div>' : '')
          + (spark ? sparkHtml(spark) : '') + shipDropdown(key, prs || [], agents) + '</div>';
 }
 
@@ -5993,28 +7761,233 @@ function capacityOutline(card, colour, glow) {
         : 'none');
 }
 
-function shipArrow(square, glyph, count, description) {
+// Pipe thickness: sqrt scale so a 4x rate difference doesn't read as a 4x-wider
+// pipe (which would dwarf everything else in the row) - 16px floor (SHIP-PIPES-2:
+// so the thinnest pipe is still a pipe, not a hairline), 36px only at the row's
+// own largest rate.
+function shipPipeWidth(rate, maxRate) {
+    const r = Number(rate);
+    if (!(r > 0) || !(maxRate > 0)) return 16;
+    return Math.max(16, Math.min(36, 16 + 20 * Math.sqrt(r / maxRate)));
+}
+
+function shipPipePoints(width) {
+    const cy = 18;
+    const hb = Math.max(3, Math.min(18, width / 2));
+    const hh = Math.min(18, hb + 5);
+    return '1,' + (cy - hb) + ' 33,' + (cy - hb) + ' 33,' + (cy - hh) + ' 47,' + cy
+        + ' 33,' + (cy + hh) + ' 33,' + (cy + hb) + ' 1,' + (cy + hb) + ' 6,' + cy;
+}
+
+function shipDrainText(drain) {
+    if (drain === null || drain === undefined) return 'stalled';
+    const n = Math.round(Number(drain) * 10) / 10;
+    return n + 'h to drain';
+}
+
+// square/glyph/description keep the old call shape; `arrow` is this edge's
+// {key, rate_per_hour, backlog, drain_hours} from /api/pipeline's `arrows`
+// list (null fields mean the instrument was unavailable, never a fake 0).
+// `legacyCount` is the count the arrow used to show (still the click target
+// for the 🤖 agent-lane dropdown) and rides along as a secondary number.
+// SHIP-GAME item 1 (Ben 11:30/12:32 PM CDT): `arrowLabel` is arrow.label (e.g.
+// "3/hour") - when present it REPLACES the old "N/h [+ h to drain]" badge text
+// for this one arrow; `drainLabelText` is arrow.drain_label (e.g. "102h to
+// drain"), rendered OUTSIDE the arrow shape, above its top edge, always grey -
+// never red, the arrow's own bottleneck glow still carries that alarm.
+// The robot/house yard strip is NOT built here - it lives in a persistent
+// #ship-yard element outside #ship-flow entirely (see renderShipYard),
+// because this whole arrow gets torn down and rebuilt from an HTML string on
+// every 45s refresh, and the yard must survive that (item 5: robots are keyed
+// client-side by worker id and must not reset on every payload refresh).
+function shipArrow(square, glyph, arrow, description, legacyCount, width, isBottleneck, arrowLabel, drainLabelText) {
     const agentLane = glyph === '🤖';
-    count = Math.max(0, Number(count) || 0);
-    const colour = capacityColour(count, [0, 1, 4, 8]);
-    const outline = count === 0 ? 'color-mix(in srgb,' + colour + ' 55%,black)' : colour;
+    const rate = arrow ? arrow.rate_per_hour : null;
+    const backlog = arrow ? arrow.backlog : null;
+    const drain = arrow ? arrow.drain_hours : null;
+    const hasRate = rate !== null && rate !== undefined;
+    const colour = isBottleneck ? 'var(--neon-red)' : (hasRate ? capacityColour(rate, [0, 1, 4, 8]) : '#556b8a');
+    const outline = !hasRate ? '#3a4560' : (rate === 0 ? 'color-mix(in srgb,' + colour + ' 55%,black)' : colour);
+    const w = width == null ? 16 : width;
+    const rateForSpeed = hasRate ? Number(rate) : 0;
+    // SHIP-PIPES-2 (Ben, 8:53 AM): dashes move at half the SHIP-PIPES speed at
+    // every rate - double the floor and the numerator so the 2x holds whether
+    // or not the floor is the binding constraint.
+    const duration = rateForSpeed > 0 ? Math.max(0.8, 24 / rateForSpeed) : 0;
     const style = '--arrow-color:' + colour + ';--arrow-outline:' + outline
-        + ';--arrow-glow:' + (count >= 8 ? 'drop-shadow(0 0 5px ' + colour + ')' : 'none')
+        + ';--arrow-glow:' + (isBottleneck ? 'drop-shadow(0 0 6px var(--neon-red))' : (hasRate && rate >= 8 ? 'drop-shadow(0 0 5px ' + colour + ')' : 'none'))
+        + ';--pipe-duration:' + (duration ? duration + 's' : '0s')
         + (agentLane ? '' : ';cursor:default');
     const key = square.replaceAll(' ', '-').replaceAll('/', '-');
-    const label = shipEscape(description + ': ' + count);
+    const rateText = hasRate ? (rate + '/h') : 'rate unknown';
+    const backlogText = (backlog === null || backlog === undefined) ? 'unknown waiting' : backlog + ' waiting';
+    const label = shipEscape(description + ': ' + rateText + ', ' + backlogText + ', ' + shipDrainText(drain));
     const tag = agentLane ? 'button' : 'span';
-    return '<' + tag + (agentLane ? ' type="button"' : ' role="img"') + ' class="ship-arrow" style="' + style
+    let badge;
+    if (arrowLabel) {
+        badge = glyph + ' ' + shipEscape(arrowLabel);
+    } else {
+        badge = glyph + ' ' + (hasRate ? rate + '/h' : '?');
+        // SHIP-PIPES-2: the drain line only ever rides on a MEASURED rate (hasRate
+        // true covers rate===0 too) - an unavailable ('?') arrow can never grow a
+        // "stalled" second line, even defensively, if the picker below ever mis-picks it.
+        if (isBottleneck && hasRate) badge += '<b>' + shipDrainText(drain) + '</b>';
+    }
+    if (agentLane && legacyCount !== null && legacyCount !== undefined) badge += '<small class="ship-arrow-sub">' + legacyCount + ' live</small>';
+    const drainLabelHtml = drainLabelText ? '<span class="ship-arrow-drainlabel">' + shipEscape(drainLabelText) + '</span>' : '';
+    return '<' + tag + (agentLane ? ' type="button"' : ' role="img"') + ' class="ship-arrow' + (isBottleneck ? ' bottleneck' : '') + '" style="' + style
         + '" data-square-left="' + square + '" title="' + label + '" aria-label="' + label + '"'
         + (agentLane ? ' data-dropdown="' + key + '" aria-controls="ship-list-' + key
             + '" aria-expanded="' + (openShipDropdown === key) + '" onclick="toggleShipDropdown(this.dataset.dropdown)"' : '') + '>'
-        + '<svg class="ship-arrow-shape" viewBox="0 0 48 36" preserveAspectRatio="none" aria-hidden="true"><polygon points="1,6 33,6 33,1 47,18 33,35 33,30 1,30 6,18"/></svg>'
-        + '<span class="ship-arrow-badge">' + glyph + ' ' + count + '</span></' + tag + '>';
+        + drainLabelHtml
+        + '<svg class="ship-arrow-shape pipe" viewBox="0 0 48 36" preserveAspectRatio="none" aria-hidden="true"><polygon points="' + shipPipePoints(w) + '"/></svg>'
+        + '<span class="ship-arrow-badge">' + badge + '</span></' + tag + '>';
 }
 
 function shipDeployCount(d) {
     // Existing production workflow activity, with merge/deploy lag as fallback.
     return d.deploys_in_flight || (Date.parse(d.last_merge_at) > Date.parse(d.last_deploy_at) ? 1 : 0);
+}
+
+// SHIP-GAME items 2-5 (Ben 11:30 AM CDT, council build): one robot+house per
+// running worker (d.workers from /api/pipeline). Keyed by worker id in
+// shipYardEls so a stage change updates the house SVG in place rather than
+// tearing the whole strip down every 45s refresh (item 5) - #ship-yard lives
+// outside #ship-flow's replaced subtree specifically so these nodes persist.
+const shipYardEls = {};                    // worker id -> its <div class="ship-worker"> node
+const shipYardCompletionsSeen = new Set(); // "id@at" already animated this session
+const SHIP_YARD_MAX_VISIBLE = 12;
+
+function shipWorkerLabel(w) {
+    if (w.issue) return 'issue-' + w.issue;
+    if (w.pr) return 'pr-' + w.pr;
+    return w.id;
+}
+function shipWorkerDelay(id) {
+    // Deterministic per-id offset (not Math.random) so a worker's idle-bob
+    // phase is stable across refreshes instead of jittering on every render.
+    let h = 0;
+    for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
+    return (h % 30) / 10; // 0.0-2.9s
+}
+// Six fixed stages, empty lot to finished house with a lit window - simple
+// inline SVG, same thin-stroke line style as the rest of the row.
+function shipHouseSvg(stage) {
+    const s = Math.max(1, Math.min(6, Number(stage) || 1));
+    const wall = '#7dd3fc', roof = '#c7cee0', dim = '#3a4560', lit = '#ffd766';
+    let body = '<line x1="1" y1="15" x2="19" y2="15" stroke="' + dim + '" stroke-width="1.2"/>';
+    if (s === 1) {
+        body += '<line x1="4" y1="15" x2="4" y2="7" stroke="' + dim + '" stroke-width="1.2"/>'
+              + '<polygon points="4,7 10,9 4,11" fill="' + dim + '"/>';
+    } else {
+        body += '<rect x="2" y="13" width="16" height="2" fill="' + dim + '"/>';
+    }
+    if (s === 3) {
+        body += [3, 6, 9, 12, 15].map(x => '<line x1="' + x + '" y1="13" x2="' + x + '" y2="6" stroke="' + wall + '" stroke-width="1.1"/>').join('')
+              + '<line x1="2" y1="6" x2="16" y2="6" stroke="' + wall + '" stroke-width="1.1"/>';
+    }
+    if (s >= 4) body += '<rect x="2" y="6" width="14" height="7" fill="none" stroke="' + wall + '" stroke-width="1.2"/>';
+    if (s >= 5) body += '<polygon points="1,6 9,1 17,6" fill="none" stroke="' + roof + '" stroke-width="1.2"/>';
+    if (s >= 6) {
+        body += '<rect x="11" y="8" width="3" height="3" fill="' + lit + '"/>'
+              + '<rect x="5" y="9" width="2" height="4" fill="' + dim + '"/>';
+    }
+    return '<svg class="ship-worker-house" viewBox="0 0 20 17" aria-hidden="true">' + body + '</svg>';
+}
+function shipWorkerNode(w) {
+    const el = document.createElement('div');
+    el.className = 'ship-worker';
+    el.dataset.workerId = w.id;
+    el.style.setProperty('--bot-delay', shipWorkerDelay(w.id) + 's');
+    el.setAttribute('data-ship-tip', shipWorkerLabel(w));
+    el.innerHTML = shipHouseSvg(w.stage) + '<span class="ship-worker-bot">🤖</span>';
+    return el;
+}
+function shipUpdateWorkerStage(el, stage) {
+    if (Number(el.dataset.stage) === Number(stage)) return;
+    el.dataset.stage = stage;
+    const houseEl = el.querySelector('.ship-worker-house');
+    if (houseEl) houseEl.outerHTML = shipHouseSvg(stage);
+}
+// Anchors #ship-yard under the first (issues->prs) arrow via a bounding-rect
+// read every refresh - cheap, and keeps the yard's own children (the robots)
+// untouched, unlike rebuilding the arrow's HTML would.
+function positionShipYard() {
+    const yard = document.getElementById('ship-yard');
+    const wrap = yard && yard.parentElement;
+    const arrow = document.querySelector('#ship-flow .ship-arrow[data-square-left="issues open"]');
+    if (!yard || !wrap || !arrow) return;
+    const arrowRect = arrow.getBoundingClientRect();
+    const wrapRect = wrap.getBoundingClientRect();
+    yard.style.left = (arrowRect.left - wrapRect.left + arrowRect.width / 2) + 'px';
+    yard.style.top = (arrowRect.bottom - wrapRect.top + 2) + 'px';
+    yard.style.transform = 'translateX(-50%)';
+}
+function renderShipYard(workers, completions) {
+    const yard = document.getElementById('ship-yard');
+    if (!yard) return;
+    const list = Array.isArray(workers) ? workers : [];
+    const currentIds = new Set(list.map(w => w.id));
+
+    // A completed lane: pop its house to stage 6 (already done via the stage
+    // field before it left the list), glide it into PRS OPEN, roll the count.
+    (Array.isArray(completions) ? completions : []).forEach(c => {
+        const seenKey = c.id + '@' + c.at;
+        if (shipYardCompletionsSeen.has(seenKey)) return;
+        shipYardCompletionsSeen.add(seenKey);
+        const el = shipYardEls[c.id];
+        if (!el) return; // this page loaded after it already left the strip - nothing to animate from
+        delete shipYardEls[c.id];
+        el.classList.add('ship-worker-completing');
+        setTimeout(() => {
+            const prsBox = document.querySelector('.ship-stage[data-square="prs open"] .ship-num');
+            const yardRect = yard.getBoundingClientRect();
+            if (prsBox) {
+                const boxRect = prsBox.getBoundingClientRect();
+                el.style.transform = 'translate(' + (boxRect.left + boxRect.width / 2 - yardRect.left - 10) + 'px,' + (boxRect.top - yardRect.top) + 'px) scale(.4)';
+            }
+            el.classList.add('ship-worker-gliding');
+            el.style.opacity = '0';
+            setTimeout(() => {
+                el.remove();
+                if (prsBox) {
+                    prsBox.classList.remove('ship-num-roll');
+                    void prsBox.offsetWidth; // restart the animation even if it is mid-cycle
+                    prsBox.classList.add('ship-num-roll');
+                }
+            }, 1100);
+        }, 500);
+    });
+
+    // A lane that vanished WITHOUT a completion event - blocked/killed.
+    Object.keys(shipYardEls).forEach(id => {
+        if (currentIds.has(id)) return;
+        const el = shipYardEls[id];
+        delete shipYardEls[id];
+        const bot = el.querySelector('.ship-worker-bot');
+        if (bot) bot.textContent = '🚧';
+        el.classList.add('ship-worker-blocked');
+        setTimeout(() => el.remove(), 1700);
+    });
+
+    const capped = list.slice(0, SHIP_YARD_MAX_VISIBLE);
+    capped.forEach(w => {
+        let el = shipYardEls[w.id];
+        if (!el) {
+            el = shipWorkerNode(w);
+            shipYardEls[w.id] = el;
+            yard.appendChild(el);
+        }
+        shipUpdateWorkerStage(el, w.stage);
+    });
+    let more = yard.querySelector('.ship-yard-more');
+    if (list.length > SHIP_YARD_MAX_VISIBLE) {
+        if (!more) { more = document.createElement('span'); more.className = 'ship-yard-more'; yard.appendChild(more); }
+        more.textContent = '+' + (list.length - SHIP_YARD_MAX_VISIBLE) + ' more';
+    } else if (more) {
+        more.remove();
+    }
+    positionShipYard();
 }
 
 function mergedRateClass(count) {
@@ -6026,17 +7999,95 @@ function mergedRateClass(count) {
     return 'merge-red merge-pulse';
 }
 
+// SHIP-SPARK-3 (council dispatch 20260905, Ben's order 11:26 AM CDT): the repo
+// switcher next to the "CI/CD" heading. shipCurrentRepo is the short name
+// ('armbrain', 'fleet-planning', ...) - the single source of truth every
+// fetch, the URL, and localStorage stay in sync with.
+let shipCurrentRepo = null;
+const SHIP_REPO_STORAGE_KEY = 'fleet.repo';
+
+function shipRepoUrl(base) {
+    return shipCurrentRepo ? base + '?repo=' + encodeURIComponent(shipCurrentRepo) : base;
+}
+
+function shipPushedAgo(iso) {
+    if (!iso) return '';
+    const mins = Math.max(0, Math.round((Date.now() - Date.parse(iso)) / 60000));
+    if (mins < 60) return mins + 'm ago';
+    const hrs = Math.round(mins / 60);
+    if (hrs < 24) return hrs + 'h ago';
+    return Math.round(hrs / 24) + 'd ago';
+}
+
+function initShipRepoSelector() {
+    const params = new URLSearchParams(window.location.search);
+    const fromUrl = params.get('repo');
+    const fromStorage = (() => { try { return localStorage.getItem(SHIP_REPO_STORAGE_KEY); } catch (e) { return null; } })();
+    shipCurrentRepo = fromUrl || fromStorage || 'armbrain';
+    shipRefreshRepoOptions();
+}
+
+function shipRefreshRepoOptions() {
+    fetch('/api/pipeline/repos').then(r => r.json()).then(repos => {
+        const sel = document.getElementById('ship-repo-select');
+        if (!sel || !Array.isArray(repos) || !repos.length) return;
+        const names = repos.map(r => r.name);
+        // A stale localStorage/URL value pointing at a repo that fell out of the
+        // 14-day/8-cap window falls back to armbrain rather than 404-looping.
+        if (!names.includes(shipCurrentRepo)) shipCurrentRepo = names.includes('armbrain') ? 'armbrain' : names[0];
+        sel.innerHTML = repos.map(r =>
+            '<option value="' + shipEscape(r.name) + '"' + (r.name === shipCurrentRepo ? ' selected' : '') + '>'
+            + shipEscape(r.name) + ' (pushed ' + shipEscape(shipPushedAgo(r.pushed_at) || '?') + ')</option>'
+        ).join('');
+    }).catch(() => {});
+}
+
+function shipRepoChanged(name) {
+    if (!name || name === shipCurrentRepo) return;
+    shipCurrentRepo = name;
+    try { localStorage.setItem(SHIP_REPO_STORAGE_KEY, name); } catch (e) {}
+    const url = new URL(window.location);
+    url.searchParams.set('repo', name);
+    window.history.replaceState({}, '', url);
+    const hint = document.getElementById('ship-repo-refreshing');
+    if (hint) hint.hidden = false;
+    // Immediate refresh of the newly-selected repo (council item 3: "the switch
+    // triggers an immediate refresh, shown with a refreshing… hint until it lands").
+    refreshShipFlow().finally(() => { if (hint) hint.hidden = true; });
+}
+
 // The development pipeline as a left-to-right flow: what is queued, what is in
 // flight, what actually shipped. Ben asked for this shape specifically.
+// SHIP-SPARK-3: every box, pipe, sparkline and dropdown re-keys to whichever
+// repo is currently selected in the dropdown next to "CI/CD" - see shipRepoUrl().
 function refreshShipFlow() {
+    // SHIP-SPARK-3: a fetch dispatched for repo A can resolve AFTER a later fetch
+    // for repo B (whichever repo's GitHub read happens to be slower/colder wins
+    // the race) - rapid switching without this guard could paint repo A's numbers
+    // on screen while the dropdown reads B. Every fetch is tagged with the repo it
+    // was FOR at dispatch time; a response is applied only if that repo is STILL
+    // the current selection when it lands, otherwise it is silently dropped.
+    const requestedRepo = shipCurrentRepo;
     return Promise.all([
-        fetch('/api/pipeline').then(r => r.json()),
+        fetch(shipRepoUrl('/api/pipeline')).then(r => r.json()),
         fetch('/api/agents').then(r => { if (!r.ok) throw new Error('agents unavailable'); return r.json(); }).catch(() => null)
     ]).then(([d, agents]) => {
+        if (requestedRepo !== shipCurrentRepo) return;  // stale - a newer switch has already superseded this
         shipAgents = Array.isArray(agents) ? agents : null;
         shipFleetRow();
+        // SHIP-GAME item 5: runs regardless of the CI/CD row's own available/
+        // warming_up state below - the yard reflects live workers, which exist
+        // independently of whether the pipeline's own GitHub read landed.
+        renderShipYard(d.workers, d.completions);
         const el = document.getElementById('ship-flow');
         if (!el) return;
+        if (d.warming_up) {
+            // SHIP-GAME item 8: a true cold boot (nothing cached yet, anywhere,
+            // for this repo) - not a failure, the background refresh is already
+            // running and the next 45s poll will have real data.
+            el.innerHTML = '<span class="gdim">shipping pipeline warming up (first read since restart still in flight)…</span>';
+            return;
+        }
         if (!d.available) {
             let since = '';
             if (d.gh_auth_failing_since) {
@@ -6049,73 +8100,130 @@ function refreshShipFlow() {
         const ciNum = d.ci_queued + '/' + d.ci_running;
         const ciCls = d.ci_queued > 5 ? 'hot' : (d.ci_queued > 0 ? 'warn' : 'ok');
         const greenCls = d.green_waiting >= 6 ? 'hot' : (d.green_waiting >= 3 ? 'warn' : (d.green_waiting > 0 ? 'ok' : ''));
-        const greenSub = d.green_waiting_prs.length ? '#' + d.green_waiting_prs[0].number : '';
-        const stuck = d.queue_prs.find(pr => pr.state === 'UNMERGEABLE');
-        const queueCls = stuck || d.queue_depth === 0 ? 'hot' : (d.queue_depth === 1 ? 'warn' : 'ok');
-        const queueSub = stuck ? '#' + stuck.number + ' stuck' : (d.queue_prs.length ? '#' + d.queue_prs[0].number : '');
+        const stuck = (d.queue_prs || []).find(pr => pr.state === 'UNMERGEABLE');
+        // SHIP-SPARK-3 item 4: has_merge_queue === false means this repo has none
+        // configured (GraphQL mergeQueue returned null) - neutral "n/a", never the
+        // "0 queued" red alarm a real empty queue on armbrain would show.
+        const noQueue = d.has_merge_queue === false;
+        const queueCls = noQueue ? '' : (stuck || d.queue_depth === 0 ? 'hot' : (d.queue_depth === 1 ? 'warn' : 'ok'));
+        // SHIP-OLDEST: box colour + "oldest:" sub-line from the age of the oldest item in each
+        // box (thresholds in SHIP_OLDEST_THRESHOLDS). A null age keeps the box neutral and reads
+        // "oldest: ?"; a count of 0 shows no sub-line and no colour.
+        const oldestOf = (box, count, min) => ({ cls: Number(count) > 0 ? shipOldestClass(box, min) : '', sub: shipOldestSub(count, min) });
+        const prsOld = oldestOf('prs open', d.prs_open, d.prs_oldest_min);
+        const ciOld = oldestOf('ci q/run', d.ci_queued, d.ci_oldest_min);
+        const greenOld = oldestOf('green waiting', d.green_waiting, d.green_oldest_min);
+        const queueOld = oldestOf('in queue', d.queue_depth, d.queue_oldest_min);
+        const greenFirst = d.green_waiting_prs.length ? '#' + d.green_waiting_prs[0].number : '';
+        const greenSub = greenFirst + (greenOld.sub ? (greenFirst ? ' · ' : '') + greenOld.sub : '');
+        // SHIP-SPARK-2 (Ben 11:12 AM CDT): "Ave: 42m" - mean wait of every PR that entered
+        // today's merge queue plus every PR currently green-waiting and not yet queued.
+        const greenWaitSub = (d.green_wait_avg_min === null || d.green_wait_avg_min === undefined)
+            ? '' : 'Ave: ' + shipOldestText(d.green_wait_avg_min);
+        const greenWaitWords = (d.green_wait_n === null || d.green_wait_n === undefined) ? '' :
+            ' Ave over ' + d.green_wait_n + ' PR' + (d.green_wait_n === 1 ? '' : 's')
+            + (d.green_wait_excluded ? ', ' + d.green_wait_excluded + ' excluded: no approval' : '') + '.'
+            + ((d.green_wait_prs || []).length ? ' ' + d.green_wait_prs.map(p => '#' + p.number + ' ' + shipOldestText(p.wait_min)).join(', ') : '');
+        const queueSub = noQueue ? '' : (stuck ? ('#' + stuck.number + ' stuck' + (queueOld.sub ? ' · ' + queueOld.sub : '')) : queueOld.sub);
+        const queueNum = noQueue ? 'n/a' : d.queue_depth;
+        const queueHelp = noQueue ? 'no merge queue on ' + (d.repo_name || d.repo_full || 'this repo')
+            : (HELP.inLine + shipOldestWords('in queue', 'age of the oldest merge-queue entry since it was enqueued'));
+        // merged today: colour by minutes since the LAST merge (the "Last: · 60m:" text stays);
+        // the pulse rides only on red, exactly as the old merges-per-hour rule already did.
+        const mergedCls = shipOldestClass('merged today', d.merged_since_min);
+        const mergedStage = mergedCls + (mergedCls === 'merge-red' ? ' merge-pulse' : '');
+        // last deploy: colour by minutes since the last deploy ONLY while main has commits the
+        // deploy does not contain; nothing waiting = green whatever the age; unknown = neutral.
+        const waiting = d.deploy_commits_waiting;
+        const deployCls = waiting === null || waiting === undefined ? '' : (Number(waiting) > 0 ? shipOldestClass('last deploy', d.deploy_since_min) : 'merge-green');
+        const deployWords = ' Commits waiting to deploy: ' + (waiting === null || waiting === undefined ? 'unknown' : waiting) + '.'
+            + ' Deployed ' + shipOldestText(d.deploy_since_min) + ' ago.'
+            + ((d.deploy_run_id !== null && d.deploy_run_id !== undefined)
+                ? ' Newest deploy-related run: #' + d.deploy_run_id + ' ' + (d.deploy_run_state || '?') + '.' : '');
         let mergedSub = d.merged_last_hour !== null && d.merged_last_hour !== undefined ? '60m: ' + d.merged_last_hour : '';
         if (d.last_merge_at) {
             const t = new Date(d.last_merge_at).toLocaleTimeString('en-US', {hour:'numeric', minute:'2-digit', timeZone:'America/Chicago'}).toLowerCase().replace(' ','');
             mergedSub = 'Last: ' + t + (mergedSub ? ' · ' + mergedSub : '');
         }
-        let stamp = '--';
+        // SHIP-SPARK: "last deploy" becomes a count box shaped like "merged today" -
+        // big number = deploys completed today, "Last: 10:41am" sub-line in the same
+        // style as the merged box's Last: line, SHA folded onto that same line
+        // (kept visible, per the brief, just not as its own separate sub-line).
+        let deploySub = '';
         if (d.last_deploy_at) {
-            const t = new Date(d.last_deploy_at);
-            stamp = t.toLocaleString('en-US', {month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZone: 'America/Chicago'});
+            const t = new Date(d.last_deploy_at).toLocaleTimeString('en-US', {hour:'numeric', minute:'2-digit', timeZone:'America/Chicago'}).toLowerCase().replace(' ','');
+            deploySub = 'Last: ' + t + (d.last_deploy_sha ? ' · ⎇ ' + d.last_deploy_sha : '');
         }
+        // SHIP-SPARK-2 item 6 (Ben 11:18 AM CDT): "stalled" is wrong when a deploy is
+        // simply waiting for the next odd-hour tick. deploy_state (from the workflow's
+        // actual run state, server-side) overrides both the sub-line and the colour;
+        // deploy_state === null (instrument unavailable) falls back to the age-only
+        // Last:/deployCls rendering above, honestly, rather than guessing a state.
+        const fmtCT = iso => new Date(iso).toLocaleTimeString('en-US', {hour:'numeric', minute:'2-digit', timeZone:'America/Chicago'}).toLowerCase().replace(' ','');
+        // SHIP-SPARK-3 item 4: no deploy-ish workflow at all on this repo (never
+        // resolved one by name/path match) - neutral n/a box, not a fake "0 today".
+        const noDeploy = d.deploy_configured === false;
+        let deployStateSub = deploySub, deployStateCls = deployCls;
+        if (noDeploy) {
+            deployStateSub = 'no deploy workflow on ' + (d.repo_name || d.repo_full || 'this repo');
+            deployStateCls = '';
+        } else if (d.deploy_state === 'shipping') {
+            deployStateSub = 'shipping now · ⎇ ' + (d.deploy_run_sha || '?');
+            deployStateCls = 'merge-blue';
+        } else if (d.deploy_state === 'held') {
+            deployStateSub = 'held · next tick ' + (d.deploy_next_tick_at ? fmtCT(d.deploy_next_tick_at) : '?');
+            deployStateCls = deployCls;
+        } else if (d.deploy_state === 'stalled') {
+            const nextTickMs = d.deploy_next_tick_at ? Date.parse(d.deploy_next_tick_at) : NaN;
+            deployStateSub = 'STALLED · tick ' + (Number.isFinite(nextTickMs) ? fmtCT(new Date(nextTickMs - 2 * 3600000).toISOString()) : '?') + ' missed';
+            deployStateCls = 'merge-red merge-pulse';
+        } else if (d.deploy_state === 'current') {
+            deployStateSub = 'up to date';
+            deployStateCls = 'merge-green';
+        }
+        const sp = d.spark12h || {};
+        // SHIP-PIPES: arrows carry rate/backlog/drain from the server; the
+        // bottleneck is whichever arrow drains its backlog slowest - a MEASURED
+        // stall (rate_per_hour === 0) with a backlog always outranks a merely-slow
+        // one. SHIP-PIPES-2 fix: an UNAVAILABLE instrument (rate_per_hour === null)
+        // is a "?" grey read, never a red bottleneck - drain_hours is null for both
+        // cases server-side, so eligibility is decided on rate_per_hour, not drain_hours.
+        const arrows = Array.isArray(d.arrows) ? d.arrows : [];
+        const arrowByKey = {};
+        arrows.forEach(a => { arrowByKey[a.key] = a; });
+        const maxRate = Math.max(0, ...arrows.map(a => Number(a.rate_per_hour) || 0));
+        const withBacklog = arrows.filter(a => Number(a.backlog) > 0);
+        const eligible = withBacklog.filter(a => a.rate_per_hour !== null && a.rate_per_hour !== undefined);
+        let bottleneckKey = null;
+        if (eligible.length) {
+            const stalled = eligible.filter(a => Number(a.rate_per_hour) === 0);
+            const pool = stalled.length ? stalled : eligible;
+            let best = null;
+            for (const a of pool) {
+                const rate = Number(a.rate_per_hour) || 0;
+                if (!best) { best = a; continue; }
+                const bestRate = Number(best.rate_per_hour) || 0;
+                if (stalled.length ? rate < bestRate
+                    : (a.drain_hours > best.drain_hours || (a.drain_hours === best.drain_hours && rate < bestRate))) best = a;
+            }
+            bottleneckKey = best ? best.key : null;
+        }
+        const wFor = key => shipPipeWidth(arrowByKey[key] && arrowByKey[key].rate_per_hour, maxRate);
+        const isB = key => key === bottleneckKey;
         el.innerHTML =
-            shipStage(d.issues_open, 'issues open', '', '', null, HELP.issues) + shipArrow('issues open', '🤖', (shipAgents || []).filter(a => a.live && a.square === 'issues open').length, 'Live agent lanes on issues open') +
-            shipStage(d.prs_open, 'prs open', '', '', null, HELP.prs) + shipArrow('prs open', '⚙', d.ci_queued, 'Workflow runs queued') +
-            shipStage(ciNum, 'ci q/run', ciCls, '', null, HELP.ciqr) + shipArrow('ci q/run', '⚙', d.ci_running, 'Workflow runs in progress') +
-            shipStage(d.green_waiting, 'green waiting', greenCls, greenSub, null, HELP.greenWaiting, '', 'green-waiting', d.green_waiting_prs) + shipArrow('green waiting', '⚡', d.green_waiting, 'Green eligible PRs not yet enqueued') +
-            shipStage(d.queue_depth, 'in line', queueCls, queueSub, null, HELP.inLine, '', 'in-line', d.queue_prs) + shipArrow('in line', '⚡', d.queue_depth, 'Merge queue entries') +
-            shipStage(d.merged_today, 'merged today', 'ok', mergedSub, d.merged_spark, HELP.merged, mergedRateClass(d.merged_last_hour), 'merged-today', d.merged_today_prs) + shipArrow('merged today', '⚡', shipDeployCount(d), 'Production deploy workflows in flight, or merge awaiting deploy') +
-            '<div class="ship-stage" title="' + HELP.lastdep.replace(/"/g, '') + '"><div class="ship-num stamp">' + stamp + '</div>'
-              + '<div class="ship-cap">last deploy (CT)</div>'
-              + (d.last_deploy_sha ? '<div class="ship-sub">⎇ ' + d.last_deploy_sha + '</div>' : '') + '</div>';
+            shipStage(d.issues_open, 'issues open', '', '', null, HELP.issues, '', null, null, null, shipHistorySpark(sp.issues, 'issues')) + shipArrow('issues open', '🤖', arrowByKey['issues-prs'], 'PRs opened in the last hour, from GitHub search - click for live agent lanes', (shipAgents || []).filter(a => a.live && a.square === 'issues open').length, wFor('issues-prs'), isB('issues-prs'), arrowByKey['issues-prs'] && arrowByKey['issues-prs'].label, arrowByKey['issues-prs'] && arrowByKey['issues-prs'].drain_label) +
+            shipStage(d.prs_open, 'prs open', '', prsOld.sub, null, HELP.prs + shipOldestWords('prs open', 'age of the oldest open, non-draft pull request'), prsOld.cls, null, null, null, shipHistorySpark(sp.prs, 'prs')) + shipArrow('prs open', '⚙', arrowByKey['prs-ci'], 'Distinct PRs with a CI run started this hour, from the GitHub workflow-runs list', d.ci_queued, wFor('prs-ci'), isB('prs-ci')) +
+            shipStage(ciNum, 'ci q/run', ciCls, ciOld.sub, null, HELP.ciqr + shipOldestWords('ci q/run', 'how long the oldest queued run in the last 48 h has waited to start (since it was re-queued, if it was re-run)'), ciOld.cls, null, null, null, shipHistorySpark(sp.ci, 'ci')) + shipArrow('ci q/run', '⚙', arrowByKey['ci-green'], 'Distinct PRs with a green Pre-Merge Gate run this hour (workflow 255384592)', d.ci_running, wFor('ci-green'), isB('ci-green')) +
+            shipStage(d.green_waiting, 'green waiting', greenCls, greenSub, null, HELP.greenWaiting + shipOldestWords('green waiting', 'how long the oldest green-eligible pull request has waited since its last activity') + greenWaitWords, greenOld.cls, 'green-waiting', d.green_waiting_prs, null, shipHistorySpark(sp.green, 'green'), greenWaitSub) + shipArrow('green waiting', '⚡', arrowByKey['green-inline'], 'Green eligible PRs not yet enqueued', d.green_waiting, wFor('green-inline'), isB('green-inline')) +
+            shipStage(queueNum, 'in line', queueCls, queueSub, null, queueHelp, queueOld.cls, 'in-line', d.queue_prs, 'in queue', shipHistorySpark(sp.queue, 'queue')) + shipArrow('in line', '⚡', arrowByKey['inline-merged'], 'Merge queue entries', d.queue_depth, wFor('inline-merged'), isB('inline-merged')) +
+            shipStage(d.merged_today, 'merged today', 'ok', mergedSub, d.merged_spark, HELP.merged + shipOldestWords('merged today', 'minutes since the last merge'), mergedStage, 'merged-today', d.merged_today_prs, null, shipHistorySpark(sp.merged, 'merged')) + shipArrow('merged today', '⚡', arrowByKey['merged-deploy'], 'Production deploy workflows in flight, or merge awaiting deploy', shipDeployCount(d), wFor('merged-deploy'), isB('merged-deploy')) +
+            shipStage(noDeploy ? 'n/a' : d.deploys_today, 'last deploy', 'ok', deployStateSub, null, (noDeploy ? 'no deploy workflow on ' + (d.repo_name || d.repo_full || 'this repo') : HELP.lastdep + shipOldestWords('last deploy', 'minutes since the last deploy, counted only while main has commits newer than it') + deployWords), deployStateCls, 'last-deploy', null, 'deployed today', shipHistorySpark(sp.deploy, 'deploy'));
+        // SHIP-GAME items 2/5: the first arrow (and its bounding rect) just got
+        // rebuilt above - reposition the persistent yard against the new one.
+        positionShipYard();
     }).catch(() => {
         const el = document.getElementById('ship-flow');
         if (el && !el.querySelector('.ship-stage')) el.innerHTML = '<span class="gdim">shipping pipeline failed to load.</span>';
-    });
-}
-
-function refreshMergeLane() {
-    fetch('/api/merge_lane').then(r => r.json()).then(d => {
-        const el = document.getElementById('merge-lane-body');
-        if (!el) return;
-        // UNKNOWN IS NEUTRAL, NEVER GREEN AND NEVER RED. A failed request must not render
-        // as "0 merged last hour" - that is an alarming, useful fact, and inventing it
-        // from an error is a lie shaped exactly like the truth. The shared token hit zero
-        // twice on 2026-09-05, so this path is real, not defensive decoration.
-        const val = v => (v === null || v === undefined) ? null : v;
-        const cell = (label, text, cls) =>
-            `<div class="ml-cell ${cls}"><div class="ml-num">${text}</div><div class="ml-lab">${label}</div></div>`;
-
-        const depth = val(d.depth), oldest = val(d.oldest_awaiting_min), merged = val(d.merged_last_hour);
-
-        // Red only when we KNOW merges are stuck: something queued and nothing landed.
-        const stuck = (depth !== null && depth > 0 && merged === 0);
-        const oldStuck = (oldest !== null && oldest > 20);
-
-        let html = '';
-        html += cell('in queue', depth === null ? '?' : depth, depth === null ? 'ml-unknown' : (stuck ? 'ml-bad' : 'ml-ok'));
-        html += cell('oldest waiting', oldest === null ? '?' : (oldest >= 60 ? Math.floor(oldest/60) + 'h ' + (oldest%60) + 'm' : oldest + 'm'),
-                     oldest === null ? 'ml-unknown' : (oldStuck ? 'ml-bad' : 'ml-ok'));
-        html += cell('merged last hour', merged === null ? '?' : merged, merged === null ? 'ml-unknown' : (stuck ? 'ml-bad' : 'ml-ok'));
-        // The lane does not exist until armbrain#7118 lands. Saying so is honest and costs
-        // no API call; polling for a label nobody carries would spend budget to re-learn
-        // something already known.
-        html += cell('lane runners', d.lane_state === 'not-configured' ? 'n/a' : (d.lane_runners === null ? '?' : d.lane_runners),
-                     d.lane_state === 'not-configured' ? 'ml-unknown' : 'ml-ok');
-
-        let note = '';
-        if (d.lane_state === 'not-configured') note += '<div class="ml-note">reserved lane not built yet (armbrain#7118)</div>';
-        if (d.error) note += `<div class="ml-note">read error: ${d.error} - figures above may be stale</div>`;
-        if (stuck) note += '<div class="ml-note ml-bad-note">merges are queued and none landed in the last hour</div>';
-        el.innerHTML = '<div class="ml-strip">' + html + '</div>' + note;
-    }).catch(() => {
-        const el = document.getElementById('merge-lane-body');
-        if (el) el.innerHTML = '<div class="ml-note">merge lane unreadable</div>';
     });
 }
 
@@ -6455,13 +8563,13 @@ const HELP = {
     peak:  'The high-water mark for today. Like the peak needle on a stereo amplifier: it stays where the loudest moment was, even after the level drops back down. Resets at midnight.',
     routepill: 'A ROUTE is a nickname you ask for instead of naming a model, so the gateway can pick the machine. This badge sits on the machine that serves it. GREEN means the model is loaded in memory and will answer immediately. GREY means the route works but nothing is loaded, so the first request waits while it loads. RED means the route is missing from the gateway entirely - that one is a problem.',
     routesum:  'LOADED ROUTES - how many of your local model routes have their model actually sitting in memory right now, out of the total number of local routes. Grey dots are idle, not broken: models unload after sitting unused, and the next request loads them again. Only red is a real fault.',
-    issues:    'ISSUES OPEN - open tickets on the armbrain repository.',
+    issues:    'ISSUES OPEN - open tickets on this repository.',
     prs:       'PULL REQUESTS OPEN - finished work waiting to be reviewed and merged.',
     ciqr:      'CI QUEUED / RUNNING - automated test runs waiting to start, and runs happening now. A growing queued number means you are short on runners.',
     merged:    'MERGED TODAY - pull requests that landed in the main branch today. The little bars are the last seven days, so you can see whether today is normal.',
     inLine: 'IN LINE - pull requests the merge queue is testing right now. Two is full and good. Zero means nothing is being merged.',
     greenWaiting: 'GREEN WAITING - approved pull requests with every required test passing and no open review gate that are not in the merge line yet. Zero is good. If this grows, the line is not being fed.',
-    lastdep:   'LAST DEPLOY - when the most recent release went out, in Central Time, and the short code identifying exactly which version it was.',
+    lastdep:   'DEPLOYED TODAY - production deploys that finished today. The sub-line shows the time of the last one, Central Time, and the short code identifying exactly which version it was.',
     maxutil:   'The busiest this graphics card got today, as a percentage.',
 };
 
@@ -7301,7 +9409,21 @@ function runnerJobFlow(tried, done) {
 
 function refreshRunsOn() {
     refreshRunnerJobs();
-    fetch('/api/runson').then(r => r.json()).then(d => {
+    // SHIP-GAME item 6 (Ben 11:31 AM CDT): reproduced live via headless Chrome
+    // (console + network capture) against the CURRENT served code - /api/runson
+    // answered 200 with no console errors and no failed requests; no fetch to
+    // /api/runson/status (a route that genuinely 404s - confirmed - but nothing
+    // in this file's client JS calls it) exists today. Most likely explanation:
+    // a stale cached bundle in Ben's browser at screenshot time, or the same
+    // cold-start hang item 8 fixed (a slow /api/runson read during that window
+    // falling into this .catch() with no detail). Either way, the underlying ask
+    // - "name the failing request instead of a bare 'failed to load'" - is
+    // implemented regardless of root cause: check r.ok and surface the real
+    // status/URL/error instead of a generic message.
+    fetch('/api/runson').then(r => {
+        if (!r.ok) throw new Error('HTTP ' + r.status + ' from /api/runson');
+        return r.json();
+    }).then(d => {
         runnerJobsAwsOff = d.gate_shards === 'off' || d.deployed === false;
         if (runnerJobsData) renderRunnerJobs(runnerJobsData);
         const card = document.getElementById('runson-card');
@@ -7353,9 +9475,10 @@ function refreshRunsOn() {
             + '<div class="runson-fact"><b>' + Number(d.trial_days_remaining || 0) + ' days</b><span>to $'
             + Number(d.subscription_usd_per_year || 350) + '/yr · ' + runsonEscape(d.trial_charge_date || '2026-09-30') + '</span></div>'
             + '</div>' + visuals;
-    }).catch(() => {
+    }).catch(err => {
         const body = document.getElementById('runson-body');
-        if (body) body.innerHTML = '<p class="runson-warning">⚠ RunsOn panel failed to load</p>';
+        const reason = (err && err.message) ? runsonEscape(err.message) : 'network error reaching /api/runson';
+        if (body) body.innerHTML = '<p class="runson-warning">⚠ RunsOn panel failed to load: ' + reason + '</p>';
     });
 }
 
@@ -7388,20 +9511,18 @@ function refreshLocalRunners() {
 
 // --- Polling control: pause everything when the tab isn't visible, resume ---
 // --- with an immediate refresh when it becomes visible again.              ---
-let statusTimer = null, fleetTimer = null, historyTimer = null, energyTimer = null, ciQueueTimer = null, routeHealthTimer = null, modelServingTimer = null, shipFlowTimer = null, runsonTimer = null, localRunnersTimer = null, mergeLaneTimer = null;
+let statusTimer = null, fleetTimer = null, historyTimer = null, energyTimer = null, ciQueueTimer = null, routeHealthTimer = null, modelServingTimer = null, shipFlowTimer = null, runsonTimer = null, localRunnersTimer = null;
 
 function startPolling() {
     // PAINT ONCE IMMEDIATELY. Without this the card sits on "Loading..." for a full
     // minute after every page load, and a glanceable display that is blank when you
     // glance at it is not one. Caught by reading the rendered DOM rather than trusting
     // that registering a timer was the same as showing a number.
-    try { refreshMergeLane(); } catch (err) { console.error('[dashboard] merge lane first paint failed:', err); }
     if (!localRunnersTimer) localRunnersTimer = setInterval(refreshLocalRunners, 60000);
     if (!statusTimer) statusTimer = setInterval(refresh, 12000);     // queue/GPU state: 12s
     if (!fleetTimer) fleetTimer = setInterval(refreshFleet, 45000);  // ssh fleet stats: 45s
     if (!historyTimer) historyTimer = setInterval(refreshHistory, 60000);
     if (!energyTimer) energyTimer = setInterval(refreshEnergy, 60000);
-    if (!mergeLaneTimer) mergeLaneTimer = setInterval(refreshMergeLane, 60000);  // matches MERGE_LANE_CACHE_TTL
     if (!ciQueueTimer) ciQueueTimer = setInterval(refreshCiQueue, 45000);        // matches backend cache TTL
     if (!shipFlowTimer) shipFlowTimer = setInterval(refreshShipFlow, 60000);     // /api/pipeline is cached 45 seconds
     if (!runsonTimer) runsonTimer = setInterval(refreshRunsOn, 120000);           // matches AWS cache TTL
@@ -7428,7 +9549,6 @@ function stopPolling() {
     clearInterval(historyTimer); historyTimer = null;
     clearInterval(energyTimer); energyTimer = null;
     clearInterval(ciQueueTimer); ciQueueTimer = null;
-    clearInterval(mergeLaneTimer); mergeLaneTimer = null;
     clearInterval(shipFlowTimer); shipFlowTimer = null;
     clearInterval(runsonTimer); runsonTimer = null;
     clearInterval(routeHealthTimer); routeHealthTimer = null;
@@ -7732,6 +9852,8 @@ function safeCall(label, fn) {
 startPolling();   // arm the timers before anything that can throw
 if (document.hidden) startSlowPolling();   // loaded in a background tab: still beat
 safeCall('initVramTooltip', initVramTooltip);
+safeCall('initShipSparkTooltip', initShipSparkTooltip);
+safeCall('initShipRepoSelector', initShipRepoSelector);
 safeCall('refresh', refresh);
 safeCall('refreshHistory', refreshHistory);
 safeCall('refreshEnergy', refreshEnergy);
@@ -8030,6 +10152,16 @@ if __name__ == "__main__":
     # hourly dash-truth run on its 20s budget (shadowfax-queue-router#5).
     runson_thread = threading.Thread(target=runson_warm_loop, daemon=True)
     runson_thread.start()
+
+    # SHIP-SPARK: 5-minute snapshot of each shipping-row box into ship_history,
+    # reading only the already-cached pipeline snapshot - adds no GitHub calls.
+    ship_history_thread = threading.Thread(target=ship_history_sampler_loop, daemon=True)
+    ship_history_thread.start()
+
+    # SHIP-SPARK-3 item 3: keeps every listed repo's /api/pipeline payload no
+    # older than 10 minutes so switching the dropdown never waits on a cold read.
+    repo_tracker_thread = threading.Thread(target=_repo_background_tracker_loop, daemon=True)
+    repo_tracker_thread.start()
 
     # ComfyUI watchdog (auto-restart if down) — OFF BY DEFAULT.
     #
