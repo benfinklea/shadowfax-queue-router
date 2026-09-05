@@ -5326,6 +5326,7 @@ letter-spacing:0;white-space:pre;width:22ch;text-align:right}
 <button type="button" class="panel-refresh-btn" data-panel="Shipping pipeline" title="Refresh this panel" aria-label="Refresh Shipping pipeline panel" onclick="refreshPanel(this, 'refreshShipFlow')">&#x21bb;</button>
 <h2 class="cicd-label">CI/CD</h2>
 <div id="ship-flow" class="ship-flow panel-refresh-body"><span class="gdim">shipping pipeline…</span></div>
+<div class="ship-fleet">🤖 agent lane we run · ⚙ CI automation · ⚡ merge/deploy automation</div>
 <div id="ship-fleet" class="ship-fleet" aria-live="polite">🤖 working: checking agents…</div>
 </div>
 
@@ -5563,7 +5564,7 @@ function shipShortTitle(title) {
 }
 function toggleShipDropdown(key) {
     openShipDropdown = openShipDropdown === key ? null : key;
-    document.querySelectorAll('.ship-toggle, .ship-arrow').forEach(button => {
+    document.querySelectorAll('.ship-toggle, button.ship-arrow').forEach(button => {
         const open = button.dataset.dropdown === openShipDropdown;
         button.setAttribute('aria-expanded', String(open));
         if (button.classList.contains('ship-toggle')) button.textContent = open ? '▴' : '▾';
@@ -5613,16 +5614,23 @@ function shipStage(num, cap, cls, sub, spark, help, stageCls, dropdownKey, prs) 
          + (spark ? sparkHtml(spark) : '') + shipDropdown(key, prs || [], agents) + '</div>';
 }
 
-function shipArrow(square) {
-    const count = (shipAgents || []).filter(a => a.live && a.square === square).length;
+function shipArrow(square, glyph, count, description) {
+    const agentLane = glyph === '🤖';
     const tier = count === 0 ? 'red' : count < 4 ? 'yellow' : count === 4 ? 'green' : 'blue';
     const key = square.replaceAll(' ', '-').replaceAll('/', '-');
-    return '<button type="button" class="ship-arrow bots-' + tier
-        + '" data-square-left="' + square + '" data-dropdown="' + key + '" aria-controls="ship-list-' + key
-        + '" aria-expanded="' + (openShipDropdown === key) + '" aria-label="Agents on ' + square
-        + ': ' + count + '" onclick="toggleShipDropdown(this.dataset.dropdown)">'
+    const label = shipEscape(description + ': ' + count);
+    const tag = agentLane ? 'button' : 'span';
+    return '<' + tag + (agentLane ? ' type="button"' : ' role="img" style="cursor:default"') + ' class="ship-arrow bots-' + tier
+        + '" data-square-left="' + square + '" title="' + label + '" aria-label="' + label + '"'
+        + (agentLane ? ' data-dropdown="' + key + '" aria-controls="ship-list-' + key
+            + '" aria-expanded="' + (openShipDropdown === key) + '" onclick="toggleShipDropdown(this.dataset.dropdown)"' : '') + '>'
         + '<svg class="ship-arrow-shape" viewBox="0 0 48 36" preserveAspectRatio="none" aria-hidden="true"><polygon points="1,6 33,6 33,1 47,18 33,35 33,30 1,30 6,18"/></svg>'
-        + '<span class="ship-arrow-badge">🤖 ' + count + '</span></button>';
+        + '<span class="ship-arrow-badge">' + glyph + ' ' + count + '</span></' + tag + '>';
+}
+
+function shipDeployCount(d) {
+    // Existing production workflow activity, with merge/deploy lag as fallback.
+    return d.deploys_in_flight || (Date.parse(d.last_merge_at) > Date.parse(d.last_deploy_at) ? 1 : 0);
 }
 
 function mergedRateClass(count) {
@@ -5672,12 +5680,12 @@ function refreshShipFlow() {
             stamp = t.toLocaleString('en-US', {month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZone: 'America/Chicago'});
         }
         el.innerHTML =
-            shipStage(d.issues_open, 'issues open', '', '', null, HELP.issues) + shipArrow('issues open') +
-            shipStage(d.prs_open, 'prs open', '', '', null, HELP.prs) + shipArrow('prs open') +
-            shipStage(ciNum, 'ci q/run', ciCls, '', null, HELP.ciqr) + shipArrow('ci q/run') +
-            shipStage(d.green_waiting, 'green waiting', greenCls, greenSub, null, HELP.greenWaiting, '', 'green-waiting', d.green_waiting_prs) + shipArrow('green waiting') +
-            shipStage(d.queue_depth, 'in line', queueCls, queueSub, null, HELP.inLine, '', 'in-line', d.queue_prs) + shipArrow('in line') +
-            shipStage(d.merged_today, 'merged today', 'ok', mergedSub, d.merged_spark, HELP.merged, mergedRateClass(d.merged_last_hour), 'merged-today', d.merged_today_prs) + shipArrow('merged today') +
+            shipStage(d.issues_open, 'issues open', '', '', null, HELP.issues) + shipArrow('issues open', '🤖', (shipAgents || []).filter(a => a.live && a.square === 'issues open').length, 'Live agent lanes on issues open') +
+            shipStage(d.prs_open, 'prs open', '', '', null, HELP.prs) + shipArrow('prs open', '⚙', d.prs_open, 'Open PRs (proxy: awaiting-trigger count unavailable)') +
+            shipStage(ciNum, 'ci q/run', ciCls, '', null, HELP.ciqr) + shipArrow('ci q/run', '⚙', d.ci_queued + d.ci_running, 'Workflow runs queued or in progress') +
+            shipStage(d.green_waiting, 'green waiting', greenCls, greenSub, null, HELP.greenWaiting, '', 'green-waiting', d.green_waiting_prs) + shipArrow('green waiting', '⚡', d.green_waiting, 'Green eligible PRs not yet enqueued') +
+            shipStage(d.queue_depth, 'in line', queueCls, queueSub, null, HELP.inLine, '', 'in-line', d.queue_prs) + shipArrow('in line', '⚡', d.queue_depth, 'Merge queue entries') +
+            shipStage(d.merged_today, 'merged today', 'ok', mergedSub, d.merged_spark, HELP.merged, mergedRateClass(d.merged_last_hour), 'merged-today', d.merged_today_prs) + shipArrow('merged today', '⚡', shipDeployCount(d), 'Production deploy workflows in flight, or merge awaiting deploy') +
             '<div class="ship-stage" title="' + HELP.lastdep.replace(/"/g, '') + '"><div class="ship-num stamp">' + stamp + '</div>'
               + '<div class="ship-cap">last deploy (CT)</div>'
               + (d.last_deploy_sha ? '<div class="ship-sub">⎇ ' + d.last_deploy_sha + '</div>' : '') + '</div>';
