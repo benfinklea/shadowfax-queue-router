@@ -75,6 +75,53 @@ def emit(level: str, signal: str, dashboard, instrument, detail: str = "") -> No
               f"instrument={json.dumps(instrument, separators=(',', ':'))}{suffix}")
 
 
+# A collector that could not READ its subject has not observed a fault - it has
+# observed nothing. On 2026-09-05 gandalf ran at load 95-103 (its lanes taking
+# 21.3 of 32 cores, fleet-planning#340) and the 17:14Z run emitted eight FAILs
+# at once - api.runson.schema "unreadable", model.pippin.metrics "unavailable",
+# pipeline fields stale, runson.gate_shards None, render_state "expired
+# credentials" - while the subjects were healthy: /api/runson answered 200 in
+# 7 ms and pippen:8891/metrics answered 200 in 3.2 s when probed directly. The
+# checker was timing out, not the fleet. Eight fabricated faults is worse than
+# no signal, because someone acts on them.
+#
+# So a transport failure emits STALE, which does not page. What keeps that from
+# being a fail-open hole is CONSECUTIVE_STALE_ESCALATION below: a subject that
+# stays unreadable run after run is a real fault about the COLLECTOR, and it is
+# escalated as one, with its own signal name so nobody confuses it for the
+# subject being broken.
+TRANSPORT_EXCEPTIONS = (
+    TimeoutError,
+    socket.timeout,
+    socket.gaierror,
+    ConnectionError,
+    urllib.error.URLError,
+    subprocess.TimeoutExpired,
+)
+
+
+def is_transport_failure(exc: BaseException) -> bool:
+    """True when the collector could not reach the subject at all.
+
+    Deliberately narrow. A JSONDecodeError, a KeyError, or an HTTPError with a
+    real status code all mean the subject ANSWERED and answered wrongly - those
+    stay FAIL. Only "no answer arrived" is STALE. urllib raises HTTPError as a
+    subclass of URLError, so it is excluded explicitly rather than by ordering.
+    """
+    if isinstance(exc, urllib.error.HTTPError):
+        return False
+    return isinstance(exc, TRANSPORT_EXCEPTIONS)
+
+
+def emit_unreadable(signal: str, exc: BaseException, dashboard, instrument) -> None:
+    """FAIL when the subject answered wrongly, STALE when it did not answer."""
+    if is_transport_failure(exc):
+        emit("STALE", signal, dashboard, instrument,
+             f"collector could not read the subject: {type(exc).__name__}")
+    else:
+        emit("FAIL", signal, dashboard, instrument, type(exc).__name__)
+
+
 def http(path: str, timeout: int = TIMEOUT, headers: dict | None = None) -> tuple[int, bytes]:
     req = urllib.request.Request(BASE + path, headers=headers or {})
     try:
@@ -113,7 +160,7 @@ def check_apis() -> None:
                  {"http": 200, "required": sorted(required)},
                  "valid JSON" if ok else f"missing={missing}")
         except Exception as exc:
-            emit("FAIL", f"api.{endpoint}.schema", "unreadable", "HTTP 200 JSON", type(exc).__name__)
+            emit_unreadable(f"api.{endpoint}.schema", exc, "unreadable", "HTTP 200 JSON")
     # These controls are real /api endpoints but cannot safely be called by a read-only monitor.
     source = (ROOT / "queue_router.py").read_text()
     for endpoint in MUTATING:
@@ -293,19 +340,30 @@ def check_models() -> None:
     serving = api.get("model_serving", {})
     status = api.get("status", {}).get("targets", {})
     for name in ("frodo", "pippin", "aragorn"):
+        last_exc: BaseException | None = None
         try:
             direct = serving_instrument(name)
         except Exception as exc:
             # One immediate retry differentiates a busy accept queue from the
             # dead metric-port failure this suite is intended to catch.
+            last_exc = exc
             try:
                 direct = serving_instrument(name)
-            except Exception:
+            except Exception as exc2:
+                # The retry's exception used to be swallowed, so by the time the
+                # verdict was decided the cause was gone and a 3-second timeout
+                # on a loaded box was indistinguishable from a dead metrics
+                # port. Keep it: it is the only thing that tells them apart.
+                last_exc = exc2
                 direct = None
         claim = serving.get(name, {})
         if direct is None:
-            emit("WARN" if not claim.get("available") else "FAIL", f"model.{name}.metrics",
-                 claim, "serving /metrics unavailable")
+            if last_exc is not None and is_transport_failure(last_exc):
+                emit("STALE", f"model.{name}.metrics", claim, "serving /metrics unavailable",
+                     f"collector could not read the subject: {type(last_exc).__name__} (twice)")
+            else:
+                emit("WARN" if not claim.get("available") else "FAIL", f"model.{name}.metrics",
+                     claim, "serving /metrics unavailable")
             continue
         # The dashboard rate is a 60s counter delta. Validate zero/nonzero state and sane bounds.
         tps = claim.get("tps_now")
@@ -330,7 +388,7 @@ def check_models() -> None:
         sane = isinstance(gs.get("tps_now"), (int, float)) and 0 <= gs["tps_now"] <= 2000
         emit("PASS" if sane else "FAIL", "model.gandalf.tps_now", gs.get("tps_now"), "llama-swap counter sampler", "rate sanity + source live")
     except Exception as exc:
-        emit("FAIL", "model.gandalf.identity", "dashboard", "/running unavailable", type(exc).__name__)
+        emit_unreadable("model.gandalf.identity", exc, "dashboard", "/running unavailable")
     # Gateway-derived boxes: verify each advertised value has a route/model source.
     routes = api.get("model_routes", {}).get("routes", [])
     route_boxes = {r.get("box") for r in routes if r.get("live")}
@@ -406,8 +464,8 @@ def check_green_waiting(d) -> None:
              waiting, {"invalid_prs": invalid, "queued": sorted(queued)},
              "live OPEN + not draft + APPROVED + MERGEABLE + CLEAN + not held + no open review gate + not queued; cache churn may fail")
     except Exception as exc:
-        emit("FAIL", "pipeline.green_waiting.live", waiting, "could not establish", str(exc))
-        emit("FAIL", "pipeline.queue.live", queue_prs, "could not establish", str(exc))
+        emit_unreadable("pipeline.green_waiting.live", exc, waiting, "could not establish")
+        emit_unreadable("pipeline.queue.live", exc, queue_prs, "could not establish")
 
 
 def check_pipeline() -> None:
@@ -587,7 +645,7 @@ def check_local_sources() -> None:
         emit("PASS" if sums_ok else "FAIL", "energy.fleet_totals", fleet, "sum(by_machine) for day/week/month", "direct aggregate invariant")
         con.close()
     except Exception as exc:
-        emit("FAIL", "sqlite.sources", "dashboard values", "direct SQLite", str(exc))
+        emit_unreadable("sqlite.sources", exc, "dashboard values", "direct SQLite")
     routes = api.get("model_routes", {})
     try:
         env_text = Path("/home/ben/.config/gandalf-gateway/fleet.env").read_text()
@@ -599,7 +657,7 @@ def check_local_sources() -> None:
             actual = route.get("name") in live
             emit("PASS" if route.get("live") is actual else "FAIL", f"route.{route.get('name')}.live", route.get("live"), actual)
     except Exception as exc:
-        emit("FAIL", "routes.direct_gateway", routes.get("available"), "gateway /v1/models", type(exc).__name__)
+        emit_unreadable("routes.direct_gateway", exc, routes.get("available"), "gateway /v1/models")
     # Fleet stats invariants and source availability.
     fs = api.get("fleet_stats", {})
     agents = fs.get("agents", {})
@@ -1084,12 +1142,47 @@ def notify_cron(failures: list[dict], signature: str) -> None:
         run(["/home/ben/bin/council-notify", f"DASH-TRUTH repeated failure ({count}x): {', '.join(x['signal'] for x in failures[:4])}"], timeout=15)
 
 
+# How many consecutive runs a signal may stay unreadable before the COLLECTOR
+# itself is escalated. Three hourly runs is long enough to ride out a load spike
+# and short enough that a genuinely dead subject is not silently ignored. This
+# is the guard that stops STALE from becoming a fail-open hole.
+CONSECUTIVE_STALE_ESCALATION = 3
+
+
+def stale_streaks(stale: list[dict]) -> dict[str, int]:
+    """Per-signal consecutive-run count for signals that are STALE right now."""
+    path = STATE / "stale-streaks.json"
+    try:
+        prior = json.loads(path.read_text())
+    except Exception:
+        prior = {}
+    current = {r["signal"]: int(prior.get(r["signal"], 0)) + 1 for r in stale}
+    # Signals that are no longer stale drop out entirely, so a streak only ever
+    # counts CONSECUTIVE runs. Carrying them at their old value would let two
+    # unrelated blips a day apart add up to an escalation.
+    path.write_text(json.dumps(current, indent=2, sort_keys=True) + "\n")
+    return current
+
+
 def finish() -> int:
     STATE.mkdir(parents=True, exist_ok=True)
     failures = [r for r in results if r["level"] == "FAIL"]
     warnings = [r for r in results if r["level"] == "WARN"]
+    # STALE means the collector could not read the subject. It is NOT a fault of
+    # the subject and must not page - but a signal that stays unreadable is a
+    # fault of the collector, and that does page, under its own name.
+    stale = [r for r in results if r["level"] == "STALE"]
+    streaks = stale_streaks(stale)
+    stuck = [r for r in stale if streaks.get(r["signal"], 0) >= CONSECUTIVE_STALE_ESCALATION]
+    for r in stuck:
+        failures.append({**r, "level": "FAIL",
+                         "signal": f"collector.unreadable.{r['signal']}",
+                         "detail": f"unreadable for {streaks[r['signal']]} consecutive runs - "
+                                   f"this is a collector fault, not a fault of {r['signal']}"})
     payload = {"generated_at": dt.datetime.now(dt.timezone.utc).isoformat(), "dashboard_url": BASE,
-               "summary": {"pass": sum(r["level"] == "PASS" for r in results), "warn": len(warnings), "fail": len(failures)},
+               "summary": {"pass": sum(r["level"] == "PASS" for r in results), "warn": len(warnings),
+                           "fail": len(failures), "stale": len(stale)},
+               "stale_streaks": streaks,
                "results": results}
     temp = STATE / f".last-run.{os.getpid()}.json"
     temp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
