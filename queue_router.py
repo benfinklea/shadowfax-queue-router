@@ -239,6 +239,41 @@ FLEET_NODES = {
     "sam":           {"ssh_host": FLEET_IPS["sam"], "ssh_user": "ben"},
 }
 
+# Host reachability is independent of application/SSH metrics availability.
+CORE_HOST_NAMES = ("gandalf", "frodo", "aragorn", "pippin")
+
+
+def probe_core_host(address):
+    """True for an ICMP answer, False for no answer; errors stay unknown."""
+    result = subprocess.run(
+        ["ping", "-n", "-c", "1", "-W", "2", address],
+        capture_output=True, text=True, timeout=5,
+    )
+    if result.returncode not in (0, 1):
+        raise RuntimeError(result.stderr.strip() or f"ping exited {result.returncode}")
+    return result.returncode == 0
+
+
+def get_core_status():
+    hosts = {}
+    with ThreadPoolExecutor(max_workers=len(CORE_HOST_NAMES)) as executor:
+        futures = {
+            name: executor.submit(probe_core_host, CONFIG["targets"][name]["ssh_host"])
+            for name in CORE_HOST_NAMES
+        }
+        for name, future in futures.items():
+            host = {"address": CONFIG["targets"][name]["ssh_host"]}
+            try:
+                host["online"] = future.result()
+            except Exception as exc:
+                host.update(online=None, error=str(exc))
+            hosts[name] = host
+    up = None if any(h["online"] is None for h in hosts.values()) else sum(
+        h["online"] for h in hosts.values()
+    )
+    return {"up": up, "total": len(hosts), "hosts": hosts}
+
+
 # --- Glance-view additions (2026-07-19): CI queue depth + local model-route
 # health. Goal: "the Shire is flapping" should read as ONE clear signal
 # instead of an OK/FAIL/OK phone-push flap. Both secrets below are read live
@@ -4736,6 +4771,7 @@ def get_status():
 
     return jsonify({
         "targets": targets_status,
+        "core": get_core_status(),
         "recent_jobs": recent_jobs
     })
 
@@ -5727,32 +5763,25 @@ GET  /api/health  - Health check</pre>
 const icons = {gandalf: "🧙", frodo: "🧝", pippin: "🍎", shadowfax: "🐴", aragorn: "👑"};
 const fleetIcons = {northfarthing: "🌾", eastfarthing: "🌾", southfarthing: "🌾", westfarthing: "🌾", shadowfax: "🐴", sam: "🌱"};
 
-// Core vs Reserve summary (2026-07-18): 5-of-6 reserve boxes down at any given
-// time is EXPECTED (the Shire farthings + sam are spun up on demand, not
-// always-on) but reads at a glance like "everything is down". This banner
-// separates the always-on CORE (gandalf/frodo/pippin from /api/status, plus
-// shadowfax itself from /api/fleet) from the RESERVE/Shire boxes so Ben can
-// see the core is healthy without counting red tiles.
-const CORE_TARGET_NAMES = ['gandalf', 'frodo', 'pippin'];       // from /api/status
-const RESERVE_FLEET_NAMES = ['northfarthing', 'eastfarthing', 'southfarthing', 'westfarthing', 'sam']; // from /api/fleet
-let lastTargetsOnline = {};
+// Core uses independent per-host ICMP probes; missing/error data is unknown.
+const RESERVE_FLEET_NAMES = ['northfarthing', 'eastfarthing', 'southfarthing', 'westfarthing', 'sam'];
+let lastCoreStatus = null;
 let lastFleetOnline = {};
 
 function updateFleetSummary() {
     const el = document.getElementById('fleet-summary');
     if (!el) return;
-    const coreFromTargets = CORE_TARGET_NAMES.filter(n => lastTargetsOnline[n]).length;
-    const shadowfaxUp = lastFleetOnline['shadowfax'] ? 1 : 0;
-    const coreUp = coreFromTargets + shadowfaxUp;
-    const coreTotal = CORE_TARGET_NAMES.length + 1;
+    const coreUp = lastCoreStatus?.up ?? null;
+    const coreTotal = lastCoreStatus?.total ?? 4;
     const reserveUp = RESERVE_FLEET_NAMES.filter(n => lastFleetOnline[n]).length;
     const reserveTotal = RESERVE_FLEET_NAMES.length;
-    const coreColor = (coreUp === coreTotal) ? 'var(--neon-green)' : 'var(--neon-red)';
-    el.title = (!lastFleetOnline['shadowfax'] && coreUp < coreTotal)
-        ? 'Core detail: shadowfax unreachable from gandalf (primary SSH path)'
-        : 'Core and reserve availability as seen from gandalf';
+    const coreColor = coreUp === null ? '#aaa' : coreUp === coreTotal
+        ? 'var(--neon-green)' : coreUp === 0 ? 'var(--neon-red)' : '#ffbf00';
+    el.title = lastCoreStatus ? Object.entries(lastCoreStatus.hosts).map(([name, host]) =>
+        name + ': ' + (host.online === null ? 'unknown' : host.online ? 'up' : 'down')
+    ).join(', ') : 'Core reachability unknown';
     el.innerHTML =
-        '<b>Core:</b> <span style="color:' + coreColor + ';font-weight:bold">' + coreUp + '/' + coreTotal + ' up</span>' +
+        '<b>Core:</b> <span style="color:' + coreColor + ';font-weight:bold">' + (coreUp ?? '?') + '/' + coreTotal + ' up</span>' +
         ' &nbsp;·&nbsp; <b>Reserve (Shire):</b> <span style="color:#8a8">' + reserveUp + '/' + reserveTotal + ' up</span>';
 }
 
@@ -6699,7 +6728,7 @@ function updateGauge(id, value, min, max, unit, showLimit, colorFn) {
 function refresh() {
     fetch("/api/status").then(r => r.json()).then(data => {
         const targets = data.targets || {};
-        for (const [name, info] of Object.entries(targets)) { lastTargetsOnline[name] = info.online; }
+        lastCoreStatus = data.core || null;
         updateFleetSummary();
         // If not initialized, build the full HTML
         if (!initialized) {
@@ -6986,6 +7015,8 @@ function refresh() {
             reloadCountdown = null;
         }
     }).catch(err => {
+        lastCoreStatus = null;
+        updateFleetSummary();
         console.error('Error fetching status:', err);
         consecutiveErrors++;
 
