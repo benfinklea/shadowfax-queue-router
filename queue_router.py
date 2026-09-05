@@ -5464,8 +5464,8 @@ letter-spacing:0;white-space:pre;width:22ch;text-align:right}
 <details class="runner-jobs-details" id="aws-runner-jobs"><summary>show running jobs</summary><div>Loading...</div></details>
 </div>
 <div class="card" id="local-runners-card">
-<button type="button" class="panel-refresh-btn" data-panel="HOME LAB" aria-label="Refresh HOME LAB panel" onclick="refreshPanel(this, 'refreshLocalRunners')">&#x21bb;</button>
-<h3>HOME LAB</h3><div id="local-runners-body">Loading...</div>
+<button type="button" class="panel-refresh-btn" data-panel="FLEET" aria-label="Refresh FLEET panel" onclick="refreshPanel(this, 'refreshLocalRunners')">&#x21bb;</button>
+<h3>FLEET</h3><div id="local-runners-body">Loading...</div>
 <details class="runner-jobs-details" id="home-runner-jobs"><summary>show running jobs</summary><div>Loading...</div></details>
 </div>
 </div>
@@ -7102,14 +7102,7 @@ function refreshLocalRunners() {
             + (history ? '<p class="runson-label">' + runsonEscape(d.caption) + '</p>' : '')
             + (d.truncated ? '<p class="runson-warning">Limited job sample · up to 30 runs; counts may be incomplete</p>' : '')
             + '<div class="runner-facts">' + (history ? ['online', 'busy', 'idle', 'seen_last_hour'] : ['online', 'busy', 'idle']).map(k =>
-            '<div class="runson-fact"><b>' + count(d[k]) + '</b><span>' + k.replaceAll('_', ' ') + '</span></div>').join('') + '</div>'
-            + '<details class="runson-runners-details"><summary>show ' + d.runners.length + ' runners</summary>'
-            + (d.hosts || []).map(h => '<div class="local-runner-host"><b>' + runsonEscape(h.host)
-                + '</b> · ' + count(h.online) + ' online · ' + count(h.busy) + ' busy · ' + count(h.idle) + ' idle'
-                + (history ? ' · ' + count(h.seen_last_hour) + ' seen last hour' : '')
-                + h.runners.map(r => '<div class="local-runner">' + runsonEscape(r.name) + ' · '
-                    + runsonEscape(r.labels.join(', ')) + ' · ' + runsonEscape(r.status)
-                    + ' · ' + (r.busy ? 'busy' : (history ? 'seen in last hour' : 'idle')) + '</div>').join('') + '</div>').join('') + '</details>';
+            '<div class="runson-fact"><b>' + count(d[k]) + '</b><span>' + k.replaceAll('_', ' ') + '</span></div>').join('') + '</div>';
     }).catch(() => { document.getElementById('local-runners-body').innerHTML = '<p>Could not establish local runners</p>'; });
 }
 
