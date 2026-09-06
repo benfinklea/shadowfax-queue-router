@@ -5185,6 +5185,7 @@ def _get_deploy_state(headers, deploy_commits_waiting, oldest_waiting_commit_at,
     cadence to call held/stalled from" (falls back to the age-only Last: render)."""
     result = {"deploy_state": None, "deploy_next_tick_at": None,
               "deploy_run_id": None, "deploy_run_state": None, "deploy_run_sha": None,
+              "deploy_run_sha_full": None,
               "deploy_configured": bool(deploy_workflow_ids)}
     if repo == GITHUB_CI_REPO:
         result["deploy_next_tick_at"] = _next_odd_tick_ct().isoformat()
@@ -5206,6 +5207,7 @@ def _get_deploy_state(headers, deploy_commits_waiting, oldest_waiting_commit_at,
                 result["deploy_state"] = "shipping"
                 result["deploy_run_id"] = active.get("id")
                 result["deploy_run_state"] = deploy_job.get("status")
+                result["deploy_run_sha_full"] = active.get("head_sha")
                 result["deploy_run_sha"] = (active.get("head_sha") or "")[:9]
                 return result
         newest = runs[0] if runs else None
@@ -5547,6 +5549,85 @@ def _get_merged_today_prs(headers, today, repo=None):
         raise ValueError("Merged-today search changed during pagination")
     items.sort(key=lambda p: p["pull_request"]["merged_at"], reverse=True)
     return [{"number": p["number"], "title": p["title"]} for p in items]
+
+
+def _get_deployed_prs_today(headers, merged_today_prs, deployed_sha, repo):
+    """Return today's merged PR numbers whose merge commit is reachable from production.
+
+    SHIP-GAME-3: one GraphQL read per 50 merged PRs obtains mergeCommit.oid
+    without an O(PRs) REST detail loop. Exact ancestry uses gandalf's local
+    armbrain clone, falling back per missing object/repo to GitHub compare. This
+    work lives inside the existing 45-second pipeline snapshot/cache.
+    """
+    prs = list(merged_today_prs or [])
+    if not deployed_sha:
+        return None, []
+    if not prs:
+        return 0, []
+    owner, name = repo.split("/", 1)
+    merge_rows = []
+    for start in range(0, len(prs), 50):
+        chunk = prs[start:start + 50]
+        fields = " ".join(
+            f'p{i}:pullRequest(number:{int(pr["number"])})'
+            '{number mergedAt mergeCommit{oid}}'
+            for i, pr in enumerate(chunk)
+        )
+        query = "query($owner:String!,$name:String!){repository(owner:$owner,name:$name){" + fields + "}}"
+        r = requests.post("https://api.github.com/graphql", json={
+            "query": query, "variables": {"owner": owner, "name": name},
+        }, headers=headers, timeout=8)
+        r.raise_for_status()
+        body = r.json()
+        if body.get("errors"):
+            raise ValueError("Could not establish deployed-PR merge commits")
+        rows = (body.get("data") or {}).get("repository") or {}
+        for i in range(len(chunk)):
+            row = rows.get(f"p{i}") or {}
+            commit = row.get("mergeCommit") or {}
+            if row.get("number") and row.get("mergedAt") and commit.get("oid"):
+                merge_rows.append({"number": int(row["number"]), "merged_at": row["mergedAt"],
+                                   "oid": commit["oid"]})
+    if len(merge_rows) != len(prs):
+        raise ValueError("Could not establish every merged-today PR's merge commit")
+
+    # The armbrain clone already used on gandalf contains today's shared objects,
+    # so exact merge-base ancestry is local and free. If either object is absent
+    # (or for a switched repo without a known local clone), use GitHub compare for
+    # only that row. Do not use the commits endpoint's `since=mergedAt`: GitHub
+    # filters by the commit timestamp, and Pippen caught #6696 merged just after
+    # midnight pointing at a commit timestamped just before it.
+    local_clone = "/workspace/armbrain" if repo == GITHUB_CI_REPO else None
+    local_deploy = bool(local_clone and os.path.isdir(os.path.join(local_clone, ".git")) and
+                        subprocess.run(["git", "-C", local_clone, "cat-file", "-e", deployed_sha + "^{commit}"],
+                                       capture_output=True, timeout=3).returncode == 0)
+    deployed = []
+    for row in merge_rows:
+        established = False
+        if local_deploy:
+            exists = subprocess.run(["git", "-C", local_clone, "cat-file", "-e", row["oid"] + "^{commit}"],
+                                    capture_output=True, timeout=3).returncode == 0
+            if exists:
+                rc = subprocess.run(["git", "-C", local_clone, "merge-base", "--is-ancestor",
+                                     row["oid"], deployed_sha], capture_output=True, timeout=3).returncode
+                if rc in (0, 1):
+                    established = True
+                    if rc == 0:
+                        deployed.append(row["number"])
+            else:
+                # This is a full (not shallow/partial) clone and the deployed
+                # commit object exists, so all of its ancestors necessarily
+                # exist too. A candidate object absent locally is therefore
+                # established not-reachable, not an API fallback case.
+                established = True
+        if not established:
+            r = requests.get(f"https://api.github.com/repos/{repo}/compare/{row['oid']}...{deployed_sha}",
+                             headers=headers, timeout=8)
+            r.raise_for_status()
+            if r.json().get("status") in ("ahead", "identical"):
+                deployed.append(row["number"])
+    deployed.sort()
+    return len(deployed), deployed
 
 
 # SHIP-SPARK-2 (council dispatch 20260905, Ben 11:12 AM CDT): the "green waiting"
@@ -5949,6 +6030,18 @@ def get_pipeline_status(repo=None, default_branch=None, force_refresh=False):
             # SHIP-SPARK-3 FIRST ITEM: deploy box semantics from the workflow's actual run
             # state PLUS when the oldest waiting commit itself landed (see _get_deploy_state).
             result.update(_get_deploy_state(headers, _deploy_waiting, _deploy_oldest_at, repo, deploy_workflow_ids))
+            # SHIP-GAME-3: the deployed-today headline counts PRs, not workflow
+            # runs. Prefer the active deploy's production head when present, then
+            # the last successful deploy head established by the deploy-job scan.
+            deployed_sha = (result.get("deploy_run_sha_full") or
+                            result.get("last_deploy_sha_full") or result.get("last_deploy_sha"))
+            try:
+                (result["deployed_prs_today"],
+                 result["deployed_prs_today_list"]) = _get_deployed_prs_today(
+                    headers, result.get("merged_today_prs"), deployed_sha, repo)
+            except Exception as e:
+                logger.warning("deployed-PR ancestry lookup failed (%s): %s", repo, e)
+                result["deployed_prs_today"], result["deployed_prs_today_list"] = None, []
             github_reads_ok = github_fetches_ok and all(result.get(field) is not None for field in (
                 "issues_open", "prs_open", "merged_today", "ci_queued", "ci_running"
             ))
@@ -6099,9 +6192,11 @@ def api_pipeline():
                   "green_oldest_min", "queue_oldest_min", "deploy_commits_waiting", "deploys_today",
                   "green_wait_avg_min", "green_wait_n", "green_wait_excluded", "has_merge_queue",
                   "deploy_state", "deploy_next_tick_at", "deploy_run_id", "deploy_run_state",
-                  "deploy_run_sha", "deploy_configured"):
+                  "deploy_run_sha", "deploy_run_sha_full", "deploy_configured",
+                  "deployed_prs_today"):
         result.setdefault(field, None)
     result.setdefault("green_wait_prs", [])
+    result.setdefault("deployed_prs_today_list", [])
     # SHIP-SPARK: 12h/5-minute sparkline history per box - a plain SQLite read,
     # zero GitHub calls, always attached even on a degraded pipeline read.
     result["spark12h"] = _get_ship_spark12h(repo=repo)
@@ -6706,18 +6801,24 @@ box-shadow:var(--glow-cyan)}
 .sparkline-container{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
 .sparkline-box{background:var(--bg-panel);padding:12px;border-radius:4px;border:1px solid #1a2332}
 .sparkline-label{font-size:0.9em;color:#888;margin-bottom:8px;font-family:'Orbitron',monospace;letter-spacing:1px}
-.sparkline{height:45px;display:flex;align-items:end;gap:2px;width:100%;overflow:hidden}
-.sparkline-bar{background:var(--neon-cyan);flex:1 1 0;min-width:0;border-radius:1px 1px 0 0;
-transition:height 0.5s cubic-bezier(0.4,0,0.2,1);box-shadow:0 0 5px var(--neon-cyan)}
-.sparkline-bar.high{background:var(--neon-yellow);box-shadow:0 0 5px var(--neon-yellow)}
-.sparkline-bar.critical{background:var(--neon-red);box-shadow:0 0 5px var(--neon-red);animation:spark-glow 1.2s ease-in-out infinite}
+/* SHIP-GAME-4 (Ben, 4:53 PM CDT 2026-09-05: "spark lines not bar charts"): the
+   Historical Metrics boxes reuse the CI/CD row's shipHistorySpark polyline -
+   graph left, current value right, the same read as the issues-closed/hour
+   panel (.ship-issues-rate). The row keeps the old bar strip's 45px so each
+   box's footprint is unchanged. Static per-refresh snapshot, no animation,
+   so prefers-reduced-motion needs nothing extra (same as .ship-history-spark). */
+.sparkline-row{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:8px;width:100%;height:45px}
+.sparkline-row .ship-history-spark{min-width:0;height:45px}
+.sparkline-now{font-family:'Orbitron',monospace;font-size:1em;color:#c7cee0;font-variant-numeric:tabular-nums;
+line-height:1;min-width:3.2em;text-align:right}
+.sparkline-now.yellow{color:var(--neon-yellow);text-shadow:0 0 6px var(--neon-yellow)}
+.sparkline-now.red{color:var(--neon-red);text-shadow:0 0 6px var(--neon-red)}
 .history-machine{padding:15px 18px;border-radius:6px;margin-bottom:16px;border:1px solid #1a2332;overflow:hidden}
 .history-machine.alt-0{background:rgba(0,255,242,0.04)}
 .history-machine.alt-1{background:rgba(255,0,255,0.05)}
 .max-util{color:var(--neon-green);text-shadow:0 0 8px var(--neon-green);font-family:'Orbitron',monospace}
 .cost{color:var(--neon-green);font-family:'Orbitron',monospace;text-shadow:0 0 6px var(--neon-green)}
 #energy td,#energy-fleet td{font-size:0.95em}
-@keyframes spark-glow{0%,100%{opacity:0.85}50%{opacity:1}}
 .gauge-arc{}
 .progress-label{display:flex;justify-content:space-between;font-size:1em;color:#888;
 font-family:'Rajdhani',sans-serif;letter-spacing:1px}
@@ -7138,33 +7239,52 @@ font-size:0.85em;letter-spacing:0.5px;vertical-align:middle}
 @keyframes ship-pipe-flow{to{stroke-dashoffset:-18}}
 .ship-arrow-badge{position:relative;z-index:1;display:inline-block;color:#8a94ad;background:rgba(6,10,20,.88);outline:1px solid #8a94ad;border-radius:4px;padding:2px 3px;font-size:11px;line-height:1.25;text-align:center;white-space:nowrap}
 .ship-arrow-badge b{display:block;font-weight:inherit}
-.ship-arrow-sub{display:block;font-size:.75em;color:#8992aa;text-shadow:none;margin-top:1px}
 .ship-arrow.bottleneck{animation:ship-arrow-bottleneck-pulse 1.6s ease-in-out infinite}
 @keyframes ship-arrow-bottleneck-pulse{0%,100%{filter:drop-shadow(0 0 4px var(--neon-red))}50%{filter:drop-shadow(0 0 11px var(--neon-red))}}
 @media(prefers-reduced-motion:reduce){.ship-arrow-shape.pipe{animation:none}.ship-arrow.bottleneck{animation:none}}
 .ship-arrow:focus-visible{outline:2px solid var(--arrow-color);outline-offset:2px}
-/* SHIP-GAME item 1 (Ben 11:30 AM + 12:32 PM CDT amendment): the drain figure
-   sits OUTSIDE and above the first arrow's top edge, small and grey - never
-   red, even when the arrow itself is glowing red as the bottleneck. */
-.ship-arrow-drainlabel{position:absolute;bottom:100%;left:50%;transform:translateX(-50%);
-white-space:nowrap;font-size:10px;line-height:1;color:#8a94ad;margin-bottom:3px;z-index:1}
+/* SHIP-GAME-2: issues-closed/hour history replaces the open-issue count
+   sparkline. It mirrors the runners read: graph left, current value right. */
+.ship-issues-rate{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;
+gap:5px;width:100%;height:22px}
+.ship-issues-rate .ship-history-spark{min-width:0}
+.ship-issues-rate-now{font-family:'Orbitron',monospace;font-size:.72em;color:#c7cee0;
+font-variant-numeric:tabular-nums;line-height:1}
+.ship-stage-drain{font-size:.62em;color:#8a94ad;line-height:1.1;margin-top:2px;white-space:nowrap}
 /* SHIP-GAME items 2-5: one robot+house per running worker, in a small "yard"
    strip anchored under the first (issues->prs) arrow via JS position-sync
    (positionShipYard) rather than being part of that arrow's own rebuilt HTML -
    #ship-yard is a persistent sibling of #ship-flow (see the HTML template) so
    robots, keyed by worker id, survive every 45s payload refresh untouched
    (item 5) instead of being torn down and recreated with it. */
-.ship-yard{position:absolute;z-index:4;display:flex;flex-wrap:wrap;justify-content:center;
-gap:3px;max-width:230px;padding:3px 5px;background:rgba(10,14,24,.55);border-radius:6px;
+.ship-yard{position:absolute;z-index:4;display:grid;grid-template-columns:repeat(2,16px);
+grid-auto-rows:16px;gap:1px 2px;justify-content:center;padding:2px 3px;
+background:rgba(10,14,24,.55);border-radius:6px;
 pointer-events:none}
 .ship-yard:empty{display:none}
-.ship-yard-more{font-size:10px;color:#8a94ad;align-self:center;white-space:nowrap;pointer-events:auto}
-.ship-worker{position:relative;display:flex;flex-direction:column;align-items:center;
-width:20px;cursor:default;pointer-events:auto}
-.ship-worker-house{width:20px;height:17px;display:block;overflow:visible}
-.ship-worker-bot{font-size:11px;line-height:1;margin-top:-3px;
-animation:ship-robot-idle 3s ease-in-out infinite;animation-delay:var(--bot-delay,0s)}
-@keyframes ship-robot-idle{0%,100%{transform:translateX(-3px)}50%{transform:translateX(3px)}}
+.ship-yard-more{display:none}
+.ship-worker{position:relative;width:16px;height:16px;cursor:default;pointer-events:auto}
+.ship-worker-house{position:absolute;left:2px;bottom:0;width:12px;height:10.2px;display:block;overflow:visible}
+.ship-house-ghost{opacity:.52;filter:drop-shadow(0 0 2px #55bfff)}
+.ship-worker-bot{position:absolute;left:0;bottom:3px;z-index:2;width:16px;height:12px;display:block;
+animation-name:var(--bot-path);animation-duration:var(--bot-duration);animation-delay:var(--bot-delay);
+animation-timing-function:cubic-bezier(.3,.05,.35,1);animation-iteration-count:infinite}
+.ship-bot-svg{display:block;width:16px;height:12px;overflow:visible;filter:drop-shadow(0 1px 1px #02050a)}
+/* Original dashboard art, informed by the Factorio construction-robot silhouette:
+   grey-green compact body, paired rotor pods, work arm/laser, status lamp. */
+.ship-worker-spark{position:absolute;left:8px;top:10px;width:2px;height:2px;border-radius:50%;
+background:#fff7b2;box-shadow:0 0 3px #ffd84d;opacity:0;animation:ship-bot-spark var(--bot-duration) var(--bot-delay) infinite}
+@keyframes ship-bot-build-cw{0%,7%,14%,100%{transform:translate(0,-1px)}4%,11%{transform:translate(0,-2px)}24%{transform:translate(var(--bot-x),var(--bot-y-high))}31%{transform:translate(var(--bot-x-small),var(--bot-y))}39%{transform:translate(var(--bot-x),var(--bot-y-half))}47%{transform:translate(var(--bot-x-neg-small),var(--bot-y))}55%{transform:translate(var(--bot-x-neg),var(--bot-y-half))}61%{transform:translate(0,var(--bot-y-high))}68%,100%{transform:translate(0,-1px)}}
+@keyframes ship-bot-build-ccw{0%,7%,14%,100%{transform:translate(0,-1px)}4%,11%{transform:translate(0,-2px)}24%{transform:translate(var(--bot-x-neg),var(--bot-y-high))}31%{transform:translate(var(--bot-x-neg-small),var(--bot-y))}39%{transform:translate(var(--bot-x-neg),var(--bot-y-half))}47%{transform:translate(var(--bot-x-small),var(--bot-y))}55%{transform:translate(var(--bot-x),var(--bot-y-half))}61%{transform:translate(0,var(--bot-y-high))}68%,100%{transform:translate(0,-1px)}}
+@keyframes ship-bot-spark{0%,34%,49%,100%{opacity:0;transform:translate(0,0) scale(.5)}38%{opacity:1}47%{opacity:0;transform:translate(var(--spark-x),var(--spark-y)) scale(1)}}
+.ship-carry-layer{position:absolute;inset:0;z-index:20;pointer-events:none;overflow:visible}
+.ship-pr-carry{position:absolute;width:24px;height:18px;transform:translate(-12px,-9px);will-change:left,top}
+.ship-pr-carry .ship-bot-svg{position:absolute;left:4px;top:0;width:16px;height:12px}
+.ship-pr-chip{position:absolute;left:1px;top:10px;padding:1px 2px;border:1px solid #76d8ff;border-radius:3px;
+background:#101827;color:#fff;font:700 7px/1 monospace;box-shadow:0 0 4px #42bfff;white-space:nowrap}
+.ship-carry-sparks{position:absolute;left:10px;top:9px;width:4px;height:4px}
+.ship-carry-sparks i{position:absolute;width:2px;height:2px;border-radius:50%;background:#fff7b2;box-shadow:0 0 4px #ffd84d;animation:ship-carry-spark .42s ease-out forwards}
+@keyframes ship-carry-spark{from{opacity:1;transform:translate(0,0)}to{opacity:0;transform:translate(var(--cx),var(--cy))}}
 .ship-worker.ship-worker-blocked{animation:ship-worker-fade 1.6s ease-in forwards}
 .ship-worker.ship-worker-completing{animation:ship-worker-pop .5s ease-out}
 @keyframes ship-worker-pop{0%{transform:scale(1)}50%{transform:scale(1.4)}100%{transform:scale(1)}}
@@ -7173,6 +7293,7 @@ animation:ship-robot-idle 3s ease-in-out infinite;animation-delay:var(--bot-dela
 transition:transform 1.1s cubic-bezier(.3,.6,.4,1),opacity 1.1s linear .3s}
 @media(prefers-reduced-motion:reduce){
   .ship-worker-bot{animation:none}
+  .ship-worker-spark,.ship-pr-carry{display:none}
   .ship-worker.ship-worker-blocked{animation:none;opacity:.35}
   .ship-worker.ship-worker-completing{animation:none}
   .ship-worker.ship-worker-gliding{transition:none}
@@ -7217,6 +7338,7 @@ transition:transform 1.1s cubic-bezier(.3,.6,.4,1),opacity 1.1s linear .3s}
 <div class="ship-flow-wrap" style="position:relative">
 <div id="ship-flow" class="ship-flow panel-refresh-body"><span class="gdim">shipping pipeline…</span></div>
 <div id="ship-yard" class="ship-yard" aria-label="Robots building the next PR"></div>
+<div id="ship-carry-layer" class="ship-carry-layer" aria-hidden="true"></div>
 </div>
 <div class="ship-fleet-row"><div id="ship-fleet" class="ship-fleet" aria-live="polite">🤖 working: checking agents…</div><div class="ship-fleet ship-legend">🤖 agent lane we run · ⚙ CI automation · ⚡ merge/deploy automation · pipe width = PRs/hour · red = bottleneck (longest time to drain)</div></div>
 </div>
@@ -7451,21 +7573,36 @@ function shipHistoryTimeCT(epochSeconds) {
     return new Date(epochSeconds * 1000).toLocaleTimeString('en-US',
         {hour: 'numeric', minute: '2-digit', timeZone: 'America/Chicago'}).toLowerCase().replace(' ', '');
 }
-function shipHistorySpark(samples, key) {
+function shipHistorySpark(samples, key, opts) {
+    // SHIP-GAME-4: optional opts so the Historical Metrics boxes can reuse this
+    // exact line (same stroke, colours, hover columns) for their own series:
+    //   slots  - column count (default SHIP_HISTORY_SLOTS, right-aligned to now)
+    //   max    - fixed scale ceiling (default: the series peak; never clips above it)
+    //   height - viewBox/CSS height (default 22)
+    //   tip    - function(sample) -> hover text (default: CT time · value · oldest)
+    //   label  - aria-label (default 'Last 12 hours')
+    opts = opts || {};
+    // null/undefined is a gap, never a zero (Number(null) is 0, which drew a false floor).
+    const num = x => (x === null || x === undefined || x === '') ? NaN : Number(x);
     const colour = {green: 'var(--neon-green)', yellow: 'var(--neon-yellow)',
         red: 'var(--neon-red)', neutral: '#556b8a'};
     const list = Array.isArray(samples) ? samples : [];
     // Right-align to "now": today's newest sample always lands in the last
     // slot; fewer than 144 samples means the earliest slots simply have none
     // yet (SHIP-SPARK honesty rule - never back-fill from another source).
-    const slots = new Array(SHIP_HISTORY_SLOTS).fill(null);
+    const nSlots = Math.max(2, Math.floor(num(opts.slots)) || SHIP_HISTORY_SLOTS);
+    const slots = new Array(nSlots).fill(null);
     for (let i = 0; i < list.length; i++) {
-        const idx = SHIP_HISTORY_SLOTS - list.length + i;
-        if (idx >= 0 && idx < SHIP_HISTORY_SLOTS) slots[idx] = list[i];
+        const idx = nSlots - list.length + i;
+        if (idx >= 0 && idx < nSlots) slots[idx] = list[i];
     }
-    const values = list.map(p => Number(p.v)).filter(Number.isFinite);
-    const peak = Math.max(1, ...values);
-    const h = 22;
+    const values = list.map(p => num(p.v)).filter(Number.isFinite);
+    const peak = Math.max(1, num(opts.max) > 0 ? num(opts.max) : 0, ...values);
+    const h = num(opts.height) > 0 ? num(opts.height) : 22;
+    // Points sit at the centre of their hover column, so the first and last
+    // samples are half a column from the edges instead of the last one
+    // stopping a full column short of the right edge.
+    const xOf = i => i + 0.5;
     const yOf = v => h - Math.max(1, (Number(v) / peak) * (h - 2));
     // SHIP-SPARK-2 (Ben 11:32 AM CDT: "I wanted a line graph"): one polyline
     // per maximal run of same-colour segments, not bars. A segment between
@@ -7484,14 +7621,14 @@ function shipHistorySpark(samples, key) {
         }
         run = null;
     }
-    for (let i = 1; i < SHIP_HISTORY_SLOTS; i++) {
+    for (let i = 1; i < nSlots; i++) {
         const prev = slots[i - 1], cur = slots[i];
-        if (!prev || !cur || !Number.isFinite(Number(prev.v)) || !Number.isFinite(Number(cur.v))) {
+        if (!prev || !cur || !Number.isFinite(num(prev.v)) || !Number.isFinite(num(cur.v))) {
             flushRun();
             continue;
         }
         const cls = cur.cls || 'neutral';
-        const p0 = [i - 1, yOf(prev.v)], p1 = [i, yOf(cur.v)];
+        const p0 = [xOf(i - 1), yOf(prev.v)], p1 = [xOf(i), yOf(cur.v)];
         if (run && run.cls === cls) {
             run.points.push(p1);
         } else {
@@ -7501,10 +7638,10 @@ function shipHistorySpark(samples, key) {
     }
     flushRun();
     let rects = '';
-    for (let i = 0; i < SHIP_HISTORY_SLOTS; i++) {
+    for (let i = 0; i < nSlots; i++) {
         const p = slots[i];
         const tip = p
-            ? shipHistoryTimeCT(p.t) + ' · ' + p.v + (p.oldest_min !== null && p.oldest_min !== undefined ? ' · oldest: ' + shipOldestText(p.oldest_min) : '')
+            ? (typeof opts.tip === 'function' ? opts.tip(p) : shipHistoryTimeCT(p.t) + ' · ' + p.v + (p.oldest_min !== null && p.oldest_min !== undefined ? ' · oldest: ' + shipOldestText(p.oldest_min) : ''))
             : 'no sample yet';
         // Full-height, transparent hit target over the (often thin) line, so
         // hovering anywhere in the column - not just on the line pixels -
@@ -7514,8 +7651,33 @@ function shipHistorySpark(samples, key) {
         // headless screenshot, so it could never be proven with a picture.
         rects += '<rect x="' + i + '" y="0" width="1" height="' + h + '" fill="transparent" data-ship-tip="' + shipEscape(tip) + '"></rect>';
     }
-    return '<svg class="ship-history-spark" data-key="' + key + '" viewBox="0 0 ' + SHIP_HISTORY_SLOTS + ' ' + h
-        + '" preserveAspectRatio="none" role="img" aria-label="Last 12 hours">' + polylines + rects + '</svg>';
+    return '<svg class="ship-history-spark" data-key="' + key + '" viewBox="0 0 ' + nSlots + ' ' + h
+        + '" preserveAspectRatio="none" role="img" aria-label="' + shipEscape(opts.label || 'Last 12 hours') + '">' + polylines + rects + '</svg>';
+}
+
+// SHIP-GAME-2: spark12h.issues stores open-issue counts, not closure events.
+// For every sample, use the oldest sample within the preceding hour and turn
+// the positive net drop into issues/hour: max(0, old-open - new-open) / elapsed
+// hours. Openings during the same window can mask closures, so this is net rate.
+function shipIssuesClosedRateSeries(samples) {
+    const list = (Array.isArray(samples) ? samples : []).filter(p =>
+        Number.isFinite(Number(p.t)) && Number.isFinite(Number(p.v)));
+    return list.map((p, i) => {
+        if (!i) return Object.assign({}, p, {v: null, cls: 'neutral', oldest_min: null});
+        let j = i - 1;
+        while (j > 0 && Number(p.t) - Number(list[j - 1].t) <= 3600) j--;
+        const elapsedHours = (Number(p.t) - Number(list[j].t)) / 3600;
+        const rate = elapsedHours > 0 ? Math.max(0, Number(list[j].v) - Number(p.v)) / elapsedHours : null;
+        return Object.assign({}, p, {v: rate === null ? null : Math.round(rate * 10) / 10,
+            cls: 'neutral', oldest_min: null});
+    }).filter(p => p.v !== null && p.v !== undefined && Number.isFinite(Number(p.v)));
+}
+function shipIssuesRatePanel(samples) {
+    const rates = shipIssuesClosedRateSeries(samples);
+    const current = rates.length ? Number(rates[rates.length - 1].v).toFixed(1) : '?';
+    return '<div class="ship-issues-rate" title="Net issues closed per hour, trailing one-hour average">'
+        + shipHistorySpark(rates, 'issues-closed-per-hour')
+        + '<span class="ship-issues-rate-now" aria-label="Current net issues closed per hour">' + current + '</span></div>';
 }
 
 // SHIP-SPARK-3 (carried gap from SHIP-SPARK): real hover proof for the sparkline
@@ -7669,9 +7831,10 @@ function shipDropdown(key, prs, agents) {
     const open = openShipDropdown === key;
     // SHIP-GAME item 0: the ▾ caret button is gone - shipStage's own outer div
     // is the click/keyboard target that opens this panel now.
+    const repoPath = (shipCurrentRepo && shipCurrentRepo.includes('/')) ? shipCurrentRepo : ('armbrain-io/' + (shipCurrentRepo || 'armbrain'));
     return '<div class="ship-dropdown" id="ship-list-' + key + '"' + (open ? '' : ' hidden') + '>'
         + shipAgentRows(agents)
-        + prs.map(pr => '<div class="ship-pr" data-pr-number="' + pr.number + '"><a href="https://github.com/armbrain-io/armbrain/pull/' + pr.number + '" target="_blank" rel="noopener">#' + pr.number + '</a><span>' + shipEscape(shipShortTitle(pr.title)) + '</span>'
+        + prs.map(pr => '<div class="ship-pr" data-pr-number="' + pr.number + '"><a href="https://github.com/' + shipEscape(repoPath) + '/pull/' + pr.number + '" target="_blank" rel="noopener">#' + pr.number + '</a><span>' + shipEscape(shipShortTitle(pr.title)) + '</span>'
             + (key === 'in-line' ? '<span class="ship-sub ' + (pr.state === 'UNMERGEABLE' ? 'hot' : '') + '">' + (pr.state === 'UNMERGEABLE' ? 'stuck' : 'testing') + '</span>' : '') + '</div>').join('') + '</div>';
 }
 // SHIP-OLDEST (council dispatch 20260905, Ben's order 8:57 AM CDT): each box below is
@@ -7712,7 +7875,7 @@ function shipOldestWords(box, what) {
     const t = SHIP_OLDEST_THRESHOLDS[box];
     return ' Colour: ' + what + ' - green under ' + shipOldestText(t[0]) + ', yellow under ' + shipOldestText(t[1]) + ', red from ' + shipOldestText(t[1]) + '.';
 }
-function shipStage(num, cap, cls, sub, spark, help, stageCls, dropdownKey, prs, label, hist, sub2) {
+function shipStage(num, cap, cls, sub, spark, help, stageCls, dropdownKey, prs, label, hist, sub2, belowCap) {
     const agents = (shipAgents || []).filter(a => a.live && a.square === cap);
     const key = dropdownKey || cap.replaceAll(' ', '-').replaceAll('/', '-');
     // SHIP-SPARK: the 12h history sparkline renders first, above the number,
@@ -7732,6 +7895,7 @@ function shipStage(num, cap, cls, sub, spark, help, stageCls, dropdownKey, prs, 
          + (help ? ' title="' + help.replace(/"/g, '') + '"' : '') + '>' + (hist || '')
          + '<div class="ship-num ' + (cls || '') + '">' + num + '</div>'
          + '<div class="ship-cap">' + (label || cap) + '</div>'
+         + (belowCap ? '<div class="ship-stage-drain">' + shipEscape(belowCap) + '</div>' : '')
          + (sub ? '<div class="ship-sub">' + sub + '</div>' : '')
          // SHIP-SPARK-2: a second, independent sub-line (e.g. green waiting's "Ave: 42m") -
          // kept as its own div rather than concatenated onto `sub`, so it always reads as
@@ -7788,8 +7952,8 @@ function shipDrainText(drain) {
 // square/glyph/description keep the old call shape; `arrow` is this edge's
 // {key, rate_per_hour, backlog, drain_hours} from /api/pipeline's `arrows`
 // list (null fields mean the instrument was unavailable, never a fake 0).
-// `legacyCount` is the count the arrow used to show (still the click target
-// for the 🤖 agent-lane dropdown) and rides along as a secondary number.
+// `legacyCount` is retained in the call shape for compatibility but is no
+// longer rendered: SHIP-GAME-2 removed the obsolete "N live" caption.
 // SHIP-GAME item 1 (Ben 11:30/12:32 PM CDT): `arrowLabel` is arrow.label (e.g.
 // "3/hour") - when present it REPLACES the old "N/h [+ h to drain]" badge text
 // for this one arrow; `drainLabelText` is arrow.drain_label (e.g. "102h to
@@ -7833,13 +7997,10 @@ function shipArrow(square, glyph, arrow, description, legacyCount, width, isBott
         // "stalled" second line, even defensively, if the picker below ever mis-picks it.
         if (isBottleneck && hasRate) badge += '<b>' + shipDrainText(drain) + '</b>';
     }
-    if (agentLane && legacyCount !== null && legacyCount !== undefined) badge += '<small class="ship-arrow-sub">' + legacyCount + ' live</small>';
-    const drainLabelHtml = drainLabelText ? '<span class="ship-arrow-drainlabel">' + shipEscape(drainLabelText) + '</span>' : '';
     return '<' + tag + (agentLane ? ' type="button"' : ' role="img"') + ' class="ship-arrow' + (isBottleneck ? ' bottleneck' : '') + '" style="' + style
         + '" data-square-left="' + square + '" title="' + label + '" aria-label="' + label + '"'
         + (agentLane ? ' data-dropdown="' + key + '" aria-controls="ship-list-' + key
             + '" aria-expanded="' + (openShipDropdown === key) + '" onclick="toggleShipDropdown(this.dataset.dropdown)"' : '') + '>'
-        + drainLabelHtml
         + '<svg class="ship-arrow-shape pipe" viewBox="0 0 48 36" preserveAspectRatio="none" aria-hidden="true"><polygon points="' + shipPipePoints(w) + '"/></svg>'
         + '<span class="ship-arrow-badge">' + badge + '</span></' + tag + '>';
 }
@@ -7849,65 +8010,108 @@ function shipDeployCount(d) {
     return d.deploys_in_flight || (Date.parse(d.last_merge_at) > Date.parse(d.last_deploy_at) ? 1 : 0);
 }
 
-// SHIP-GAME items 2-5 (Ben 11:30 AM CDT, council build): one robot+house per
-// running worker (d.workers from /api/pipeline). Keyed by worker id in
-// shipYardEls so a stage change updates the house SVG in place rather than
-// tearing the whole strip down every 45s refresh (item 5) - #ship-yard lives
-// outside #ship-flow's replaced subtree specifically so these nodes persist.
-const shipYardEls = {};                    // worker id -> its <div class="ship-worker"> node
-const shipYardCompletionsSeen = new Set(); // "id@at" already animated this session
-const SHIP_YARD_MAX_VISIBLE = 12;
+// SHIP-GAME-3: persistent construction yard plus separately-spawned carry bots.
+// The public Factorio wiki describes construction robots fetching items and
+// building blueprint ghosts. We reproduce that readable sequence and silhouette
+// with original inline SVG; no Wube image or sprite bytes are shipped.
+const shipYardEls = {};
+const shipYardCompletionsSeen = new Set();
+const shipBuiltWorkerIds = new Set();
+const shipWorkerBuildTimers = {};
+const SHIP_YARD_MAX_VISIBLE = 8;
+const shipBotMotionUsed = new Set();
 
+function shipBotSvg(extraClass) {
+    return '<svg class="ship-bot-svg ' + (extraClass || '') + '" viewBox="0 0 32 24" aria-hidden="true">'
+        + '<g stroke="#202922" stroke-width="1.4"><ellipse cx="5" cy="7" rx="4" ry="3" fill="#667565"/>'
+        + '<ellipse cx="27" cy="7" rx="4" ry="3" fill="#667565"/><path d="M1 4h8M23 4h8" stroke="#bac4b5"/>'
+        + '<path d="M9 6l4-3h7l3 3-2 9H11z" fill="#778775"/><path d="M12 7h8l-1 5h-6z" fill="#4b5b4d"/>'
+        + '<path d="M16 14v5l-3 3M16 19l3 3" fill="none" stroke="#aeb9aa"/>'
+        + '<path d="M16 18v5" stroke="#ffe66b" stroke-width="1"/></g>'
+        + '<circle cx="18.5" cy="6.5" r="1.5" fill="#72ff65"/><circle cx="18.5" cy="6.5" r=".7" fill="#eaffdf"/>'
+        + '</svg>';
+}
+function shipSparkMarkup() {
+    const rays = [[-6,-5],[-3,-7],[1,-7],[5,-5],[7,-1],[5,4],[0,6],[-5,4]];
+    return rays.map((p, i) => '<i class="ship-worker-spark" style="--spark-x:' + p[0]
+        + 'px;--spark-y:' + p[1] + 'px;animation-delay:calc(var(--bot-delay) + ' + (i * .018) + 's)"></i>').join('');
+}
 function shipWorkerLabel(w) {
     if (w.issue) return 'issue-' + w.issue;
     if (w.pr) return 'pr-' + w.pr;
     return w.id;
 }
-function shipWorkerDelay(id) {
-    // Deterministic per-id offset (not Math.random) so a worker's idle-bob
-    // phase is stable across refreshes instead of jittering on every render.
-    let h = 0;
-    for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
-    return (h % 30) / 10; // 0.0-2.9s
+function shipWorkerMotion() {
+    let motion, signature;
+    do {
+        const clockwise = Math.random() < .5;
+        const path = clockwise ? 'ship-bot-build-cw' : 'ship-bot-build-ccw';
+        const duration = (6 + Math.random() * 8).toFixed(3);
+        signature = path + '@' + duration;
+        const x = 2.5 + Math.random() * 2, y = 3.5 + Math.random() * 2.5;
+        motion = {path: path, duration: duration + 's', delay: (-Math.random() * 14).toFixed(3) + 's',
+            direction: clockwise ? 'clockwise' : 'counterclockwise', x: x.toFixed(2) + 'px',
+            xNeg: (-x).toFixed(2) + 'px', xSmall: (x * .45).toFixed(2) + 'px',
+            xNegSmall: (-x * .45).toFixed(2) + 'px', y: (-y).toFixed(2) + 'px',
+            yHalf: (-y * .55).toFixed(2) + 'px', yHigh: (-y * 1.5).toFixed(2) + 'px'};
+    } while (shipBotMotionUsed.has(signature));
+    shipBotMotionUsed.add(signature);
+    return motion;
 }
-// Six fixed stages, empty lot to finished house with a lit window - simple
-// inline SVG, same thin-stroke line style as the rest of the row.
 function shipHouseSvg(stage) {
-    const s = Math.max(1, Math.min(6, Number(stage) || 1));
+    const s = Math.max(0, Math.min(6, Number(stage) || 0));
     const wall = '#7dd3fc', roof = '#c7cee0', dim = '#3a4560', lit = '#ffd766';
-    let body = '<line x1="1" y1="15" x2="19" y2="15" stroke="' + dim + '" stroke-width="1.2"/>';
-    if (s === 1) {
-        body += '<line x1="4" y1="15" x2="4" y2="7" stroke="' + dim + '" stroke-width="1.2"/>'
-              + '<polygon points="4,7 10,9 4,11" fill="' + dim + '"/>';
-    } else {
-        body += '<rect x="2" y="13" width="16" height="2" fill="' + dim + '"/>';
-    }
-    if (s === 3) {
-        body += [3, 6, 9, 12, 15].map(x => '<line x1="' + x + '" y1="13" x2="' + x + '" y2="6" stroke="' + wall + '" stroke-width="1.1"/>').join('')
-              + '<line x1="2" y1="6" x2="16" y2="6" stroke="' + wall + '" stroke-width="1.1"/>';
-    }
-    if (s >= 4) body += '<rect x="2" y="6" width="14" height="7" fill="none" stroke="' + wall + '" stroke-width="1.2"/>';
-    if (s >= 5) body += '<polygon points="1,6 9,1 17,6" fill="none" stroke="' + roof + '" stroke-width="1.2"/>';
-    if (s >= 6) {
-        body += '<rect x="11" y="8" width="3" height="3" fill="' + lit + '"/>'
-              + '<rect x="5" y="9" width="2" height="4" fill="' + dim + '"/>';
-    }
+    if (s === 0) return '<svg class="ship-worker-house ship-house-ghost" viewBox="0 0 20 17" aria-hidden="true">'
+        + '<path d="M1 15h18M2 13V6L9 1l8 5v7zM5 13V9h2M11 8h3v3" fill="none" stroke="#64c8ff" stroke-width="1" stroke-dasharray="2 1"/></svg>';
+    let body = '<line x1="1" y1="15" x2="19" y2="15" stroke="' + dim + '" stroke-width="1.2"/>'
+        + '<rect x="2" y="13" width="16" height="2" fill="' + dim + '"/>';
+    if (s >= 4) body += '<rect x="2" y="6" width="14" height="7" fill="#304956" stroke="' + wall + '" stroke-width="1.2"/>';
+    if (s >= 6) body += '<polygon points="1,6 9,1 17,6" fill="#657080" stroke="' + roof + '" stroke-width="1.2"/>'
+        + '<rect x="11" y="8" width="3" height="3" fill="' + lit + '"/><rect x="5" y="9" width="2" height="4" fill="' + dim + '"/>';
     return '<svg class="ship-worker-house" viewBox="0 0 20 17" aria-hidden="true">' + body + '</svg>';
+}
+function shipSetHouseStage(el, stage) {
+    el.dataset.stage = stage;
+    const houseEl = el.querySelector('.ship-worker-house');
+    if (houseEl) houseEl.outerHTML = shipHouseSvg(stage);
+}
+function shipStartHouseBuild(el, workerId) {
+    const reduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const duration = reduced ? 0 : 1500 + Math.round(Math.random() * 1000);
+    el.dataset.buildDuration = duration;
+    if (!duration) {
+        shipSetHouseStage(el, 6);
+        shipBuiltWorkerIds.add(workerId);
+        return;
+    }
+    shipSetHouseStage(el, 0);
+    const timers = [
+        setTimeout(() => shipSetHouseStage(el, 2), duration * .22),
+        setTimeout(() => shipSetHouseStage(el, 4), duration * .55),
+        setTimeout(() => { shipSetHouseStage(el, 6); shipBuiltWorkerIds.add(workerId); delete shipWorkerBuildTimers[workerId]; }, duration),
+    ];
+    shipWorkerBuildTimers[workerId] = timers;
 }
 function shipWorkerNode(w) {
     const el = document.createElement('div');
     el.className = 'ship-worker';
     el.dataset.workerId = w.id;
-    el.style.setProperty('--bot-delay', shipWorkerDelay(w.id) + 's');
+    const motion = shipWorkerMotion();
+    el.dataset.botMotion = motion.path + '@' + motion.duration;
+    el.dataset.botDirection = motion.direction;
+    el.style.setProperty('--bot-path', motion.path);
+    el.style.setProperty('--bot-duration', motion.duration);
+    el.style.setProperty('--bot-delay', motion.delay);
+    el.style.setProperty('--bot-x', motion.x);
+    el.style.setProperty('--bot-x-neg', motion.xNeg);
+    el.style.setProperty('--bot-x-small', motion.xSmall);
+    el.style.setProperty('--bot-x-neg-small', motion.xNegSmall);
+    el.style.setProperty('--bot-y', motion.y);
+    el.style.setProperty('--bot-y-half', motion.yHalf);
+    el.style.setProperty('--bot-y-high', motion.yHigh);
     el.setAttribute('data-ship-tip', shipWorkerLabel(w));
-    el.innerHTML = shipHouseSvg(w.stage) + '<span class="ship-worker-bot">🤖</span>';
+    el.innerHTML = shipHouseSvg(0) + '<span class="ship-worker-bot">' + shipBotSvg('ship-yard-bot') + shipSparkMarkup() + '</span>';
     return el;
-}
-function shipUpdateWorkerStage(el, stage) {
-    if (Number(el.dataset.stage) === Number(stage)) return;
-    el.dataset.stage = stage;
-    const houseEl = el.querySelector('.ship-worker-house');
-    if (houseEl) houseEl.outerHTML = shipHouseSvg(stage);
 }
 // Anchors #ship-yard under the first (issues->prs) arrow via a bounding-rect
 // read every refresh - cheap, and keeps the yard's own children (the robots)
@@ -7964,8 +8168,10 @@ function renderShipYard(workers, completions) {
         if (currentIds.has(id)) return;
         const el = shipYardEls[id];
         delete shipYardEls[id];
-        const bot = el.querySelector('.ship-worker-bot');
-        if (bot) bot.textContent = '🚧';
+        (shipWorkerBuildTimers[id] || []).forEach(clearTimeout);
+        delete shipWorkerBuildTimers[id];
+        // Keep the completed-by-ID fact even if this node temporarily disappears:
+        // the API refresh is authoritative by worker id, not DOM order.
         el.classList.add('ship-worker-blocked');
         setTimeout(() => el.remove(), 1700);
     });
@@ -7977,8 +8183,11 @@ function renderShipYard(workers, completions) {
             el = shipWorkerNode(w);
             shipYardEls[w.id] = el;
             yard.appendChild(el);
+            if (shipBuiltWorkerIds.has(w.id)) shipSetHouseStage(el, 6);
+            else shipStartHouseBuild(el, w.id);
         }
-        shipUpdateWorkerStage(el, w.stage);
+        // Existing IDs keep their live DOM/build state; refresh order and the
+        // server's elapsed-time stage can never reset a house already built.
     });
     let more = yard.querySelector('.ship-yard-more');
     if (list.length > SHIP_YARD_MAX_VISIBLE) {
@@ -7987,7 +8196,91 @@ function renderShipYard(workers, completions) {
     } else if (more) {
         more.remove();
     }
+    // Departing nodes fade for readability, but never let those transient ghosts
+    // violate SHIP-GAME-2's hard eight-node visual cap.
+    let visible = Array.from(yard.querySelectorAll('.ship-worker'));
+    while (visible.length > SHIP_YARD_MAX_VISIBLE) {
+        const victim = visible.find(node => node.classList.contains('ship-worker-blocked')) || visible[visible.length - 1];
+        victim.remove();
+        visible = visible.filter(node => node !== victim);
+    }
     positionShipYard();
+}
+
+// Diff the per-square PR lists between successful refreshes. Later stages win
+// when a cumulative list contains the same PR (merged-today and deployed-today).
+const SHIP_PR_STAGES = ['green waiting', 'in line', 'merged today', 'last deploy'];
+let shipPrStageRepo = null, shipPrStagePrevious = null;
+const shipPrCarryQueue = [];
+let shipPrCarriesActive = 0;
+function shipPrStageMap(d) {
+    const map = new Map();
+    const put = (items, stage) => (Array.isArray(items) ? items : []).forEach(p => {
+        const n = Number(typeof p === 'object' ? p.number : p);
+        if (Number.isFinite(n)) map.set(n, stage);
+    });
+    put(d.green_waiting_prs || d.green_wait_prs, 0);
+    put(d.queue_prs, 1);
+    put(d.merged_today_prs, 2);
+    put(d.deployed_prs_today_list, 3);
+    return map;
+}
+function shipQueuePrTransitions(d) {
+    const repo = d.repo_full || d.repo || '';
+    const current = shipPrStageMap(d);
+    if (shipPrStageRepo !== repo) {
+        shipPrStageRepo = repo;
+        shipPrStagePrevious = current;
+        shipPrCarryQueue.length = 0;
+        return;
+    }
+    if (shipPrStagePrevious) current.forEach((stage, number) => {
+        const before = shipPrStagePrevious.get(number);
+        if (before !== undefined && stage > before) shipPrCarryQueue.push({number:number, from:before, to:stage});
+    });
+    shipPrStagePrevious = current;
+    shipDrainPrCarries();
+}
+function shipCarryBurst(parent) {
+    const rays = [[-9,-5],[-4,-9],[3,-9],[9,-4],[9,4],[3,9],[-5,8],[-9,3]];
+    const burst = document.createElement('span');
+    burst.className = 'ship-carry-sparks';
+    burst.innerHTML = rays.map(p => '<i style="--cx:' + p[0] + 'px;--cy:' + p[1] + 'px"></i>').join('');
+    parent.appendChild(burst);
+    setTimeout(() => burst.remove(), 500);
+}
+function shipDrainPrCarries() {
+    const reduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (reduced) { shipPrCarryQueue.length = 0; return; }
+    while (shipPrCarriesActive < 3 && shipPrCarryQueue.length) shipRunPrCarry(shipPrCarryQueue.shift());
+}
+function shipRunPrCarry(job) {
+    const layer = document.getElementById('ship-carry-layer');
+    const wrap = layer && layer.parentElement;
+    const from = document.querySelector('.ship-stage[data-square="' + SHIP_PR_STAGES[job.from] + '"]');
+    const to = document.querySelector('.ship-stage[data-square="' + SHIP_PR_STAGES[job.to] + '"]');
+    if (!layer || !wrap || !from || !to) { setTimeout(shipDrainPrCarries, 0); return; }
+    shipPrCarriesActive++;
+    const wr = wrap.getBoundingClientRect(), a = from.getBoundingClientRect(), b = to.getBoundingClientRect();
+    const start = {x:a.left - wr.left + a.width / 2, y:a.top - wr.top + a.height / 2};
+    const end = {x:b.left - wr.left + b.width / 2, y:b.top - wr.top + b.height / 2};
+    const carry = document.createElement('span');
+    carry.className = 'ship-pr-carry';
+    carry.style.left = start.x + 'px'; carry.style.top = start.y + 'px';
+    carry.innerHTML = shipBotSvg('ship-carry-bot') + '<b class="ship-pr-chip">#' + job.number + '</b>';
+    layer.appendChild(carry);
+    const ms = Math.max(650, Math.min(1500, Math.hypot(end.x-start.x,end.y-start.y) * 3));
+    carry.animate([{left:start.x+'px',top:start.y+'px'},{left:end.x+'px',top:end.y+'px'}],
+        {duration:ms,easing:'cubic-bezier(.2,.8,.25,1)',fill:'forwards'}).finished.then(() => {
+        carry.style.left = end.x + 'px'; carry.style.top = end.y + 'px';
+        const chip = carry.querySelector('.ship-pr-chip');
+        if (chip) chip.remove();
+        shipCarryBurst(carry);
+        return carry.animate([{left:end.x+'px',top:end.y+'px'},{left:start.x+'px',top:start.y+'px'}],
+            {duration:Math.max(500,ms*.72),easing:'cubic-bezier(.45,0,.75,.3)',fill:'forwards'}).finished;
+    }).catch(() => {}).finally(() => {
+        carry.remove(); shipPrCarriesActive--; shipDrainPrCarries();
+    });
 }
 
 function mergedRateClass(count) {
@@ -8181,6 +8474,15 @@ function refreshShipFlow() {
             deployStateSub = 'up to date';
             deployStateCls = 'merge-green';
         }
+        // SHIP-GAME-3: exactly two small Central-time lines under the PR count.
+        // A held/paused cadence is a state, not a misleading future timestamp.
+        const fmtCTLine = iso => new Date(iso).toLocaleTimeString('en-US',
+            {hour:'numeric',minute:'2-digit',hour12:true,timeZone:'America/Chicago'}) + ' CT';
+        const deployLastLine = noDeploy ? deployStateSub
+            : 'last deploy ' + (d.last_deploy_at ? fmtCTLine(d.last_deploy_at) : '?');
+        const deployNextLine = noDeploy ? '' : 'next ' +
+            ((d.deploy_state === 'held' || d.deploy_state === 'paused') ? 'held'
+                : (d.deploy_next_tick_at ? fmtCTLine(d.deploy_next_tick_at) : '?'));
         const sp = d.spark12h || {};
         // SHIP-PIPES: arrows carry rate/backlog/drain from the server; the
         // bottleneck is whichever arrow drains its backlog slowest - a MEASURED
@@ -8211,13 +8513,14 @@ function refreshShipFlow() {
         const wFor = key => shipPipeWidth(arrowByKey[key] && arrowByKey[key].rate_per_hour, maxRate);
         const isB = key => key === bottleneckKey;
         el.innerHTML =
-            shipStage(d.issues_open, 'issues open', '', '', null, HELP.issues, '', null, null, null, shipHistorySpark(sp.issues, 'issues')) + shipArrow('issues open', '🤖', arrowByKey['issues-prs'], 'PRs opened in the last hour, from GitHub search - click for live agent lanes', (shipAgents || []).filter(a => a.live && a.square === 'issues open').length, wFor('issues-prs'), isB('issues-prs'), arrowByKey['issues-prs'] && arrowByKey['issues-prs'].label, arrowByKey['issues-prs'] && arrowByKey['issues-prs'].drain_label) +
+            shipStage(d.issues_open, 'issues open', '', '', null, HELP.issues, '', null, null, null, shipIssuesRatePanel(sp.issues), null, arrowByKey['issues-prs'] && arrowByKey['issues-prs'].drain_label) + shipArrow('issues open', '🤖', arrowByKey['issues-prs'], 'PRs opened in the last hour, from GitHub search - click for live agent lanes', null, wFor('issues-prs'), isB('issues-prs'), arrowByKey['issues-prs'] && arrowByKey['issues-prs'].label, null) +
             shipStage(d.prs_open, 'prs open', '', prsOld.sub, null, HELP.prs + shipOldestWords('prs open', 'age of the oldest open, non-draft pull request'), prsOld.cls, null, null, null, shipHistorySpark(sp.prs, 'prs')) + shipArrow('prs open', '⚙', arrowByKey['prs-ci'], 'Distinct PRs with a CI run started this hour, from the GitHub workflow-runs list', d.ci_queued, wFor('prs-ci'), isB('prs-ci')) +
             shipStage(ciNum, 'ci q/run', ciCls, ciOld.sub, null, HELP.ciqr + shipOldestWords('ci q/run', 'how long the oldest queued run in the last 48 h has waited to start (since it was re-queued, if it was re-run)'), ciOld.cls, null, null, null, shipHistorySpark(sp.ci, 'ci')) + shipArrow('ci q/run', '⚙', arrowByKey['ci-green'], 'Distinct PRs with a green Pre-Merge Gate run this hour (workflow 255384592)', d.ci_running, wFor('ci-green'), isB('ci-green')) +
             shipStage(d.green_waiting, 'green waiting', greenCls, greenSub, null, HELP.greenWaiting + shipOldestWords('green waiting', 'how long the oldest green-eligible pull request has waited since its last activity') + greenWaitWords, greenOld.cls, 'green-waiting', d.green_waiting_prs, null, shipHistorySpark(sp.green, 'green'), greenWaitSub) + shipArrow('green waiting', '⚡', arrowByKey['green-inline'], 'Green eligible PRs not yet enqueued', d.green_waiting, wFor('green-inline'), isB('green-inline')) +
             shipStage(queueNum, 'in line', queueCls, queueSub, null, queueHelp, queueOld.cls, 'in-line', d.queue_prs, 'in queue', shipHistorySpark(sp.queue, 'queue')) + shipArrow('in line', '⚡', arrowByKey['inline-merged'], 'Merge queue entries', d.queue_depth, wFor('inline-merged'), isB('inline-merged')) +
             shipStage(d.merged_today, 'merged today', 'ok', mergedSub, d.merged_spark, HELP.merged + shipOldestWords('merged today', 'minutes since the last merge'), mergedStage, 'merged-today', d.merged_today_prs, null, shipHistorySpark(sp.merged, 'merged')) + shipArrow('merged today', '⚡', arrowByKey['merged-deploy'], 'Production deploy workflows in flight, or merge awaiting deploy', shipDeployCount(d), wFor('merged-deploy'), isB('merged-deploy')) +
-            shipStage(noDeploy ? 'n/a' : d.deploys_today, 'last deploy', 'ok', deployStateSub, null, (noDeploy ? 'no deploy workflow on ' + (d.repo_name || d.repo_full || 'this repo') : HELP.lastdep + shipOldestWords('last deploy', 'minutes since the last deploy, counted only while main has commits newer than it') + deployWords), deployStateCls, 'last-deploy', null, 'deployed today', shipHistorySpark(sp.deploy, 'deploy'));
+            shipStage(noDeploy ? 'n/a' : (d.deployed_prs_today === null || d.deployed_prs_today === undefined ? '?' : d.deployed_prs_today), 'last deploy', 'ok', deployLastLine, null, (noDeploy ? 'no deploy workflow on ' + (d.repo_name || d.repo_full || 'this repo') : HELP.lastdep + shipOldestWords('last deploy', 'minutes since the last deploy, counted only while main has commits newer than it') + deployWords), deployStateCls, 'last-deploy', (d.deployed_prs_today_list || []).map(n => ({number:n,title:'deployed'})), 'deployed today', shipHistorySpark(sp.deploy, 'deploy'), deployNextLine);
+        shipQueuePrTransitions(d);
         // SHIP-GAME items 2/5: the first arrow (and its bounding rect) just got
         // rebuilt above - reposition the persistent yard against the new one.
         positionShipYard();
@@ -9167,29 +9470,67 @@ function setRange(range) {
     refreshHistory();
 }
 
+// SHIP-GAME-4 (Ben, 4:53 PM CDT 2026-09-05: "Change all the historical metrics
+// that are further down the page in to spark lines not bar charts"): the
+// Historical Metrics boxes were CSS bar strips (one div per sample, up to 60 bars,
+// yellow above 70% of scale, red above 90%). They now draw the CI/CD row's
+// shipHistorySpark polyline instead - same /api/history data, same range
+// buttons and refresh path, same 70%/90% colour rule (the complete line takes
+// the current sample's state colour, matching the number on its right),
+// one hover column per sample, and the current value as a number on the right,
+// the read the issues-closed/hour panel already uses. Titles and the average stay.
+const HISTORY_RANGE_WORDS = {hour: 'last hour', day: 'last 24 hours', week: 'last week', month: 'last month'};
+function historyPointEpoch(ts) {
+    // /api/history timestamps are zone-less server time (UTC on gandalf).
+    const s = String(ts || '');
+    const ms = Date.parse(/([zZ]|[+-]\\d\\d:?\\d\\d)$/.test(s) ? s : s + 'Z');
+    return Number.isFinite(ms) ? ms / 1000 : null;
+}
+function historySparkTip(range) {
+    const fmt = range === 'hour'
+        ? {hour: 'numeric', minute: '2-digit', timeZone: 'America/Chicago'}
+        : {month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZone: 'America/Chicago'};
+    return p => {
+        if (p.v === null || p.v === undefined || !Number.isFinite(Number(p.v))) return 'no sample';
+        const when = p.t === null ? '' : new Date(p.t * 1000).toLocaleString('en-US', fmt) + ' CT · ';
+        return when + Number(p.v).toFixed(1);
+    };
+}
 function renderSparkline(data, key, max, label) {
     if (!data || data.length === 0) return '';
 
-    const values = data.map(d => d[key]).filter(v => v !== null);
+    const isNum = v => v !== null && v !== undefined && Number.isFinite(Number(v));
+    const values = data.map(d => d[key]).filter(isNum).map(Number);
     if (values.length === 0) return '';
 
     const actualMax = max || Math.max(...values, 1);
     const current = values[values.length - 1];
     const avg = values.reduce((a, b) => a + b, 0) / values.length;
+    const clsOf = v => v > actualMax * 0.9 ? 'red' : v > actualMax * 0.7 ? 'yellow' : 'green';  // 90% red, 70% yellow - the bars' rule
 
-    let bars = '';
-    const barCount = Math.min(60, data.length);
-    const step = Math.max(1, Math.floor(data.length / barCount));
-
+    // One column per available sample; the API already buckets (<=60/hour,
+    // 24/day, ~28/week, 30/month), and the step only guards a future denser
+    // feed. Omit null buckets rather than turning them into fake zeroes. Keeping
+    // all available values in one series avoids a lone unavailable host sample
+    // making the rest of an otherwise healthy week/month line look truncated.
+    const step = Math.max(1, Math.ceil(data.length / 288));
+    const samples = [];
     for (let i = 0; i < data.length; i += step) {
-        const v = data[i][key];
-        if (v === null) continue;
-        const height = Math.max(2, (v / actualMax) * 40);
-        const cls = v > actualMax * 0.9 ? 'critical' : v > actualMax * 0.7 ? 'high' : '';  // 90% red, 70% yellow
-        bars += '<div class="sparkline-bar ' + cls + '" style="height:' + height + 'px" title="' + v + '"></div>';
+        const raw = data[i][key];
+        if (!isNum(raw)) continue;
+        // Keep one colour across this series. Per-sample state colours
+        // split volatile metrics into dozens of two-point polylines; although the
+        // pieces were numerically complete, they read as truncated line stubs.
+        samples.push({t: historyPointEpoch(data[i].timestamp), v: Number(raw), cls: clsOf(current)});
     }
-
-    return '<div class="sparkline-box"><div class="sparkline-label">' + label + ' (now: ' + (current !== undefined ? current.toFixed(1) : '--') + ', avg: ' + avg.toFixed(1) + ')</div><div class="sparkline">' + bars + '</div></div>';
+    const rangeWords = HISTORY_RANGE_WORDS[currentRange] || currentRange;
+    const spark = shipHistorySpark(samples, 'history-' + key, {
+        slots: samples.length, max: actualMax, height: 45,
+        label: label + ', ' + rangeWords, tip: historySparkTip(currentRange)
+    });
+    return '<div class="sparkline-box"><div class="sparkline-label">' + label + ' (avg: ' + avg.toFixed(1) + ')</div>'
+        + '<div class="sparkline-row">' + spark
+        + '<span class="sparkline-now ' + clsOf(current) + '" title="now: ' + current.toFixed(1) + '" aria-label="Current ' + shipEscape(label) + '">' + current.toFixed(1) + '</span></div></div>';
 }
 
 function refreshHistory() {
