@@ -46,7 +46,7 @@ with sync_playwright() as p:
     errors=[]
     page.on('pageerror',lambda e:errors.append(str(e)))
     page.set_content('<style>'+styles+'</style>'+body)
-    page.evaluate('(d)=>{window.data=d;window.fetch=async(url)=>({ok:true,json:async()=>window.data[url]});}', {'/api/agents':agents,'/api/pipeline':pipeline,'/api/runson':aws,'/api/local_runners':live_local})
+    page.evaluate('(d)=>{window.data=d;window.fetch=async(url)=>({ok:true,json:async()=>window.data[String(url).split("?")[0]]});}', {'/api/agents':agents,'/api/pipeline':pipeline,'/api/runson':aws,'/api/local_runners':live_local})
     page.add_script_tag(content=help_text+'\n'+ship+'\n'+runson)
     page.evaluate('async()=>{await refreshShipFlow();refreshRunsOn();await refreshLocalRunners();}')
     assert page.locator('.ship-cap').all_text_contents() == ['issues open','prs open','ci q/run','green waiting','in line','merged today','last deploy (CT)']

@@ -69,6 +69,42 @@ class AgentsTest(unittest.TestCase):
             self.assertEqual(response.status_code, 503)
             self.assertIn('error', response.get_json())
 
+    def test_repo_selection_scopes_agents_and_yard_workers(self):
+        repos = ('armbrain-io/armbrain', 'armbrain-io/fleet-planning')
+        rows = [
+            dict(window=f'WORK-shepherd-{number}', session='workers', kind='shepherd',
+                 live=True, square='prs open', host='gandalf', started_at=None,
+                 target=dict(repo=repo, pr=number, number=number))
+            for number, repo in enumerate(repos, start=41)
+        ]
+        client = q.app.test_client()
+        known = [dict(name=repo.rsplit('/', 1)[1], full_name=repo, default_branch='main')
+                 for repo in repos]
+        q._ship_worker_state.clear()
+        q._ship_completions.clear()
+        with patch.dict(q.agents_cache, data=None, ts=0), \
+                patch.object(q, '_agent_windows', return_value=rows), \
+                patch.object(q, '_map_agents', side_effect=lambda agents: agents), \
+                patch.object(q, '_get_repo_list', return_value=known), \
+                patch.object(q, 'get_pipeline_status_fast', return_value={'available': True}), \
+                patch.object(q, 'get_ci_queue_status_fast', return_value={'available': False}), \
+                patch.object(q, '_get_arrow_rates_fast', return_value={}), \
+                patch.object(q, '_build_ship_arrows', return_value=[]), \
+                patch.object(q, '_get_ship_spark12h', return_value={}):
+            for selected, expected_window in zip(('armbrain', 'fleet-planning'),
+                                                 ('WORK-shepherd-41', 'WORK-shepherd-42')):
+                response = client.get(f'/api/agents?repo={selected}')
+                self.assertEqual(response.status_code, 200)
+                agents = response.get_json()
+                workers, _ = q._build_ship_workers_and_completions(
+                    agents, repo=f'armbrain-io/{selected}')
+                self.assertEqual([agent['window'] for agent in agents], [expected_window])
+                self.assertEqual([worker['window'] for worker in workers], [expected_window])
+                yard = client.get(f'/api/pipeline?repo={selected}').get_json()
+                self.assertEqual([worker['window'] for worker in yard['workers']],
+                                 [expected_window])
+            self.assertEqual(client.get('/api/agents?repo=not-tracked').status_code, 404)
+
 
 if __name__ == '__main__':
     unittest.main()

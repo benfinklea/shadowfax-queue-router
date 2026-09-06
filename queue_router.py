@@ -4350,20 +4350,31 @@ def _map_agents(rows):
     return rows
 
 
-def get_agents(force_refresh=False):
+def get_agents(force_refresh=False, repo=None):
     with agents_cache_lock:
         if not force_refresh and agents_cache['data'] is not None and time.monotonic() - agents_cache['ts'] < AGENTS_CACHE_TTL:
-            return agents_cache['data']
-        rows = _map_agents(_agent_windows())
-        agents_cache.update(data=rows, ts=time.monotonic())
+            rows = agents_cache['data']
+        else:
+            rows = _map_agents(_agent_windows())
+            agents_cache.update(data=rows, ts=time.monotonic())
+    if repo is None:
         return rows
+    full_repo = _repo_full_name(repo)
+    return [row for row in rows if (row.get('target') or {}).get('repo') == full_repo]
 
 
 @app.route('/api/agents', methods=['GET'])
 def api_agents():
+    repo_param = request.args.get('repo')
+    repo = None
+    if repo_param:
+        known = _get_repo_list()
+        repo = _repo_full_name(repo_param)
+        if not any(r['full_name'] == repo for r in known):
+            return jsonify({'error': f"unknown repo '{repo_param}'"}), 404
     fresh, disposition = _fresh_bypass('agents')
     try:
-        return _fresh_jsonify(get_agents(fresh), disposition, 'agents')
+        return _fresh_jsonify(get_agents(fresh, repo=repo), disposition, 'agents')
     except Exception:
         logger.exception('Could not establish live tmux agents')
         return _fresh_jsonify({'error': 'Could not establish live tmux agents'}, disposition, 'agents'), 503
@@ -4385,8 +4396,8 @@ def api_agents():
 SHIP_WORKER_NOMINAL_MIN = 60.0
 SHIP_WORKER_STAGES = 6
 SHIP_COMPLETIONS_WINDOW_S = 15 * 60
-_ship_worker_state = {}   # worker id (tmux window name) -> last-seen info
-_ship_completions = []    # [{id, pr, at}], pruned to the last 15 minutes
+_ship_worker_state = {}   # repo -> {worker id (tmux window name) -> last-seen info}
+_ship_completions = []    # [{id, pr, at, repo}], pruned to the last 15 minutes
 _ship_worker_lock = threading.Lock()
 
 
@@ -4394,9 +4405,10 @@ def _ship_worker_running(agent):
     return bool(agent.get('live')) and agent.get('square') and agent['square'] != 'fleet'
 
 
-def _build_ship_workers_and_completions(agents):
+def _build_ship_workers_and_completions(agents, repo=None):
     now = time.time()
     now_dt = datetime.now(timezone.utc)
+    scope = repo or '__fleet__'
     current_ids = set()
     workers = []
     live_window_counts = {}
@@ -4404,6 +4416,7 @@ def _build_ship_workers_and_completions(agents):
         if _ship_worker_running(agent):
             live_window_counts[agent['window']] = live_window_counts.get(agent['window'], 0) + 1
     with _ship_worker_lock:
+        scoped_state = _ship_worker_state.setdefault(scope, {})
         for agent in agents:
             if not _ship_worker_running(agent):
                 continue
@@ -4428,7 +4441,7 @@ def _build_ship_workers_and_completions(agents):
             else:
                 bucket_min = SHIP_WORKER_NOMINAL_MIN / SHIP_WORKER_STAGES
                 stage = min(SHIP_WORKER_STAGES, int(elapsed_min // bucket_min) + 1)
-            _ship_worker_state[wid] = {'issue': issue, 'pr': pr, 'last_seen': now}
+            scoped_state[wid] = {'issue': issue, 'pr': pr, 'last_seen': now}
             workers.append({
                 'id': wid,
                 'host': host,
@@ -4441,15 +4454,17 @@ def _build_ship_workers_and_completions(agents):
                 'status': 'building',
             })
 
-        gone = [wid for wid in _ship_worker_state if wid not in current_ids]
+        gone = [wid for wid in scoped_state if wid not in current_ids]
         for wid in gone:
-            info = _ship_worker_state.pop(wid)
+            info = scoped_state.pop(wid)
             if info.get('pr'):
-                _ship_completions.append({'id': wid, 'pr': info['pr'], 'at': now_dt.isoformat()})
+                _ship_completions.append({'id': wid, 'pr': info['pr'], 'at': now_dt.isoformat(),
+                                          'repo': scope})
         cutoff = now - SHIP_COMPLETIONS_WINDOW_S
         _ship_completions[:] = [c for c in _ship_completions
                                  if _iso_epoch(c['at']) is not None and _iso_epoch(c['at']) > cutoff]
-    return workers, list(_ship_completions)
+    return workers, [completion for completion in _ship_completions
+                     if completion.get('repo', '__fleet__') == scope]
 
 
 def _iso_epoch(iso_str):
@@ -6109,11 +6124,11 @@ def api_pipeline():
     # round-trip back into ?repo= / localStorage without knowing the org.
     result["repo_full"] = repo
     result["repo_name"] = repo.split("/")[-1]
-    # SHIP-GAME items 2/7: one robot per running worker (live issue/PR lane) -
-    # fleet-wide, not scoped to whichever repo the CI/CD row is currently
-    # showing (a live lane is a live lane regardless of which row is on screen).
+    # SHIP-GAME items 2/7: one robot per running worker (live issue/PR lane),
+    # scoped to the same selected repo as the rest of the CI/CD row.
     try:
-        result["workers"], result["completions"] = _build_ship_workers_and_completions(get_agents())
+        result["workers"], result["completions"] = _build_ship_workers_and_completions(
+            get_agents(repo=repo), repo=repo)
     except Exception:
         logger.exception("SHIP-GAME could not establish live workers for the yard strip")
         result["workers"], result["completions"] = [], []
@@ -8070,7 +8085,7 @@ function refreshShipFlow() {
     const requestedRepo = shipCurrentRepo;
     return Promise.all([
         fetch(shipRepoUrl('/api/pipeline')).then(r => r.json()),
-        fetch('/api/agents').then(r => { if (!r.ok) throw new Error('agents unavailable'); return r.json(); }).catch(() => null)
+        fetch(shipRepoUrl('/api/agents')).then(r => { if (!r.ok) throw new Error('agents unavailable'); return r.json(); }).catch(() => null)
     ]).then(([d, agents]) => {
         if (requestedRepo !== shipCurrentRepo) return;  // stale - a newer switch has already superseded this
         shipAgents = Array.isArray(agents) ? agents : null;
