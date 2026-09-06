@@ -102,10 +102,16 @@ with sync_playwright() as p:
     errors = []
     page.on('pageerror', lambda error: errors.append(str(error)))
     page.set_content('<style>' + styles + '</style><div id="capture"><div id="ship-flow" class="ship-flow"></div><div id="ship-fleet" class="ship-fleet"></div></div>')
-    page.evaluate('''(data) => {window.pipeline=data.pipeline; window.agents=data.agents;
-      window.fetch=async(url)=>({ok:true,json:async()=>url.startsWith('/api/agents')?window.agents:window.pipeline});}''', dict(pipeline=pipeline, agents=agents))
+    page.evaluate('''(data) => {window.pipeline=data.pipeline; window.agents=data.agents; window.shipFetchUrls=[];
+      window.fetch=async(url)=>{window.shipFetchUrls.push(String(url));return {ok:true,json:async()=>url.startsWith('/api/agents')?window.agents:window.pipeline};};}''', dict(pipeline=pipeline, agents=agents))
     page.add_script_tag(content=help_text + '\n' + renderer)
+    page.evaluate("shipCurrentRepo='armbrain'")
     page.evaluate('refreshShipFlow()')
+    assert page.evaluate('shipFetchUrls.includes("/api/agents?repo=armbrain")')
+    page.evaluate("shipCurrentRepo='fleet-planning'")
+    page.evaluate('refreshShipFlow()')
+    assert page.evaluate('shipFetchUrls.includes("/api/agents?repo=fleet-planning")')
+    page.evaluate("shipCurrentRepo='armbrain'")
     for stage in page.locator('[data-square]').all():
         square = stage.get_attribute('data-square')
         chip = page.locator('.ship-arrow[data-square-left="' + square + '"]')
@@ -149,5 +155,5 @@ with sync_playwright() as p:
     assert 'could not establish' in page.locator('#ship-fleet').inner_text()
     assert not errors, errors
     browser.close()
-save('truth.json', dict(checked_at=datetime.now(timezone.utc).isoformat(), source='Scratch Flask API on gandalf; live tmux and fresh read-only GitHub queries', live_count=len(api_live), fresh_tmux_live_count=len(live_windows), live_windows=sorted(live_windows), per_square=dict(counts), target_checks=checks, dom='PASS: exact counts, chip toggles, agent section first, safe new-window links, six-square fixtures, zero and unavailable', runtime_errors=errors))
+save('truth.json', dict(checked_at=datetime.now(timezone.utc).isoformat(), source='Scratch Flask API on gandalf; live tmux and fresh read-only GitHub queries', live_count=len(api_live), fresh_tmux_live_count=len(live_windows), live_windows=sorted(live_windows), per_square=dict(counts), target_checks=checks, dom='PASS: repo-scoped agent fetches, exact counts, chip toggles, agent section first, safe new-window links, six-square fixtures, zero and unavailable', runtime_errors=errors))
 print(json.dumps(dict(live=len(api_live), fresh_tmux=len(live_windows), per_square=dict(counts), targets=len(checks), dom='PASS')))
