@@ -25,6 +25,8 @@ import urllib.request
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+# Also support the file-based imports used by independent truth-check tests.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from alert_policy import plan
 
 BASE = os.environ.get("DASHBOARD_URL", "http://127.0.0.1:5000").rstrip("/")
@@ -1018,8 +1020,6 @@ import sys, json, os, tempfile
 sys.path.insert(0, str(sys.argv[1]))
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
-
-from alert_policy import plan
 import queue_router as q
 fd, path = tempfile.mkstemp(prefix='runson-truth-', suffix='.db'); os.close(fd)
 try:
