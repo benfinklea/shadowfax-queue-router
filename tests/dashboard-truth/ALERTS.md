@@ -3,7 +3,7 @@
 Cron failures are keyed by the canonical JSON of signal, dashboard value and
 instrument value. A new payload pages immediately at urgent. Identical failures
 page at observations 1, 6, 12, ... during their first 24 hours, then at most once
-per 24 hours since the last successful delivery. Recovery rearms the check.
+per 24 hours since the last successful delivery. An explicit PASS rearms the check; WARN or missing results retain its incident.
 A changed payload never inherits another payload's backoff or ownership.
 Interactive runs record results but do not change cron notification state.
 
@@ -39,3 +39,8 @@ Validation (no live sensors or notifications):
 python3 -m unittest discover -s tests/dashboard-truth -p test_alert_policy.py -v
 python3 tests/dashboard-truth/mutate-alert-policy.py
 ```
+
+Due failures are batched into at most one inbox message per priority and one
+council notification per run, retaining every due signal in the message body.
+The credits-failure-fixture.json payload was captured from the live last-run.json
+on 2026-09-07; its exact fingerprint is tested against the default disposition.

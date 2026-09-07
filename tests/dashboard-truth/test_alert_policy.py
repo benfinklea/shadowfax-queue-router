@@ -20,6 +20,7 @@ class AlertTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.state = Path(self.temp.name)
         self.calls = []
+        self.real_run = suite.run
         self.now = 100000
         self.rc = 0
         for name, value in (("STATE", self.state), ("CRON", True), ("run", self.send)):
@@ -38,7 +39,7 @@ class AlertTests(unittest.TestCase):
 
     def tick(self, failures=None):
         suite.results = [self.failure] if failures is None else failures
-        self.assertEqual(suite.finish(), int(bool(suite.results)))
+        self.assertEqual(suite.finish(), int(any(r["level"] == "FAIL" for r in suite.results)))
         self.now += 60
 
     def pages(self):
@@ -100,7 +101,7 @@ class AlertTests(unittest.TestCase):
             self.tick([])
         self.tick()
         self.assertEqual(len(self.pages()), 1, "manual run must not reset cron state")
-        self.tick([])
+        self.tick([dict(self.failure, level="PASS")])
         self.tick()
         self.assertEqual(len(self.pages()), 2, "recovered incident must rearm")
 
@@ -125,6 +126,35 @@ class AlertTests(unittest.TestCase):
             self.tick()
         self.assertEqual(len(self.pages()), 1, "corrupt state must not hide novel failure")
         self.assertEqual(self.pages()[0][4], "urgent")
+
+    def test_unknown_or_missing_verdict_does_not_rearm(self):
+        self.tick()
+        self.tick([dict(self.failure, level="WARN"), dict(FAILURE, level="PASS")])
+        self.tick([])
+        self.tick()
+        self.assertEqual(len(self.pages()), 1)
+
+    def test_widespread_outage_batches_without_hiding_new_signals(self):
+        failures = [dict(self.failure, signal=f"outage.{i}") for i in range(50)]
+        self.tick(failures)
+        self.assertEqual(len(self.pages()), 1)
+        self.assertEqual(len(self.calls), 2, "one inbox batch and one council notification")
+        for failure in failures:
+            self.assertIn(failure["signal"], self.pages()[0][-1])
+        self.tick(failures)
+        self.assertEqual(len(self.pages()), 1)
+
+    def test_recorded_credits_denial_matches_owned_disposition(self):
+        recorded = json.loads(Path(__file__).with_name("credits-failure-fixture.json").read_text())
+        self.tick([recorded])
+        self.assertEqual(self.pages()[0][4], "routine")
+        self.assertIn("Cirdan", self.pages()[0][-1])
+
+    def test_real_transport_contract_returns_nonzero_without_raising(self):
+        # The production helper uses subprocess.run without check=True.
+        with patch.object(suite, "run", self.real_run):
+            sent = suite.run(["python3", "-c", "raise SystemExit(7)"])
+        self.assertEqual(sent.returncode, 7)
 
     def test_canonical_order_and_incomplete_ownership(self):
         (self.state / "dispositions.json").write_text(json.dumps({fingerprint(self.failure): {"owner": "Cirdan"}}))

@@ -17,7 +17,7 @@ mutants = [
 for name, before, after, test, assertion in mutants:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
-        for filename in ("alert_policy.py", "truth_suite.py", "test_alert_policy.py", "dispositions.json"):
+        for filename in ("alert_policy.py", "truth_suite.py", "test_alert_policy.py", "dispositions.json", "credits-failure-fixture.json"):
             shutil.copy(source / filename, root / filename)
         policy = root / "alert_policy.py"
         text = policy.read_text()

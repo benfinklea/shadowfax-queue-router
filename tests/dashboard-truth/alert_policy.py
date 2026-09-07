@@ -11,13 +11,18 @@ def fingerprint(failure):
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def plan(failures, prior, dispositions, now):
+def plan(failures, prior, dispositions, now, passed_signals=()):
     """Return current incidents and due pages. Only successful delivery advances last_page."""
-    current, pages = {}, []
+    evaluated = set(passed_signals) | {failure["signal"] for failure in failures}
+    current = {key: value for key, value in prior.items()
+               if isinstance(value, dict) and value.get("signal") not in evaluated}
+    pages = []
+    seen = set()
     for failure in failures:
         key = fingerprint(failure)
-        if key in current:
+        if key in seen:
             continue
+        seen.add(key)
         old = prior.get(key, {})
         if not isinstance(old, dict) or not (
             isinstance(old.get("count"), int) and old["count"] > 0
@@ -28,7 +33,7 @@ def plan(failures, prior, dispositions, now):
             old = {}
         count = old.get("count", 0) + 1
         first = old.get("first_seen", now)
-        incident = {"count": count, "first_seen": first, "last_page": old.get("last_page")}
+        incident = {"signal": failure["signal"], "count": count, "first_seen": first, "last_page": old.get("last_page")}
         current[key] = incident
         disposition = dispositions.get(key, {})
         if not isinstance(disposition, dict):
