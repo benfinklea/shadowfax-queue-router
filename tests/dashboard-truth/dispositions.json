@@ -1,0 +1,7 @@
+{
+  "461de2b8f7fb39f47716d25eeecb5d897ffb8eb887a6258170a80f5fc64bf0b7": {
+    "owner": "Cirdan",
+    "issue": "https://github.com/armbrain-io/fleet-planning/issues/611",
+    "note": "Scoped freetier get-account-plan-state credential denial and expected-value labeling defect. Cirdan owns permission repair and precise test-result labeling; runners execute and pass. Diagnosis recorded in fp#611."
+  }
+}
