@@ -1,0 +1,12 @@
+{
+  "dashboard": {
+    "credits_error": "access_denied",
+    "credits_remaining": null
+  },
+  "detail": "credits read failing (access_denied); credits_remaining is null because of this, not because there is no data",
+  "instrument": {
+    "credits_error": null
+  },
+  "level": "FAIL",
+  "signal": "runson.credits_read"
+}
