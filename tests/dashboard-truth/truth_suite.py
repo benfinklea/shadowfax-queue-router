@@ -7,7 +7,7 @@ import concurrent.futures
 import datetime as dt
 import ast
 import textwrap
-import hashlib
+import fcntl
 import inspect
 import html
 import json
@@ -24,6 +24,10 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+# Also support the file-based imports used by independent truth-check tests.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from alert_policy import plan
 
 BASE = os.environ.get("DASHBOARD_URL", "http://127.0.0.1:5000").rstrip("/")
 ROOT = Path(__file__).resolve().parents[2]
@@ -1066,22 +1070,67 @@ finally:
         )
 
 
-def notify_cron(failures: list[dict], signature: str) -> None:
-    track_path = STATE / "consecutive.json"
-    try:
-        prior = json.loads(track_path.read_text())
-    except Exception:
-        prior = {}
-    count = int(prior.get("count", 0)) + 1 if prior.get("signature") == signature else 1
-    track_path.write_text(json.dumps({"signature": signature, "count": count,
-                                      "updated_at": dt.datetime.now(dt.timezone.utc).isoformat()}, indent=2) + "\n")
-    lines = [f"{x['level']} {x['signal']} dashboard={x['dashboard']} instrument={x['instrument']}" for x in failures]
-    body = "DASH-TRUTH hourly failure\n" + "\n".join(lines[:20])
-    priority = "urgent" if count >= 2 else "routine"
-    env = dict(os.environ, FLEET_SEAT="dash-truth")
-    run(["/workspace/planning/scripts/fleet-msg", "send", "elrond", "--priority", priority, "--body", body], timeout=15, env=env)
-    if count >= 2:
-        run(["/home/ben/bin/council-notify", f"DASH-TRUTH repeated failure ({count}x): {', '.join(x['signal'] for x in failures[:4])}"], timeout=15)
+def notify_cron(failures: list[dict], passed_signals=()) -> None:
+    # Serialize cron/manual overlap across read, delivery and atomic state update.
+    with (STATE / "alerts.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        track_path = STATE / "alerts.json"
+        try:
+            prior = json.loads(track_path.read_text())
+            if not isinstance(prior, dict):
+                prior = {}
+        except (OSError, ValueError):
+            prior = {}
+        dispositions = {}
+        for path in (Path(__file__).with_name("dispositions.json"), STATE / "dispositions.json"):
+            try:
+                values = json.loads(path.read_text())
+                if not isinstance(values, dict):
+                    raise ValueError("expected fingerprint-to-disposition object")
+                dispositions.update(values)
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError) as exc:
+                print(f"DASH-TRUTH cannot read dispositions {path}: {exc}", file=sys.stderr)
+        now = time.time()
+        current, pages = plan(failures, prior, dispositions, now, passed_signals)
+        env = dict(os.environ, FLEET_SEAT="dash-truth")
+        # At most one inbox message per priority and one council notification,
+        # even when a dashboard outage makes every check fail simultaneously.
+        for priority in ("routine", "urgent"):
+            batch = [page for page in pages if page[2] == priority]
+            if not batch:
+                continue
+            sections = []
+            for key, failure, _, disposition in batch:
+                section = (f"FAIL {failure['signal']} dashboard={failure['dashboard']} instrument={failure['instrument']}\n"
+                           f"Fingerprint: {key} ({current[key]['count']} observations)")
+                if disposition:
+                    section += (f"\nOwner: {disposition.get('owner', '')}"
+                                f"\nTracking issue: {disposition.get('issue', '')}"
+                                f"\nPrior ack: {disposition.get('note', '')}")
+                sections.append(section)
+            body = "DASH-TRUTH failures\n" + "\n\n".join(sections)
+            try:
+                sent = run(["/workspace/planning/scripts/fleet-msg", "send", "elrond",
+                            "--priority", priority, "--body", body], timeout=15, env=env)
+                if sent.returncode != 0:
+                    continue
+                for key, _, _, _ in batch:
+                    current[key]["last_page"] = now
+                if priority == "urgent":
+                    run(["/home/ben/bin/council-notify",
+                         f"DASH-TRUTH: {len(batch)} new/due failures: " +
+                         ", ".join(page[1]['signal'] for page in batch[:4])], timeout=15)
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+        # Keep a due reminder due after transport failure (not six observations later).
+        for key, _, _, _ in pages:
+            if current[key]["last_page"] != now:
+                current[key]["last_page"] = None
+        temp = STATE / f".alerts.{os.getpid()}.json"
+        temp.write_text(json.dumps(current, indent=2) + "\n")
+        temp.replace(track_path)
 
 
 def finish() -> int:
@@ -1096,13 +1145,8 @@ def finish() -> int:
     temp.replace(STATE / "last-run.json")
     with (STATE / "runs.jsonl").open("a") as handle:
         handle.write(json.dumps(payload, separators=(",", ":")) + "\n")
-    if failures:
-        signature = hashlib.sha256("\n".join(sorted(r["signal"] for r in failures)).encode()).hexdigest()
-        if CRON:
-            notify_cron(failures, signature)
-    else:
-        (STATE / "consecutive.json").write_text(json.dumps({"signature": None, "count": 0,
-                                                             "updated_at": payload["generated_at"]}, indent=2) + "\n")
+    if CRON:
+        notify_cron(failures, {r["signal"] for r in results if r["level"] == "PASS"})
     if not CRON:
         print(f"SUMMARY PASS={payload['summary']['pass']} WARN={len(warnings)} FAIL={len(failures)}")
         print(f"JSON {STATE / 'last-run.json'}")
