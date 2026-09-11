@@ -2228,6 +2228,13 @@ def get_ci_queue_status(repo=None, force_refresh=False):
                  result["oldest_queued_run_attempt"]) = _oldest_queued_run(
                     q.json().get("workflow_runs") or [])
 
+                # Last-activity for stage 5 (ci q/run) - most recent run start
+                # among what's already fetched here, no extra call.
+                starts = [run.get("run_started_at") or run.get("created_at")
+                          for run in (q.json().get("workflow_runs") or []) + (ip.json().get("workflow_runs") or [])
+                          if run.get("run_started_at") or run.get("created_at")]
+                result["last_run_started_at"] = max(starts) if starts else None
+
                 # A workflow run may contain many concurrent jobs. Count the jobs
                 # actually running so the dashboard reflects fleet workload.
                 try:
@@ -5459,12 +5466,19 @@ def _build_ship_arrows(result, rates):
         })
     return arrows
 
+REVIEW_ROUTED_LABEL_SUFFIX = "-review"
+GATE_VERDICT_CHECK_NAME = "gate-verdict-check-review"
+
 def _get_shipping_readiness(token, repo=None, default_branch="main"):
     """Read the oldest 100 open PRs and the repo's merge queue together.
     SHIP-SPARK-3 item 4: mergeQueue(branch: default_branch) legitimately returns
     null on a repo with no merge queue configured - that is "n/a", not a failed
     read, so it no longer raises. A TRUNCATED queue (hasNextPage) still raises:
-    that IS a failed read, we cannot establish who's queued from a partial page."""
+    that IS a failed read, we cannot establish who's queued from a partial page.
+
+    Widened --json selection (added createdAt/updatedAt/reviews/statusCheckRollup)
+    so the 15-stage strip's review-routed/in-review/gate-verdict/conflicted/approved
+    squares derive from THIS single call rather than one query per new square."""
     repo = repo or GITHUB_CI_REPO
     env = dict(os.environ, GH_TOKEN=token)
     def gh_json(args):
@@ -5477,7 +5491,8 @@ def _get_shipping_readiness(token, repo=None, default_branch="main"):
 
     prs = gh_json(["pr", "list", "--repo", repo, "--state", "open",
                    "--limit", "100", "--search", "sort:created-asc", "--json",
-                   "number,title,isDraft,reviewDecision,mergeable,mergeStateStatus,labels,updatedAt"])
+                   "number,title,isDraft,reviewDecision,mergeable,mergeStateStatus,labels,updatedAt,"
+                   "createdAt,reviews,statusCheckRollup"])
     owner, name = repo.split("/")
     query = '''query($owner:String!,$name:String!,$branch:String!){
       repository(owner:$owner,name:$name){mergeQueue(branch:$branch){
@@ -5521,8 +5536,62 @@ def _get_shipping_readiness(token, repo=None, default_branch="main"):
     waiting_numbers = {pr["number"] for pr in waiting}
     green_oldest_min = _oldest_minutes(pr.get("updatedAt") for pr in prs if pr["number"] in waiting_numbers)
 
+    # 4th element: the raw open-PR list, so the 15-stage strip's review-routed /
+    # in-review / gate-verdict / conflicted / approved squares derive from THIS
+    # single call rather than one query per new square.
     return waiting, queue_prs, {"queue_oldest_min": queue_oldest_min, "green_oldest_min": green_oldest_min,
-                                "queue_enqueued_at": queue_enqueued_at, "has_merge_queue": has_merge_queue}
+                                "queue_enqueued_at": queue_enqueued_at, "has_merge_queue": has_merge_queue}, prs
+
+
+def _dispatched_stage():
+    """Live lane count + last-spawn timestamp from lane-refill's own loop log.
+    Read the file directly - never shell out to the lane-refill script itself."""
+    path = "/workspace/planning/state/lane-refill/loop.log"
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            block, data = 4096, b""
+            while size > 0 and data.count(b"\n") < 2:
+                step = min(block, size)
+                size -= step
+                f.seek(size)
+                data = f.read(step) + data
+        lines = [l for l in data.decode("utf-8", "replace").splitlines() if l.strip()]
+        if not lines:
+            return None, None
+        last = lines[-1]
+        ts = last.split(" ", 1)[0]
+        m = re.search(r"\blive=(\d+)", last)
+        return (int(m.group(1)) if m else None), ts
+    except Exception:
+        return None, None
+
+
+def _folded_stage():
+    """Commits master is ahead of live (rev-list against local refs — no GitHub
+    call) and the timestamp of the newest status=folded line in runs.log.
+    Deliberately reads runs.log, not cron.log: cron.log carries stderr only and
+    its 'fold: frodo synced' line is a different event (fleet-planning#903)."""
+    ahead = None
+    try:
+        cp = subprocess.run(["git", "-C", "/workspace/planning", "rev-list", "--count",
+                              "origin/live..origin/master"],
+                             capture_output=True, text=True, timeout=10, check=True)
+        ahead = int(cp.stdout.strip())
+    except Exception:
+        ahead = None
+    last_at = None
+    try:
+        with open("/workspace/planning/state/fold-master-into-live/runs.log") as f:
+            for line in f:
+                if "\tstatus=folded\t" in line:
+                    ts = line.split("\t", 1)[0]
+                    if last_at is None or ts > last_at:
+                        last_at = ts
+    except Exception:
+        pass
+    return ahead, last_at
 
 
 def _get_merged_today_prs(headers, today, repo=None):
@@ -5837,7 +5906,7 @@ def get_pipeline_status(repo=None, default_branch=None, force_refresh=False):
     if token:
         try:
             headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
-            result["green_waiting_prs"], result["queue_prs"], ship_oldest = _get_shipping_readiness(
+            result["green_waiting_prs"], result["queue_prs"], ship_oldest, all_open_prs = _get_shipping_readiness(
                 token, repo=repo, default_branch=default_branch)
             result["queue_depth"] = len(result["queue_prs"])
             result["green_waiting"] = len(result["green_waiting_prs"])
@@ -5852,6 +5921,56 @@ def get_pipeline_status(repo=None, default_branch=None, force_refresh=False):
             result.update(ship_oldest)
             queue_enqueued_at = result.pop("queue_enqueued_at", {})  # SHIP-SPARK-2: internal only, not part of the payload
             result["prs_oldest_min"] = _get_prs_oldest_min(headers, repo, force_refresh=force_refresh)
+
+            # ── 15-stage strip: stages 4,6,7,8,9,11 derive from the single PR-list
+            # call above - zero added GitHub calls for six of the nine new squares.
+            # prs_open itself keeps its own search_count below: that count is exact,
+            # where len(all_open_prs) would cap at the 100-PR page fetched above.
+            opened_ats = [p["createdAt"] for p in all_open_prs if p.get("createdAt")]
+            result["prs_open_last_at"] = max(opened_ats) if opened_ats else None
+
+            routed = [p for p in all_open_prs
+                      if any(l["name"].lower().endswith(REVIEW_ROUTED_LABEL_SUFFIX) for l in p.get("labels", []))]
+            result["review_routed"] = len(routed)
+            routed_ats = [p["updatedAt"] for p in routed if p.get("updatedAt")]
+            result["review_routed_last_at"] = max(routed_ats) if routed_ats else None
+
+            in_rev = [p for p in all_open_prs if p.get("reviewDecision") in ("REVIEW_REQUIRED", "CHANGES_REQUESTED")]
+            result["in_review"] = len(in_rev)
+            rev_subs = [rv.get("submittedAt") for p in in_rev for rv in (p.get("reviews") or []) if rv.get("submittedAt")]
+            result["in_review_last_at"] = max(rev_subs) if rev_subs else None
+
+            def _gate_check(p):
+                for c in (p.get("statusCheckRollup") or []):
+                    if c.get("name") == GATE_VERDICT_CHECK_NAME:
+                        return c
+                return None
+            gate_hits = [(p, _gate_check(p)) for p in all_open_prs]
+            gate_hits = [(p, c) for p, c in gate_hits if c and c.get("conclusion") != "SUCCESS"]
+            result["gate_verdicts"] = len(gate_hits)
+            gate_ats = [c.get("completedAt") for _, c in gate_hits if c.get("completedAt")]
+            result["gate_verdicts_last_at"] = max(gate_ats) if gate_ats else None
+
+            conflicted = [p for p in all_open_prs if p.get("mergeable") == "CONFLICTING"]
+            result["conflicted"] = len(conflicted)
+            conf_ats = [p["updatedAt"] for p in conflicted if p.get("updatedAt")]
+            result["conflicted_last_at"] = max(conf_ats) if conf_ats else None
+
+            # No history store of mergeable-state transitions exists - a real
+            # count would require polling snapshots over time. Honest n/a per
+            # spec, not an invented number.
+            result["resolved"] = None
+            result["resolved_last_at"] = None
+            result["resolved_na_reason"] = "no snapshot history of mergeable-state transitions to detect a resolve event"
+
+            approved = [p for p in all_open_prs if p.get("reviewDecision") == "APPROVED"]
+            result["approved"] = len(approved)
+            appr_ats = [rv.get("submittedAt") for p in approved for rv in (p.get("reviews") or [])
+                        if rv.get("state") == "APPROVED" and rv.get("submittedAt")]
+            result["approved_last_at"] = max(appr_ats) if appr_ats else None
+
+            result["dispatched"], result["dispatched_last_at"] = _dispatched_stage()
+            result["folded"], result["folded_last_at"] = _folded_stage()
             # "Today" is CENTRAL TIME (Ben's day), not UTC - counters were resetting at 7pm CT.
             from zoneinfo import ZoneInfo
             from datetime import timedelta
@@ -5870,6 +5989,23 @@ def get_pipeline_status(repo=None, default_branch=None, force_refresh=False):
                 return r.json().get("total_count", 0)
             result["issues_open"] = search_count(f"repo:{repo} type:issue state:open")
             result["prs_open"] = search_count(f"repo:{repo} type:pr state:open")
+            # 15-stage strip: a 24h created-count for "bugs found" plus a
+            # sorted-desc probe for its timestamp. Both are repo-scoped so the
+            # dropdown never serves armbrain's numbers for another repo.
+            bug_cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            result["bugs_found_24h"] = search_count(f"repo:{repo} type:issue created:>={bug_cutoff}")
+            result["last_issue_created_at"] = None
+            try:
+                r = requests.get("https://api.github.com/search/issues",
+                                  params={"q": f"repo:{repo} type:issue",
+                                          "sort": "created", "order": "desc", "per_page": 1},
+                                  headers=headers, timeout=8)
+                if r.ok and r.json().get("items"):
+                    result["last_issue_created_at"] = r.json()["items"][0]["created_at"]
+                elif not r.ok:
+                    github_fetches_ok = False
+            except Exception:
+                pass
             result["merged_today_prs"] = _get_merged_today_prs(headers, today, repo=repo)
             result["merged_today"] = len(result["merged_today_prs"])
             # SHIP-SPARK-2: green-wait Ave: line, its own 300 s cache (see get_green_wait_stats).
@@ -5914,6 +6050,7 @@ def get_pipeline_status(repo=None, default_branch=None, force_refresh=False):
             # number and allowing an exact, bounded-cost GitHub verification.
             # Job/runner detail remains available on /api/ci_queue.
             result["ci_running"] = ci.get("in_progress", 0) if ci.get("available") else None
+            result["ci_last_run_started_at"] = ci.get("last_run_started_at") if ci.get("available") else None
             result["ci_oldest_min"] = ci.get("oldest_queued_min") if ci.get("available") else None  # SHIP-OLDEST
             result["ci_oldest_run_id"] = ci.get("oldest_queued_run_id") if ci.get("available") else None  # SHIP-OLDEST-2
             result["ci_oldest_run_attempt"] = ci.get("oldest_queued_run_attempt") if ci.get("available") else None
@@ -6170,6 +6307,7 @@ def api_pipeline():
         result["ci_oldest_min"] = ci.get("oldest_queued_min")  # SHIP-OLDEST: same snapshot as the counts
         result["ci_oldest_run_id"] = ci.get("oldest_queued_run_id")  # SHIP-OLDEST-2: auditable back to GitHub
         result["ci_oldest_run_attempt"] = ci.get("oldest_queued_run_attempt")
+        result["ci_last_run_started_at"] = ci.get("last_run_started_at")
     rates = _get_arrow_rates_fast(repo=repo, force_refresh=force_refresh)
     result["arrows"] = _build_ship_arrows(result, rates)
     # SHIP-OLDEST: "minutes since" is computed at serve time so a cached snapshot still
@@ -6974,7 +7112,16 @@ box-shadow:0 0 7px rgba(255,0,68,0.3)}
 .ft-routes{display:flex;gap:3px;flex-wrap:wrap;margin-top:5px}
 /* One-row glance strip: CI queue + route health + agents, ~1/3 the height of
    the three cards it replaced (Ben, 2026-07-29). Numbers big, words small. */
+.ship-flow-wrap{display:flex;flex-direction:column;gap:0}
 .ship-flow{display:flex;align-items:stretch;gap:0;flex-wrap:wrap;margin:0 0 9px 0}
+.ship-flow.ship-row-2{flex-direction:row-reverse}
+.ship-elbow{font-size:1.3em;line-height:1;color:var(--neon-magenta);text-shadow:0 0 8px var(--neon-magenta);padding:0 22px;margin:-4px 0 2px 0}
+.ship-elbow-right{text-align:right}
+.ship-elbow-left{text-align:left}
+.ship-arrow.ship-arrow-left .ship-arrow-shape{transform:scaleX(-1);transform-origin:center}
+.ship-age{font-size:0.66em;color:#7d8798;white-space:nowrap;margin-top:1px}
+.ship-age.warn{color:var(--neon-yellow)}
+.ship-age.hot{color:var(--neon-red)}
 .ship-logo{width:30px;height:30px;display:block;margin:0 auto 3px auto;
 filter:drop-shadow(0 0 6px rgba(99,102,241,0.75))}
 .ship-label{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:0;font-family:'Orbitron',monospace;
@@ -7336,7 +7483,9 @@ transition:transform 1.1s cubic-bezier(.3,.6,.4,1),opacity 1.1s linear .3s}
 <select id="ship-repo-select" class="ship-repo-select" aria-label="Choose which repo the CI/CD row shows" onchange="shipRepoChanged(this.value)"><option value="">loading repos…</option></select>
 <span id="ship-repo-refreshing" class="ship-repo-refreshing" hidden>refreshing…</span>
 <div class="ship-flow-wrap" style="position:relative">
-<div id="ship-flow" class="ship-flow panel-refresh-body"><span class="gdim">shipping pipeline…</span></div>
+<!-- ship-flow now holds the three boustrophedon rows the 15-stage strip renders,
+     so it is itself a column wrap; the yard/carry overlays sit alongside it. -->
+<div id="ship-flow" class="ship-flow-wrap panel-refresh-body"><span class="gdim">shipping pipeline…</span></div>
 <div id="ship-yard" class="ship-yard" aria-label="Robots building the next PR"></div>
 <div id="ship-carry-layer" class="ship-carry-layer" aria-hidden="true"></div>
 </div>
@@ -7875,7 +8024,40 @@ function shipOldestWords(box, what) {
     const t = SHIP_OLDEST_THRESHOLDS[box];
     return ' Colour: ' + what + ' - green under ' + shipOldestText(t[0]) + ', yellow under ' + shipOldestText(t[1]) + ', red from ' + shipOldestText(t[1]) + '.';
 }
-function shipStage(num, cap, cls, sub, spark, help, stageCls, dropdownKey, prs, label, hist, sub2, belowCap) {
+// Expected refresh cadence per square (minutes) - amber past this age, red at 4x.
+// One named map so the thresholds are tunable without hunting through markup.
+const SHIP_STAGE_CADENCE_MIN = {
+    'dispatched': 30, 'ci q/run': 15, 'folded': 15,
+    // 'last deploy' is the deploy square's internal cap (it is captioned
+    // "deployed"); both names carry the same 120-minute cadence.
+    'merged today': 120, 'deployed': 120, 'last deploy': 120,
+};
+const SHIP_STAGE_DEFAULT_CADENCE_MIN = 240;
+
+function shipAgeText(ageMs) {
+    const s = ageMs / 1000;
+    if (s < 90) return Math.max(0, Math.round(s)) + 's';
+    const m = s / 60;
+    if (m < 90) return Math.round(m) + 'm';
+    const h = m / 60;
+    if (h < 36) return Math.round(h) + 'h';
+    return Math.round(h / 24) + 'd';
+}
+// n/a and unknown (?) squares pass no ISO timestamp and render no age - an
+// unknown must never read as fresh.
+function shipAgeHtml(cap, iso) {
+    if (!iso) return '';
+    const ms = Date.now() - Date.parse(iso);
+    if (!Number.isFinite(ms) || Number.isNaN(ms)) return '';
+    const cadenceMs = (SHIP_STAGE_CADENCE_MIN[cap] || SHIP_STAGE_DEFAULT_CADENCE_MIN) * 60000;
+    const cls = ms >= cadenceMs * 4 ? 'hot' : (ms >= cadenceMs ? 'warn' : '');
+    const abs = new Date(iso).toLocaleString('en-US', {month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZone: 'America/Chicago', timeZoneName: 'short'});
+    return '<div class="ship-age ' + cls + '" title="' + shipEscape(abs) + '">' + shipAgeText(Math.max(0, ms)) + '</div>';
+}
+
+// `lastActivity` (last positional arg) is the 15-stage strip's ISO "last activity"
+// timestamp for this square; it renders the small age line under the caption.
+function shipStage(num, cap, cls, sub, spark, help, stageCls, dropdownKey, prs, label, hist, sub2, belowCap, lastActivity) {
     const agents = (shipAgents || []).filter(a => a.live && a.square === cap);
     const key = dropdownKey || cap.replaceAll(' ', '-').replaceAll('/', '-');
     // SHIP-SPARK: the 12h history sparkline renders first, above the number,
@@ -7893,7 +8075,8 @@ function shipStage(num, cap, cls, sub, spark, help, stageCls, dropdownKey, prs, 
          + ' role="button" tabindex="0" aria-haspopup="true" aria-expanded="' + open + '" aria-controls="ship-list-' + key + '"'
          + ' onclick="toggleShipDropdown(this.dataset.dropdown)" onkeydown="shipStageKeydown(event,this.dataset.dropdown)"'
          + (help ? ' title="' + help.replace(/"/g, '') + '"' : '') + '>' + (hist || '')
-         + '<div class="ship-num ' + (cls || '') + '">' + num + '</div>'
+         // An unknown count renders '?' - it must never read as a measured 0.
+         + '<div class="ship-num ' + (cls || '') + '">' + ((num === null || num === undefined) ? '?' : num) + '</div>'
          + '<div class="ship-cap">' + (label || cap) + '</div>'
          + (belowCap ? '<div class="ship-stage-drain">' + shipEscape(belowCap) + '</div>' : '')
          + (sub ? '<div class="ship-sub">' + sub + '</div>' : '')
@@ -7901,6 +8084,7 @@ function shipStage(num, cap, cls, sub, spark, help, stageCls, dropdownKey, prs, 
          // kept as its own div rather than concatenated onto `sub`, so it always reads as
          // a distinct line, not just another " · "-joined clause of the first one.
          + (sub2 ? '<div class="ship-sub">' + sub2 + '</div>' : '')
+         + shipAgeHtml(cap, lastActivity)
          + (spark ? sparkHtml(spark) : '') + shipDropdown(key, prs || [], agents) + '</div>';
 }
 
@@ -7964,7 +8148,9 @@ function shipDrainText(drain) {
 // because this whole arrow gets torn down and rebuilt from an HTML string on
 // every 45s refresh, and the yard must survive that (item 5: robots are keyed
 // client-side by worker id and must not reset on every payload refresh).
-function shipArrow(square, glyph, arrow, description, legacyCount, width, isBottleneck, arrowLabel, drainLabelText) {
+// `dir` (last positional arg) is 'left' on the 15-stage strip's right-to-left
+// second row, which mirrors the arrow shape; anything else points right.
+function shipArrow(square, glyph, arrow, description, legacyCount, width, isBottleneck, arrowLabel, drainLabelText, dir) {
     const agentLane = glyph === '🤖';
     const rate = arrow ? arrow.rate_per_hour : null;
     const backlog = arrow ? arrow.backlog : null;
@@ -7997,7 +8183,8 @@ function shipArrow(square, glyph, arrow, description, legacyCount, width, isBott
         // "stalled" second line, even defensively, if the picker below ever mis-picks it.
         if (isBottleneck && hasRate) badge += '<b>' + shipDrainText(drain) + '</b>';
     }
-    return '<' + tag + (agentLane ? ' type="button"' : ' role="img"') + ' class="ship-arrow' + (isBottleneck ? ' bottleneck' : '') + '" style="' + style
+    const dirCls = dir === 'left' ? ' ship-arrow-left' : '';
+    return '<' + tag + (agentLane ? ' type="button"' : ' role="img"') + ' class="ship-arrow' + (isBottleneck ? ' bottleneck' : '') + dirCls + '" style="' + style
         + '" data-square-left="' + square + '" title="' + label + '" aria-label="' + label + '"'
         + (agentLane ? ' data-dropdown="' + key + '" aria-controls="ship-list-' + key
             + '" aria-expanded="' + (openShipDropdown === key) + '" onclick="toggleShipDropdown(this.dataset.dropdown)"' : '') + '>'
@@ -8390,6 +8577,36 @@ function refreshShipFlow() {
             el.innerHTML = '<span class="gdim">shipping pipeline unavailable (GitHub read failed)' + since + ' — stale, not an outage</span>';
             return;
         }
+        try {
+            el.innerHTML = shipFlowHtml(d);
+        } catch (e) {
+            // A JS exception here must never blank the whole panel (Ben's
+            // "degrade to ?" requirement) - fall back to the pre-15-stage
+            // seven-square view, which needs none of the new fields.
+            el.innerHTML = shipFlowHtmlLegacy(d);
+        }
+        shipQueuePrTransitions(d);
+        // SHIP-GAME items 2/5: the first arrow (and its bounding rect) just got
+        // rebuilt above - reposition the persistent yard against the new one.
+        positionShipYard();
+    }).catch(() => {
+        const el = document.getElementById('ship-flow');
+        if (el && !el.querySelector('.ship-stage')) el.innerHTML = '<span class="gdim">shipping pipeline failed to load.</span>';
+    });
+}
+
+function shipCtStamp(iso, opts) {
+    if (!iso) return '--';
+    return new Date(iso).toLocaleString('en-US', Object.assign({timeZone: 'America/Chicago'}, opts));
+}
+
+// 15-stage boustrophedon strip: row 1 runs left to right, row 2 runs back right
+// to left, and the deploy square sits alone on row 3. Every square the earlier
+// seven-square strip already had keeps its SHIP-OLDEST colour, "oldest:" line,
+// 12h sparkline, measured rate-pipe arrow and dropdown; the new squares add the
+// age line only. n/a and unknown squares render 'n/a'/'?' with no age rather
+// than inventing a number (Ben's brief, 2026-09-11).
+function shipFlowHtml(d) {
         const ciNum = d.ci_queued + '/' + d.ci_running;
         const ciCls = d.ci_queued > 5 ? 'hot' : (d.ci_queued > 0 ? 'warn' : 'ok');
         const greenCls = d.green_waiting >= 6 ? 'hot' : (d.green_waiting >= 3 ? 'warn' : (d.green_waiting > 0 ? 'ok' : ''));
@@ -8512,23 +8729,60 @@ function refreshShipFlow() {
         }
         const wFor = key => shipPipeWidth(arrowByKey[key] && arrowByKey[key].rate_per_hour, maxRate);
         const isB = key => key === bottleneckKey;
-        el.innerHTML =
-            shipStage(d.issues_open, 'issues open', '', '', null, HELP.issues, '', null, null, null, shipIssuesRatePanel(sp.issues), null, arrowByKey['issues-prs'] && arrowByKey['issues-prs'].drain_label) + shipArrow('issues open', '🤖', arrowByKey['issues-prs'], 'PRs opened in the last hour, from GitHub search - click for live agent lanes', null, wFor('issues-prs'), isB('issues-prs'), arrowByKey['issues-prs'] && arrowByKey['issues-prs'].label, null) +
-            shipStage(d.prs_open, 'prs open', '', prsOld.sub, null, HELP.prs + shipOldestWords('prs open', 'age of the oldest open, non-draft pull request'), prsOld.cls, null, null, null, shipHistorySpark(sp.prs, 'prs')) + shipArrow('prs open', '⚙', arrowByKey['prs-ci'], 'Distinct PRs with a CI run started this hour, from the GitHub workflow-runs list', d.ci_queued, wFor('prs-ci'), isB('prs-ci')) +
-            shipStage(ciNum, 'ci q/run', ciCls, ciOld.sub, null, HELP.ciqr + shipOldestWords('ci q/run', 'how long the oldest queued run in the last 48 h has waited to start (since it was re-queued, if it was re-run)'), ciOld.cls, null, null, null, shipHistorySpark(sp.ci, 'ci')) + shipArrow('ci q/run', '⚙', arrowByKey['ci-green'], 'Distinct PRs with a green Pre-Merge Gate run this hour (workflow 255384592)', d.ci_running, wFor('ci-green'), isB('ci-green')) +
-            shipStage(d.green_waiting, 'green waiting', greenCls, greenSub, null, HELP.greenWaiting + shipOldestWords('green waiting', 'how long the oldest green-eligible pull request has waited since its last activity') + greenWaitWords, greenOld.cls, 'green-waiting', d.green_waiting_prs, null, shipHistorySpark(sp.green, 'green'), greenWaitSub) + shipArrow('green waiting', '⚡', arrowByKey['green-inline'], 'Green eligible PRs not yet enqueued', d.green_waiting, wFor('green-inline'), isB('green-inline')) +
-            shipStage(queueNum, 'in line', queueCls, queueSub, null, queueHelp, queueOld.cls, 'in-line', d.queue_prs, 'in queue', shipHistorySpark(sp.queue, 'queue')) + shipArrow('in line', '⚡', arrowByKey['inline-merged'], 'Merge queue entries', d.queue_depth, wFor('inline-merged'), isB('inline-merged')) +
-            shipStage(d.merged_today, 'merged today', 'ok', mergedSub, d.merged_spark, HELP.merged + shipOldestWords('merged today', 'minutes since the last merge'), mergedStage, 'merged-today', d.merged_today_prs, null, shipHistorySpark(sp.merged, 'merged')) + shipArrow('merged today', '⚡', arrowByKey['merged-deploy'], 'Production deploy workflows in flight, or merge awaiting deploy', shipDeployCount(d), wFor('merged-deploy'), isB('merged-deploy')) +
-            shipStage(noDeploy ? 'n/a' : (d.deployed_prs_today === null || d.deployed_prs_today === undefined ? '?' : d.deployed_prs_today), 'last deploy', 'ok', deployLastLine, null, (noDeploy ? 'no deploy workflow on ' + (d.repo_name || d.repo_full || 'this repo') : HELP.lastdep + shipOldestWords('last deploy', 'minutes since the last deploy, counted only while main has commits newer than it') + deployWords), deployStateCls, 'last-deploy', (d.deployed_prs_today_list || []).map(n => ({number:n,title:'deployed'})), 'deployed', shipHistorySpark(sp.deploy, 'deploy'), null);
-        shipQueuePrTransitions(d);
-        // SHIP-GAME items 2/5: the first arrow (and its bounding rect) just got
-        // rebuilt above - reposition the persistent yard against the new one.
-        positionShipYard();
-    }).catch(() => {
-        const el = document.getElementById('ship-flow');
-        if (el && !el.querySelector('.ship-stage')) el.innerHTML = '<span class="gdim">shipping pipeline failed to load.</span>';
-    });
+
+        // New 15-stage squares: colour from the count alone (no measured age series yet).
+        const bugsCls = d.bugs_found_24h >= 5 ? 'hot' : (d.bugs_found_24h > 0 ? 'warn' : '');
+        const conflictCls = d.conflicted > 0 ? 'hot' : '';
+        const gateCls = d.gate_verdicts > 0 ? 'warn' : '';
+
+        // Row 1: bugs found -> issues open -> dispatched -> prs open -> ci q/run
+        // -> review routed -> in review, left to right.
+        const row1 =
+            shipStage(d.bugs_found_24h ?? null, 'bugs found', bugsCls, '', null, HELP.bugsFound, '', 'bugs-found', [], null, null, null, null, d.last_issue_created_at) + shipArrow('bugs found', '⚡', null, 'Issues created in the last 24h', null, null, false, String(d.bugs_found_24h ?? '?'), null, 'right') +
+            shipStage(d.issues_open, 'issues open', '', '', null, HELP.issues, '', null, null, null, shipIssuesRatePanel(sp.issues), null, arrowByKey['issues-prs'] && arrowByKey['issues-prs'].drain_label, d.last_issue_created_at) + shipArrow('issues open', '🤖', arrowByKey['issues-prs'], 'PRs opened in the last hour, from GitHub search - click for live agent lanes', null, wFor('issues-prs'), isB('issues-prs'), arrowByKey['issues-prs'] && arrowByKey['issues-prs'].label, null, 'right') +
+            shipStage(d.dispatched ?? null, 'dispatched', '', '', null, HELP.dispatched, '', 'dispatched', [], null, null, null, null, d.dispatched_last_at) + shipArrow('dispatched', '🤖', null, 'Live dispatched lanes', null, null, false, String(d.dispatched ?? '?'), null, 'right') +
+            shipStage(d.prs_open, 'prs open', '', prsOld.sub, null, HELP.prs + shipOldestWords('prs open', 'age of the oldest open, non-draft pull request'), prsOld.cls, null, null, null, shipHistorySpark(sp.prs, 'prs'), null, null, d.prs_open_last_at) + shipArrow('prs open', '⚙', arrowByKey['prs-ci'], 'Distinct PRs with a CI run started this hour, from the GitHub workflow-runs list', d.ci_queued, wFor('prs-ci'), isB('prs-ci'), null, null, 'right') +
+            shipStage(ciNum, 'ci q/run', ciCls, ciOld.sub, null, HELP.ciqr + shipOldestWords('ci q/run', 'how long the oldest queued run in the last 48 h has waited to start (since it was re-queued, if it was re-run)'), ciOld.cls, null, null, null, shipHistorySpark(sp.ci, 'ci'), null, null, d.ci_last_run_started_at) + shipArrow('ci q/run', '⚙', arrowByKey['ci-green'], 'Distinct PRs with a green Pre-Merge Gate run this hour (workflow 255384592)', d.ci_running, wFor('ci-green'), isB('ci-green'), null, null, 'right') +
+            shipStage(d.review_routed ?? null, 'review routed', '', '', null, HELP.reviewRouted, '', 'review-routed', [], null, null, null, null, d.review_routed_last_at) + shipArrow('review routed', '👀', null, 'PRs carrying a reviewer label', null, null, false, String(d.review_routed ?? '?'), null, 'right') +
+            shipStage(d.in_review ?? null, 'in review', '', '', null, HELP.inReview, '', 'in-review', [], null, null, null, null, d.in_review_last_at);
+
+        // Row 2: gate verdicts -> conflicted -> resolved -> approved -> green
+        // waiting -> in line -> merged today -> folded, in source order; the CSS
+        // row-reverse puts "gate verdicts" at the right edge under "in review".
+        const row2 =
+            shipStage(d.gate_verdicts ?? null, 'gate verdicts', gateCls, '', null, HELP.gateVerdicts, '', 'gate-verdicts', [], null, null, null, null, d.gate_verdicts_last_at) + shipArrow('gate verdicts', '⛨', null, 'PRs with a non-passing gate-verdict check', null, null, false, String(d.gate_verdicts ?? '?'), null, 'left') +
+            shipStage(d.conflicted ?? null, 'conflicted', conflictCls, '', null, HELP.conflicted, '', 'conflicted', [], null, null, null, null, d.conflicted_last_at) + shipArrow('conflicted', '⚠', null, 'Open PRs with a merge conflict', null, null, false, String(d.conflicted ?? '?'), null, 'left') +
+            shipStage(d.resolved === null || d.resolved === undefined ? 'n/a' : d.resolved, 'resolved', '', '', null, HELP.resolved + ((d.resolved === null || d.resolved === undefined) && d.resolved_na_reason ? ' (' + d.resolved_na_reason + ')' : ''), '', 'resolved', [], null, null, null, null, null) + shipArrow('resolved', '✓', null, 'Conflicts cleared in 24h', null, null, false, String(d.resolved ?? 'n/a'), null, 'left') +
+            shipStage(d.approved ?? null, 'approved', '', '', null, HELP.approved, '', 'approved', [], null, null, null, null, d.approved_last_at) + shipArrow('approved', '✅', null, 'Approved PRs not yet merged', null, null, false, String(d.approved ?? '?'), null, 'left') +
+            shipStage(d.green_waiting, 'green waiting', greenCls, greenSub, null, HELP.greenWaiting + shipOldestWords('green waiting', 'how long the oldest green-eligible pull request has waited since its last activity') + greenWaitWords, greenOld.cls, 'green-waiting', d.green_waiting_prs, null, shipHistorySpark(sp.green, 'green'), greenWaitSub, null, null) + shipArrow('green waiting', '⚡', arrowByKey['green-inline'], 'Green eligible PRs not yet enqueued', d.green_waiting, wFor('green-inline'), isB('green-inline'), null, null, 'left') +
+            shipStage(queueNum, 'in line', queueCls, queueSub, null, queueHelp, queueOld.cls, 'in-line', d.queue_prs, 'in queue', shipHistorySpark(sp.queue, 'queue'), null, null, null) + shipArrow('in line', '⚡', arrowByKey['inline-merged'], 'Merge queue entries', d.queue_depth, wFor('inline-merged'), isB('inline-merged'), null, null, 'left') +
+            shipStage(d.merged_today, 'merged today', 'ok', mergedSub, d.merged_spark, HELP.merged + shipOldestWords('merged today', 'minutes since the last merge'), mergedStage, 'merged-today', d.merged_today_prs, null, shipHistorySpark(sp.merged, 'merged'), null, null, d.last_merge_at) + shipArrow('merged today', '⚡', arrowByKey['merged-deploy'], 'Production deploy workflows in flight, or merge awaiting deploy', shipDeployCount(d), wFor('merged-deploy'), isB('merged-deploy'), null, null, 'left') +
+            shipStage(d.folded ?? null, 'folded', '', '', null, HELP.folded, '', 'folded', [], null, null, null, null, d.folded_last_at);
+
+        // Row 3: the deploy square alone, left-aligned under the end of row 2.
+        const row3 =
+            shipStage(noDeploy ? 'n/a' : (d.deployed_prs_today === null || d.deployed_prs_today === undefined ? '?' : d.deployed_prs_today), 'last deploy', 'ok', deployLastLine, null, (noDeploy ? 'no deploy workflow on ' + (d.repo_name || d.repo_full || 'this repo') : HELP.lastdep + shipOldestWords('last deploy', 'minutes since the last deploy, counted only while main has commits newer than it') + deployWords), deployStateCls, 'last-deploy', (d.deployed_prs_today_list || []).map(n => ({number:n,title:'deployed'})), 'deployed', shipHistorySpark(sp.deploy, 'deploy'), null, null, d.last_deploy_at);
+
+        return '<div class="ship-flow ship-row-1">' + row1 + '</div>'
+             + '<div class="ship-elbow ship-elbow-right">⤵</div>'
+             + '<div class="ship-flow ship-row-2">' + row2 + '</div>'
+             + '<div class="ship-elbow ship-elbow-left">⤵</div>'
+             + '<div class="ship-flow ship-row-3">' + row3 + '</div>';
 }
+
+// Pre-15-stage seven-square fallback, used only if shipFlowHtml() throws on a
+// payload missing the new fields - the strip must still render something.
+function shipFlowHtmlLegacy(d) {
+    const ciNum = (d.ci_queued ?? '?') + '/' + (d.ci_running ?? '?');
+    return shipStage(d.issues_open, 'issues open', '', '', null, HELP.issues)
+        + shipStage(d.prs_open, 'prs open', '', '', null, HELP.prs)
+        + shipStage(ciNum, 'ci q/run', '', '', null, HELP.ciqr)
+        + shipStage(d.green_waiting, 'green waiting', '', '', null, HELP.greenWaiting)
+        + shipStage(d.queue_depth, 'in line', '', '', null, HELP.inLine)
+        + shipStage(d.merged_today, 'merged today', '', '', d.merged_spark, HELP.merged)
+        + shipStage(d.deploys_ok_today ?? null, 'last deploy', '', '', null, HELP.lastdep);
+}
+
 
 function refreshCiQueue() {
     fetch('/api/ci_queue').then(r => r.json()).then(d => {
@@ -8874,6 +9128,15 @@ const HELP = {
     greenWaiting: 'GREEN WAITING - approved pull requests with every required test passing and no open review gate that are not in the merge line yet. Zero is good. If this grows, the line is not being fed.',
     lastdep:   'DEPLOYED TODAY - production deploys that finished today. The sub-line shows the time of the last one, Central Time, and the short code identifying exactly which version it was.',
     maxutil:   'The busiest this graphics card got today, as a percentage.',
+    bugsFound:     'BUGS FOUND - issues opened in the last 24 hours on the selected repository.',
+    dispatched:    'DISPATCHED - live automated worker lanes currently spawned to work the backlog.',
+    reviewRouted:  'REVIEW ROUTED - open pull requests carrying a reviewer label, meaning they have been handed to a specific reviewer.',
+    inReview:      'IN REVIEW - open pull requests awaiting a review verdict (review required or changes requested).',
+    gateVerdicts:  'GATE VERDICTS - open pull requests whose automated gate-verdict check has not passed.',
+    conflicted:    'CONFLICTED - open pull requests GitHub reports as having a merge conflict.',
+    resolved:      'RESOLVED - merge conflicts cleared in the last 24 hours. Shown as n/a when there is no history store to detect the clearing event cheaply.',
+    approved:      'APPROVED - pull requests with an approving review that have not merged yet.',
+    folded:        'FOLDED - commits on master not yet folded into live, the branch that actually serves traffic.',
 };
 
 function peakMarkerHtml(peakValue, min, max, size, id) {
