@@ -7849,7 +7849,7 @@ const SHIP_OLDEST_THRESHOLDS = {
     'green waiting': [30, 2 * 60],                  // oldest green-eligible PR, since its last activity
     'in queue':      [15, 45],                      // oldest merge-queue entry, since it was enqueued
     'merged today':  [30, 90],                      // minutes since the LAST merge
-    'last deploy':   [4 * 60, 8 * 60],              // Ben 11:12 AM 9/5: under 4h is green; yellow from 4h, red from 8h, only while commits wait
+    'last deploy':   [2 * 60, 4 * 60],              // Ben 2:46 PM CDT 9/11: under 2h is green; yellow from 2h, red from 4h, only while commits wait
 };
 function shipOldestText(min) {
     // 14m -> 1h 12m past 60 min -> 2d 3h past 48 h; "?" when the instrument is unavailable.
@@ -8478,11 +8478,11 @@ function refreshShipFlow() {
         // A held/paused cadence is a state, not a misleading future timestamp.
         const fmtCTLine = iso => new Date(iso).toLocaleTimeString('en-US',
             {hour:'numeric',minute:'2-digit',hour12:true,timeZone:'America/Chicago'}) + ' CT';
+        // Ben 2:46 PM CDT 9/11: "last deploy 2:06 PM CT" -> "X h, Y m ago"; drop the
+        // "next held"/"next <time>" line entirely (deployNextLine no longer computed).
         const deployLastLine = noDeploy ? deployStateSub
-            : 'last deploy ' + (d.last_deploy_at ? fmtCTLine(d.last_deploy_at) : '?');
-        const deployNextLine = noDeploy ? '' : 'next ' +
-            ((d.deploy_state === 'held' || d.deploy_state === 'paused') ? 'held'
-                : (d.deploy_next_tick_at ? fmtCTLine(d.deploy_next_tick_at) : '?'));
+            : (d.deploy_since_min === null || d.deploy_since_min === undefined ? '?' :
+                Math.floor(Math.max(0, Number(d.deploy_since_min)) / 60) + ' h, ' + (Math.max(0, Math.floor(Number(d.deploy_since_min))) % 60) + ' m ago');
         const sp = d.spark12h || {};
         // SHIP-PIPES: arrows carry rate/backlog/drain from the server; the
         // bottleneck is whichever arrow drains its backlog slowest - a MEASURED
@@ -8519,7 +8519,7 @@ function refreshShipFlow() {
             shipStage(d.green_waiting, 'green waiting', greenCls, greenSub, null, HELP.greenWaiting + shipOldestWords('green waiting', 'how long the oldest green-eligible pull request has waited since its last activity') + greenWaitWords, greenOld.cls, 'green-waiting', d.green_waiting_prs, null, shipHistorySpark(sp.green, 'green'), greenWaitSub) + shipArrow('green waiting', '⚡', arrowByKey['green-inline'], 'Green eligible PRs not yet enqueued', d.green_waiting, wFor('green-inline'), isB('green-inline')) +
             shipStage(queueNum, 'in line', queueCls, queueSub, null, queueHelp, queueOld.cls, 'in-line', d.queue_prs, 'in queue', shipHistorySpark(sp.queue, 'queue')) + shipArrow('in line', '⚡', arrowByKey['inline-merged'], 'Merge queue entries', d.queue_depth, wFor('inline-merged'), isB('inline-merged')) +
             shipStage(d.merged_today, 'merged today', 'ok', mergedSub, d.merged_spark, HELP.merged + shipOldestWords('merged today', 'minutes since the last merge'), mergedStage, 'merged-today', d.merged_today_prs, null, shipHistorySpark(sp.merged, 'merged')) + shipArrow('merged today', '⚡', arrowByKey['merged-deploy'], 'Production deploy workflows in flight, or merge awaiting deploy', shipDeployCount(d), wFor('merged-deploy'), isB('merged-deploy')) +
-            shipStage(noDeploy ? 'n/a' : (d.deployed_prs_today === null || d.deployed_prs_today === undefined ? '?' : d.deployed_prs_today), 'last deploy', 'ok', deployLastLine, null, (noDeploy ? 'no deploy workflow on ' + (d.repo_name || d.repo_full || 'this repo') : HELP.lastdep + shipOldestWords('last deploy', 'minutes since the last deploy, counted only while main has commits newer than it') + deployWords), deployStateCls, 'last-deploy', (d.deployed_prs_today_list || []).map(n => ({number:n,title:'deployed'})), 'deployed today', shipHistorySpark(sp.deploy, 'deploy'), deployNextLine);
+            shipStage(noDeploy ? 'n/a' : (d.deployed_prs_today === null || d.deployed_prs_today === undefined ? '?' : d.deployed_prs_today), 'last deploy', 'ok', deployLastLine, null, (noDeploy ? 'no deploy workflow on ' + (d.repo_name || d.repo_full || 'this repo') : HELP.lastdep + shipOldestWords('last deploy', 'minutes since the last deploy, counted only while main has commits newer than it') + deployWords), deployStateCls, 'last-deploy', (d.deployed_prs_today_list || []).map(n => ({number:n,title:'deployed'})), 'deployed', shipHistorySpark(sp.deploy, 'deploy'), null);
         shipQueuePrTransitions(d);
         // SHIP-GAME items 2/5: the first arrow (and its bounding rect) just got
         // rebuilt above - reposition the persistent yard against the new one.
