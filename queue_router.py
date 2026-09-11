@@ -7158,7 +7158,6 @@ box-shadow:0 0 7px rgba(255,0,68,0.3)}
 .ship-elbow{font-size:1.3em;line-height:1;color:var(--neon-magenta);text-shadow:0 0 8px var(--neon-magenta);padding:0 22px;margin:-4px 0 2px 0}
 .ship-elbow-right{text-align:right}
 .ship-elbow-left{text-align:left}
-.ship-arrow.ship-arrow-left .ship-arrow-shape{transform:scaleX(-1);transform-origin:center}
 .ship-age{font-size:0.66em;color:#7d8798;white-space:nowrap;margin-top:1px}
 .ship-age.warn{color:var(--neon-yellow)}
 .ship-age.hot{color:var(--neon-red)}
@@ -7167,8 +7166,11 @@ filter:drop-shadow(0 0 6px rgba(99,102,241,0.75))}
 .ship-label{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:0;font-family:'Orbitron',monospace;
 font-size:0.72em;letter-spacing:2px;color:var(--neon-cyan);text-shadow:0 0 8px var(--neon-cyan);
 padding-right:12px;white-space:nowrap}
-.ship-stage{background:rgba(255,255,255,0.025);border:1px solid #1e2942;border-radius:7px;
-padding:7px 14px;min-width:92px;text-align:center;display:flex;flex-direction:column;
+/* LORE order 11 "the sprite is the square": no card. The machine sprite
+   sitting directly on the dark background IS the stage - no border, no
+   panel background, no rounded rectangle. */
+.ship-stage{background:none;border:0;border-radius:0;
+padding:7px 6px;min-width:92px;text-align:center;display:flex;flex-direction:column;
 align-items:center;justify-content:center;gap:2px;cursor:pointer}
 .ship-stage{position:relative}
 /* SHIP-GAME item 0: the whole box is the click target now (no caret button) -
@@ -7192,16 +7194,24 @@ align-items:center;justify-content:center;gap:2px;cursor:pointer}
    must be able to tell at a glance what kind of thing has gone quiet, because
    the remedy differs. Shape must survive greyscale, so it never rides on
    colour alone. */
-.ship-stage.stage-machine{border-radius:2px;border:1px solid #2a3450;background:linear-gradient(180deg,rgba(255,255,255,.03),rgba(255,255,255,0))}
-.ship-stage.stage-robot{border-radius:9px;border:1px solid #364563;background:rgba(0,255,242,.035);
-box-shadow:0 0 8px rgba(0,255,242,.18),0 0 16px rgba(255,0,255,.09)}
-.ship-stage.stage-chest{border-radius:3px;border:1px solid #242c42;background:rgba(255,255,255,.012);box-shadow:none}
+/* No card border left to carry the machine/robot/chest distinction (order 11
+   deleted it) - the sprite art itself already reads as a different kind of
+   object; the robot kind keeps a sprite-level glow so "an AI is judging" is
+   still legible without a rectangle around it. */
+.ship-stage.stage-machine{background:none;border:0;border-radius:0}
+.ship-stage.stage-robot{background:none;border:0;border-radius:0;box-shadow:none}
+.ship-stage.stage-robot .ship-sprite{filter:drop-shadow(0 0 5px rgba(0,255,242,.55)) drop-shadow(0 0 9px rgba(255,0,255,.28))}
+.ship-stage.stage-chest{background:none;border:0;border-radius:0;box-shadow:none}
 /* Chest squares are piles waiting to be collected - staleness there is the
    loudest signal on the strip, so weight it heavier than any other age. */
 .ship-stage.stage-chest .ship-age{font-weight:800}
 .ship-stage.stage-chest .ship-age.warn{text-shadow:0 0 6px var(--neon-yellow)}
 .ship-stage.stage-chest .ship-age.hot{text-shadow:0 0 10px var(--neon-red),0 0 18px var(--neon-red)}
-.ship-sprite{position:absolute;top:4px;left:4px;width:24px;height:24px;
+/* Order 11: the sprite rendered LARGE (64px at 1440px, not the old 24px
+   corner icon) sitting in its own wrap so the count numeral can overlay it
+   directly instead of living in a caption below a card. */
+.ship-sprite-wrap{position:relative;width:64px;height:64px;margin:0 auto;flex:0 0 auto}
+.ship-sprite{position:absolute;inset:0;width:64px;height:64px;
 background-repeat:no-repeat;image-rendering:pixelated;pointer-events:none;opacity:.95}
 .ship-sprite.dim{opacity:.4}
 /* Remnants (Ben, 4:40 PM CDT): wreckage in place of the machine when a square
@@ -7214,9 +7224,9 @@ background-repeat:no-repeat;image-rendering:pixelated;pointer-events:none;opacit
 .ship-inserter.remnant .inserter-arm{opacity:.15!important;animation:none!important}
 /* Standard icon sheets are Factorio mip chains: 64+32+16+8=120 wide, 64 tall -
    the first (64x64) mip scaled to the 24x24 slot. */
-.ship-sprite.ico{background-size:45px 24px;background-position:0 0}
-.ship-sprite.chest-ico{background-size:24px 30px;background-position:center top}
-.ship-sprite.asm{width:24px;height:24px;background-size:192px 96px;image-rendering:pixelated}
+.ship-sprite.ico{background-size:120px 64px;background-position:0 0}
+.ship-sprite.chest-ico{background-size:64px 80px;background-position:center top}
+.ship-sprite.asm{width:64px;height:64px;background-size:512px 256px;image-rendering:pixelated}
 .ship-legend{display:flex;gap:18px;align-items:center;margin:6px 0 4px;font-size:.72em;color:#c7cee0}
 .ship-legend-chip{display:flex;align-items:center;gap:6px}
 .ship-legend-swatch{width:16px;height:16px;flex:0 0 auto}
@@ -7244,25 +7254,32 @@ transform-origin:50% 85%;transform:rotate(90deg);transition:transform .4s ease,o
 @keyframes inserter-reach-left{0%,100%{transform:rotate(-75deg)}50%{transform:rotate(-105deg)}}
 @media(prefers-reduced-motion:reduce){.ship-inserter.moving .inserter-arm{animation:none;transform:rotate(90deg)}
 .ship-arrow-left .ship-inserter.moving .inserter-arm{transform:rotate(-90deg)}}
-.ship-stage.merge-green{border-color:rgba(57,255,20,.8);background:rgba(57,255,20,.09)}
-.ship-stage.merge-yellow{border-color:rgba(255,255,0,.8);background:rgba(255,255,0,.09)}
-.ship-stage.merge-red{border-color:rgba(255,0,68,.85);background:rgba(255,0,68,.09)}
+/* No card border left to color for deploy state (order 11) - the state
+   becomes a glow on the sprite itself instead. */
+.ship-stage.merge-green .ship-sprite{filter:drop-shadow(0 0 8px rgba(57,255,20,.9))}
+.ship-stage.merge-yellow .ship-sprite{filter:drop-shadow(0 0 8px rgba(255,255,0,.9))}
+.ship-stage.merge-red .ship-sprite{filter:drop-shadow(0 0 8px rgba(255,0,68,.9))}
 /* SHIP-SPARK-2 item 6: the deploy box while a deploy run is actually shipping. */
-.ship-stage.merge-blue{border-color:rgba(0,168,255,.85);background:rgba(0,168,255,.1)}
-.ship-stage.merge-pulse{animation:merge-rate-pulse 4s ease-in-out infinite}
+.ship-stage.merge-blue .ship-sprite{filter:drop-shadow(0 0 8px rgba(0,168,255,.9))}
+.ship-stage.merge-pulse .ship-sprite{animation:merge-rate-pulse 4s ease-in-out infinite}
 @keyframes merge-rate-pulse{0%,100%{opacity:1}50%{opacity:.75}}
-@media(prefers-reduced-motion:reduce){.ship-stage.merge-pulse{animation:none}}
+@media(prefers-reduced-motion:reduce){.ship-stage.merge-pulse .ship-sprite{animation:none}}
 /* Animated assembler (stage 4, prs open) - real work being assembled. Frame
    stepping is driven by JS (32 frames, 8x4 grid) since it must mean
    something: running when work is flowing, frozen at frame 0 when idle,
    frozen+dimmed when stalled - never a screensaver. */
 .ship-sprite.asm.stalled{opacity:.4;filter:grayscale(.5)}
-.ship-num{font-family:'Orbitron',monospace;font-size:1.5em;font-weight:700;line-height:1;
-color:var(--neon-cyan);text-shadow:0 0 10px var(--neon-cyan)}
+/* The count overlays the sprite's base in a small dark plate (order 11: "if
+   the sprite cannot carry the number legibly... the way Factorio itself
+   labels things") rather than sitting in a caption under a card. */
+.ship-num{position:absolute;left:50%;bottom:1px;transform:translateX(-50%);z-index:2;
+font-family:'Orbitron',monospace;font-size:1.05em;font-weight:700;line-height:1.3;
+white-space:nowrap;background:rgba(6,10,20,.72);border-radius:3px;padding:0 5px;
+color:var(--neon-cyan);text-shadow:0 0 8px var(--neon-cyan)}
 .ship-num.ok{color:var(--neon-green);text-shadow:0 0 10px var(--neon-green)}
 .ship-num.warn{color:var(--neon-yellow);text-shadow:0 0 10px var(--neon-yellow)}
 .ship-num.hot{color:var(--neon-red);text-shadow:0 0 10px var(--neon-red)}
-.ship-num.stamp{font-size:1.05em;white-space:nowrap}
+.ship-num.stamp{font-size:.82em;white-space:nowrap}
 .ship-cap{font-family:'Orbitron',monospace;font-size:0.72em;letter-spacing:1.5px;
 text-transform:uppercase;color:#c7cee0;white-space:nowrap}
 .ship-sub{font-size:0.78em;color:#c7cee0;white-space:nowrap}
@@ -7480,17 +7497,46 @@ font-size:0.85em;letter-spacing:0.5px;vertical-align:middle}
 .ship-stage{flex:1 1 0;min-width:0;padding:8px 6px}
 .ship-cap{font-size:.65em;letter-spacing:1px}
 .ship-num.stamp{font-size:.85em}
-.ship-arrow{position:relative;flex:0 0 64px;align-self:center;justify-content:center;height:36px;padding:0 7px 0 2px;border:0;background:transparent;color:var(--arrow-color);cursor:pointer;font-size:11px;text-shadow:none}
-.ship-arrow-shape{filter:var(--arrow-glow,none)}
-.ship-arrow-shape{position:absolute;inset:0;width:100%;height:100%;fill:var(--arrow-color);fill-opacity:.09;stroke:var(--arrow-outline);stroke-width:1.5;stroke-linejoin:round;pointer-events:none}
-.ship-arrow-shape.pipe{stroke-dasharray:5 4;animation:ship-pipe-flow linear infinite;animation-duration:var(--pipe-duration,0s);animation-play-state:running}
-@keyframes ship-pipe-flow{to{stroke-dashoffset:-18}}
-.ship-arrow-badge{position:relative;z-index:1;display:inline-block;color:#8a94ad;background:rgba(6,10,20,.88);outline:1px solid #8a94ad;border-radius:4px;padding:2px 3px;font-size:11px;line-height:1.25;text-align:center;white-space:nowrap}
-.ship-arrow-badge b{display:block;font-weight:inherit}
+/* LORE order 11 #2 / order 1: a real belt segment (>=48px), not a glyph with
+   a number beside it. Widened from the old 64px pipe-only slot so the belt
+   reads as a segment rather than a sliver next to the inserter. */
+.ship-arrow{position:relative;flex:0 0 112px;align-self:center;justify-content:center;height:36px;
+gap:2px;padding:0 4px;border:0;background:transparent;color:var(--arrow-color);cursor:pointer;font-size:11px;text-shadow:none}
 .ship-arrow.bottleneck{animation:ship-arrow-bottleneck-pulse 1.6s ease-in-out infinite}
 @keyframes ship-arrow-bottleneck-pulse{0%,100%{filter:drop-shadow(0 0 4px var(--neon-red))}50%{filter:drop-shadow(0 0 11px var(--neon-red))}}
-@media(prefers-reduced-motion:reduce){.ship-arrow-shape.pipe{animation:none}.ship-arrow.bottleneck{animation:none}}
+@media(prefers-reduced-motion:reduce){.ship-arrow.bottleneck{animation:none}}
 .ship-arrow:focus-visible{outline:2px solid var(--arrow-color);outline-offset:2px}
+/* The belt itself: a scrolling texture tile carrying the order-10 item chain.
+   State is rendered, never captioned - order 9's "hover is where the numbers
+   live" (native title attr on the arrow, unchanged). */
+.ship-belt{position:relative;width:56px;height:20px;flex:0 0 56px;overflow:hidden;
+border-radius:2px;outline:1px solid var(--arrow-outline)}
+.ship-belt-track{position:absolute;inset:0;background-image:url('/static/factorio/belt/belt-tile.png');
+background-repeat:repeat-x;background-size:16px 16px;image-rendering:pixelated;opacity:.85;
+animation:ship-belt-flow linear infinite;animation-duration:var(--belt-duration,0s);animation-play-state:running}
+@keyframes ship-belt-flow{to{background-position-x:-16px}}
+.ship-belt-left .ship-belt-track{animation-name:ship-belt-flow-rev}
+@keyframes ship-belt-flow-rev{to{background-position-x:16px}}
+.ship-belt-items{position:absolute;inset:0}
+.ship-belt-item{position:absolute;top:50%;width:13px;height:13px;transform:translate(-50%,-50%);
+filter:drop-shadow(0 1px 1px rgba(0,0,0,.6))}
+.ship-belt-item svg{display:block;width:100%;height:100%}
+/* Order 13's correction: a packed belt is a customer waiting, never the
+   game's neutral "satisfying full belt" - same red treatment as a stalled
+   machine, not just density. Order 1: reuses the arrow's own existing
+   bottleneck flag rather than adding a second signal. */
+.ship-belt-backed-up{outline-color:var(--neon-red);box-shadow:0 0 8px var(--neon-red)}
+.ship-belt-backed-up .ship-belt-track{animation:none;filter:saturate(1.4)}
+/* starved: a MEASURED zero rate - the belt is real, just not moving. */
+.ship-belt-starved .ship-belt-track{animation:none;opacity:.3}
+/* known: a plain count with no rate instrument behind it - items sit still
+   because the flow speed isn't measured, not because it's known to be zero. */
+.ship-belt-known .ship-belt-track{animation:none;opacity:.55}
+/* unknown: no data at all - the same "nobody knows" language as the
+   unpowered inserter (.ship-inserter.remnant) sitting right next to it. */
+.ship-belt-unknown{opacity:.35}
+.ship-belt-unknown .ship-belt-track{animation:none;filter:grayscale(.7)}
+@media(prefers-reduced-motion:reduce){.ship-belt-track{animation:none!important}}
 /* SHIP-GAME-2: issues-closed/hour history replaces the open-issue count
    sparkline. It mirrors the runners read: graph left, current value right. */
 .ship-issues-rate{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;
@@ -8177,6 +8223,12 @@ const SHIP_STAGE_META = {
     'merged today':   {kind: 'machine', sprite: 'assembling-machine-3.png'},
     'folded':         {kind: 'machine', sprite: 'roboport.png'},
     'deployed':       {kind: 'machine', sprite: 'rocket-silo.png'},
+    // Row 3's shipStage() call uses 'last deploy' as its own cap/data-square
+    // (the box's caption text is the separate `label` param, 'deployed') -
+    // same meta, so the silo sprite actually renders on stage 15 instead of
+    // silently rendering nothing (found while verifying every square carries
+    // a sprite for order 11).
+    'last deploy':    {kind: 'machine', sprite: 'rocket-silo.png'},
 };
 
 // Ben, 4:40 PM CDT amendment: a square with NO DATA (unknown) shows Factorio
@@ -8190,11 +8242,14 @@ const SHIP_STAGE_META = {
 // sheet into the icon slot: assembling-machine-1-remnants.png is 3 frames
 // stacked 328x282 each; lab-remnants.png is 2 frames 266x196 each; radar and
 // steel-chest are single frames (own baked-in shadow, no cropping needed).
+// Crop sizes scaled up from the old 24px sprite slot to order 11's 64px slot
+// by the same 8/3 factor (64/24) so each crop still frames the identical
+// portion of its sheet, just larger.
 const REMNANT_SPRITE = {
-    'assembler': { url: '/static/factorio/remnants/assembling-machine-1-remnants.png', size: '28px 72px', pos: '0 0' },
-    'lab.png': { url: '/static/factorio/remnants/lab-remnants.png', size: '33px 48px', pos: '0 0' },
-    'radar.png': { url: '/static/factorio/remnants/radar-remnants.png', size: '32px 24px', pos: 'center' },
-    'chest/steel-chest.png': { url: '/static/factorio/remnants/steel-chest-remnants.png', size: '51px 30px', pos: '0 0' },
+    'assembler': { url: '/static/factorio/remnants/assembling-machine-1-remnants.png', size: '75px 192px', pos: '0 0' },
+    'lab.png': { url: '/static/factorio/remnants/lab-remnants.png', size: '88px 128px', pos: '0 0' },
+    'radar.png': { url: '/static/factorio/remnants/radar-remnants.png', size: '85px 64px', pos: 'center' },
+    'chest/steel-chest.png': { url: '/static/factorio/remnants/steel-chest-remnants.png', size: '136px 80px', pos: '0 0' },
 };
 function shipSpriteHtml(cap, unknown) {
     const meta = SHIP_STAGE_META[cap];
@@ -8243,9 +8298,9 @@ function shipStage(num, cap, cls, sub, spark, help, stageCls, dropdownKey, prs, 
          + ' role="button" tabindex="0" aria-haspopup="true" aria-expanded="' + open + '" aria-controls="ship-list-' + key + '"'
          + ' onclick="toggleShipDropdown(this.dataset.dropdown)" onkeydown="shipStageKeydown(event,this.dataset.dropdown)"'
          + (help ? ' title="' + help.replace(/"/g, '') + '"' : '') + '>' + (hist || '')
-         + shipSpriteHtml(cap, unknown)
+         + '<div class="ship-sprite-wrap">' + shipSpriteHtml(cap, unknown)
          // An unknown count renders '?' - it must never read as a measured 0.
-         + '<div class="ship-num ' + (cls || '') + '">' + shownNum + '</div>'
+         + '<div class="ship-num ' + (cls || '') + '">' + shownNum + '</div></div>'
          + '<div class="ship-cap">' + (label || cap) + '</div>'
          + (belowCap ? '<div class="ship-stage-drain">' + shipEscape(belowCap) + '</div>' : '')
          + (sub ? '<div class="ship-sub">' + sub + '</div>' : '')
@@ -8261,7 +8316,7 @@ function shipStage(num, cap, cls, sub, spark, help, stageCls, dropdownKey, prs, 
 // age is inside cadence, frozen at frame 0 when idle (count 0), frozen+dimmed
 // when stalled (age gone amber/red) - a stalled machine that keeps happily
 // animating is exactly the false-green this strip exists to kill.
-const ASM_COLS = 8, ASM_ROWS = 4, ASM_FRAME = 24; // displayed frame size, px
+const ASM_COLS = 8, ASM_ROWS = 4, ASM_FRAME = 64; // displayed frame size, px (order 11: 64px, up from 24px)
 let asmFrame = 0, asmTimer = null;
 function driveAssemblerAnim(d) {
     const el = document.querySelector('.ship-sprite[data-assembler="1"]');
@@ -8279,7 +8334,17 @@ function driveAssemblerAnim(d) {
         el.style.backgroundPosition = '-' + (col * ASM_FRAME) + 'px -' + (row * ASM_FRAME) + 'px';
     };
     if (!running || reduced) { asmFrame = 0; setFrame(0); return; }
-    asmTimer = setInterval(() => { asmFrame = (asmFrame + 1) % (ASM_COLS * ASM_ROWS); setFrame(asmFrame); }, 90);
+    // Order 9 "rate is speed", order 11 #3: the assembler's frame rate tracks
+    // its inflow arrow's measured rate_per_hour (issues opened -> PRs), not a
+    // fixed interval - clamped 0.2x-3x normal per the lore so a burst can't
+    // seize the strip and a slow hour still reads as alive. No measured rate
+    // (arrow unavailable or arrow not found) falls back to the old fixed pace
+    // rather than inventing a speed.
+    const inflow = Array.isArray(d.arrows) ? d.arrows.find(a => a.key === 'issues-prs') : null;
+    const rate = inflow ? inflow.rate_per_hour : null;
+    const norm = (rate !== null && rate !== undefined && rate > 0) ? Math.max(0.2, Math.min(3, Number(rate) / 3)) : 1;
+    const interval = Math.max(30, Math.min(300, 90 / norm));
+    asmTimer = setInterval(() => { asmFrame = (asmFrame + 1) % (ASM_COLS * ASM_ROWS); setFrame(asmFrame); }, interval);
 }
 
 function shipLegendHtml() {
@@ -8345,18 +8410,88 @@ function shipPipeWidth(rate, maxRate) {
     return Math.max(16, Math.min(36, 16 + 20 * Math.sqrt(r / maxRate)));
 }
 
-function shipPipePoints(width) {
-    const cy = 18;
-    const hb = Math.max(3, Math.min(18, width / 2));
-    const hh = Math.min(18, hb + 5);
-    return '1,' + (cy - hb) + ' 33,' + (cy - hb) + ' 33,' + (cy - hh) + ' 47,' + cy
-        + ' 33,' + (cy + hh) + ' 33,' + (cy + hb) + ' 1,' + (cy + hb) + ' 6,' + cy;
-}
-
 function shipDrainText(drain) {
     if (drain === null || drain === undefined) return 'stalled';
     const n = Math.round(Number(drain) * 10) / 10;
     return n + 'h to drain';
+}
+
+// LORE order 10 "THE ITEM": what actually rides the belt between stages, and
+// how it transforms - ore -> plate -> gear -> circuit -> advanced circuit ->
+// rocket part -> satellite. The order-10 text names a staged
+// static/factorio/items/ directory; it was never actually committed to this
+// repo (checked - the directory does not exist), so these are small original
+// inline SVGs, the same "own art, no Wube bytes" precedent already used for
+// the SHIP-GAME-3 yard robots, not crops of Wube's item icons.
+const SHIP_ITEM_SVG = {
+    'ore-iron': '<svg viewBox="0 0 16 16"><path d="M2 10l2-5 4-2 4 1 3 4-2 5-5 1z" fill="#9fb0c9" stroke="#5c6b82" stroke-width="1"/></svg>',
+    'ore-copper': '<svg viewBox="0 0 16 16"><path d="M2 10l2-5 4-2 4 1 3 4-2 5-5 1z" fill="#d9793d" stroke="#8a4a20" stroke-width="1"/></svg>',
+    'plate-iron': '<svg viewBox="0 0 16 16"><rect x="2" y="6" width="12" height="4" rx="1" fill="#c8d0dc" stroke="#5c6b82" stroke-width="1"/></svg>',
+    'gear': '<svg viewBox="0 0 16 16"><g fill="#aab2c4" stroke="#5c6b82" stroke-width=".6"><rect x="7" y="0" width="2" height="3"/><rect x="7" y="13" width="2" height="3"/><rect x="0" y="7" width="3" height="2"/><rect x="13" y="7" width="3" height="2"/><rect x="1.6" y="1.6" width="2.8" height="2.8" transform="rotate(45 3 3)"/><rect x="11.6" y="1.6" width="2.8" height="2.8" transform="rotate(45 13 3)"/><rect x="1.6" y="11.6" width="2.8" height="2.8" transform="rotate(45 3 13)"/><rect x="11.6" y="11.6" width="2.8" height="2.8" transform="rotate(45 13 13)"/><circle cx="8" cy="8" r="5"/></g><circle cx="8" cy="8" r="2.2" fill="#1c2438"/></svg>',
+    'circuit': '<svg viewBox="0 0 16 16"><rect x="1.5" y="3" width="13" height="10" rx="1" fill="#1d5c3a" stroke="#39ff8a" stroke-width="1"/><g fill="#39ff8a"><circle cx="4" cy="6" r="1"/><circle cx="8" cy="6" r="1"/><circle cx="12" cy="6" r="1"/><circle cx="4" cy="10" r="1"/><circle cx="8" cy="10" r="1"/><circle cx="12" cy="10" r="1"/></g></svg>',
+    'circuit-adv': '<svg viewBox="0 0 16 16"><rect x="1.5" y="3" width="13" height="10" rx="1" fill="#1d5c3a" stroke="#39ff8a" stroke-width="1"/><rect x="4.5" y="5.5" width="7" height="5" rx=".6" fill="#ff4d6a" stroke="#ffb0bd" stroke-width=".6"/></svg>',
+    'rocket-part': '<svg viewBox="0 0 16 16"><path d="M8 1l4 4v6l-4 4-4-4V5z" fill="#e8ecf5" stroke="#8a94ad" stroke-width="1"/></svg>',
+    'satellite': '<svg viewBox="0 0 16 16"><rect x="6" y="5" width="4" height="6" rx=".6" fill="#cfd8e6" stroke="#8a94ad" stroke-width=".8"/><rect x="0.5" y="6.5" width="4.5" height="3" fill="#39d7ff" stroke="#1a8fb8" stroke-width=".5"/><rect x="11" y="6.5" width="4.5" height="3" fill="#39d7ff" stroke="#1a8fb8" stroke-width=".5"/><line x1="8" y1="5" x2="8" y2="2" stroke="#cfd8e6" stroke-width="1"/></svg>',
+};
+// Bugs are copper, features are iron (order 10); from the gear onward the
+// chain converges, since past that point the pipeline treats them
+// identically. Keyed by the arrow's own `square` (upstream stage) name -
+// value is [item riding the belt, item it becomes at the downstream
+// inserter]. Arrows with no entry here (row-end joints like "in review" and
+// "folded"->deploy, which only carry the boustrophedon elbow) render no belt
+// items - there is no straight-through arrow there to draw one on.
+const SHIP_ARROW_ITEMS = {
+    'bugs found':    ['ore-copper', 'ore-iron'],
+    'issues open':   ['ore-iron', 'plate-iron'],
+    'dispatched':    ['plate-iron', 'gear'],
+    'prs open':      ['gear', 'gear'],
+    'ci q/run':      ['gear', 'circuit'],
+    'review routed': ['circuit', 'circuit'],
+    'gate verdicts': ['circuit', 'circuit-adv'],
+    'conflicted':    ['circuit-adv', 'circuit-adv'],
+    'resolved':      ['circuit-adv', 'circuit-adv'],
+    'approved':      ['circuit-adv', 'rocket-part'],
+    'in line':       ['rocket-part', 'rocket-part'],
+    'merged today':  ['rocket-part', 'satellite'],
+};
+// LORE order 1 "the belt backs up" + order 11 #2: a real belt segment
+// carrying the order-10 item, populated by throughput rather than a glyph
+// with a number beside it. `hasRate`/`rate`/`backedUp` are the same
+// instrumentation shipArrow already computes for the (now-removed) pipe
+// polygon; `knownCount` is the plain count fallback for the several arrows
+// that have never had a formal rate/backlog instrument (bugs found,
+// dispatched, review routed, gate verdicts, conflicted, resolved) - a known
+// number with no rate shows still items, never zero items (which would lie
+// and read as starved) and never motion (which would invent a speed, the
+// exact false-green order 9 warns against).
+function shipBeltHtml(square, hasRate, rate, backedUp, knownCount, dir) {
+    const items = SHIP_ARROW_ITEMS[square];
+    if (!items) return '';
+    const upItem = items[0], downItem = items[1];
+    let state, slots;
+    if (hasRate) {
+        if (backedUp) { state = 'backed-up'; slots = 5; }
+        else if (Number(rate) === 0) { state = 'starved'; slots = 0; }
+        else { state = 'flowing'; slots = Math.max(1, Math.min(4, Math.round(1 + Math.max(0.2, Math.min(3, Number(rate) / 4))))); }
+    } else if (knownCount !== null) {
+        state = 'known'; slots = Math.max(1, Math.min(3, Math.round(Math.sqrt(Math.max(1, knownCount)))));
+    } else {
+        state = 'unknown'; slots = 0;
+    }
+    let itemsHtml = '';
+    for (let i = 0; i < slots; i++) {
+        // The item changes shape AT the inserter, not while sitting in a
+        // square (order 10) - only the slot nearest the downstream box
+        // carries the transformed shape.
+        const kind = (i === slots - 1 && slots > 1) ? downItem : upItem;
+        const t = slots === 1 ? 0.5 : i / (slots - 1);
+        const pos = dir === 'left' ? (92 - 84 * t) : (8 + 84 * t);
+        itemsHtml += '<span class="ship-belt-item" style="left:' + pos.toFixed(1) + '%">' + SHIP_ITEM_SVG[kind] + '</span>';
+    }
+    const dirCls = dir === 'left' ? ' ship-belt-left' : '';
+    return '<div class="ship-belt ship-belt-' + state + dirCls + '">'
+        + '<div class="ship-belt-track"></div>'
+        + '<div class="ship-belt-items">' + itemsHtml + '</div></div>';
 }
 
 // square/glyph/description keep the old call shape; `arrow` is this edge's
@@ -8376,6 +8511,15 @@ function shipDrainText(drain) {
 // client-side by worker id and must not reset on every payload refresh).
 // `dir` (last positional arg) is 'left' on the 15-stage strip's right-to-left
 // second row, which mirrors the arrow shape; anything else points right.
+// LORE order 11 #3/#4: the old static SVG pipe-polygon-plus-badge is replaced
+// by a real belt (shipBeltHtml) carrying the order-10 item chain, plus the
+// existing inserter. `width`/`legacyCount` stay in the call shape for
+// call-site compatibility (row-assembly still computes them via shipPipeWidth
+// for the pipe-width comment/history) but are no longer rendered - the belt
+// encodes throughput through item packing/spacing instead (order 1), so a
+// separate pipe-width visual would be the "second signal" the lore says not
+// to add. Numbers live in the native `title` tooltip only (order 9: "hover is
+// where the numbers live") - there is no more always-visible badge text.
 function shipArrow(square, glyph, arrow, description, legacyCount, width, isBottleneck, arrowLabel, drainLabelText, dir) {
     const agentLane = glyph === '🤖';
     const rate = arrow ? arrow.rate_per_hour : null;
@@ -8384,39 +8528,34 @@ function shipArrow(square, glyph, arrow, description, legacyCount, width, isBott
     const hasRate = rate !== null && rate !== undefined;
     const colour = isBottleneck ? 'var(--neon-red)' : (hasRate ? capacityColour(rate, [0, 1, 4, 8]) : '#556b8a');
     const outline = !hasRate ? '#3a4560' : (rate === 0 ? 'color-mix(in srgb,' + colour + ' 55%,black)' : colour);
-    const w = width == null ? 16 : width;
     const rateForSpeed = hasRate ? Number(rate) : 0;
-    // SHIP-PIPES-2 (Ben, 8:53 AM): dashes move at half the SHIP-PIPES speed at
-    // every rate - double the floor and the numerator so the 2x holds whether
-    // or not the floor is the binding constraint.
+    // SHIP-PIPES-2 (Ben, 8:53 AM), now the belt's scroll speed (order 9: "rate
+    // is speed") - clamp lives in shipBeltHtml's slot-count mapping too.
     const duration = rateForSpeed > 0 ? Math.max(0.8, 24 / rateForSpeed) : 0;
     const style = '--arrow-color:' + colour + ';--arrow-outline:' + outline
         + ';--arrow-glow:' + (isBottleneck ? 'drop-shadow(0 0 6px var(--neon-red))' : (hasRate && rate >= 8 ? 'drop-shadow(0 0 5px ' + colour + ')' : 'none'))
-        + ';--pipe-duration:' + (duration ? duration + 's' : '0s')
+        + ';--belt-duration:' + (duration ? duration + 's' : '0s')
         + (agentLane ? '' : ';cursor:default');
     const key = square.replaceAll(' ', '-').replaceAll('/', '-');
     const rateText = hasRate ? (rate + '/h') : 'rate unknown';
     const backlogText = (backlog === null || backlog === undefined) ? 'unknown waiting' : backlog + ' waiting';
     const label = shipEscape(description + ': ' + rateText + ', ' + backlogText + ', ' + shipDrainText(drain));
     const tag = agentLane ? 'button' : 'span';
-    let badge;
-    if (arrowLabel) {
-        badge = glyph + ' ' + shipEscape(arrowLabel);
-    } else {
-        badge = glyph + ' ' + (hasRate ? rate + '/h' : '?');
-        // SHIP-PIPES-2: the drain line only ever rides on a MEASURED rate (hasRate
-        // true covers rate===0 too) - an unavailable ('?') arrow can never grow a
-        // "stalled" second line, even defensively, if the picker below ever mis-picks it.
-        if (isBottleneck && hasRate) badge += '<b>' + shipDrainText(drain) + '</b>';
-    }
     const dirCls = dir === 'left' ? ' ship-arrow-left' : '';
+    // Six arrows (bugs found/dispatched/review routed/gate verdicts/conflicted/
+    // resolved) have never had a formal rate/backlog instrument - only a plain
+    // count via arrowLabel (e.g. "5", or "?"/"n/a" when unavailable). Parsed
+    // here as the belt's known-count fallback so those squares still show
+    // items on their outbound belt rather than always reading starved.
+    const knownCount = (!hasRate && arrowLabel !== undefined && arrowLabel !== null && arrowLabel !== '' && !Number.isNaN(Number(arrowLabel)))
+        ? Number(arrowLabel) : null;
     return '<' + tag + (agentLane ? ' type="button"' : ' role="img"') + ' class="ship-arrow' + (isBottleneck ? ' bottleneck' : '') + dirCls + '" style="' + style
         + '" data-square-left="' + square + '" title="' + label + '" aria-label="' + label + '"'
         + (agentLane ? ' data-dropdown="' + key + '" aria-controls="ship-list-' + key
             + '" aria-expanded="' + (openShipDropdown === key) + '" onclick="toggleShipDropdown(this.dataset.dropdown)"' : '') + '>'
-        + '<svg class="ship-arrow-shape pipe" viewBox="0 0 48 36" preserveAspectRatio="none" aria-hidden="true"><polygon points="' + shipPipePoints(w) + '"/></svg>'
+        + shipBeltHtml(square, hasRate, rateForSpeed, isBottleneck, knownCount, dir)
         + shipInserterHtml(rateForSpeed, dir, !hasRate)
-        + '<span class="ship-arrow-badge">' + badge + '</span></' + tag + '>';
+        + '</' + tag + '>';
 }
 
 function shipDeployCount(d) {
