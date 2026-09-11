@@ -764,6 +764,28 @@ def _render_dependent_signals() -> tuple[str, ...]:
     return tuple(dict.fromkeys(signals)) or known
 
 
+def check_runson_credits_read(r: dict) -> None:
+    """Check the dashboard's reported read status against an expected contract."""
+    credits_error = r.get("credits_error")
+    if credits_error:
+        level = "FAIL"
+        detail = f"dashboard reports credits read failing ({credits_error})"
+    elif r.get("available") is True and "credits_error" in r and credits_error is None:
+        level = "PASS"
+        detail = "dashboard reports credits read clean"
+    else:
+        level = "WARN"
+        detail = "dashboard credits read status unavailable; clean read cannot be established"
+    # This suite has not issued a separate AWS credits request. Keep the expected
+    # value explicitly labeled inside the existing report shape; it is not a
+    # measured AWS result. A reported denial still fails the contract.
+    emit(level, "runson.credits_read",
+         {"credits_error": credits_error, "credits_remaining": r.get("credits_remaining")},
+         {"kind": "expected_contract", "expected": {"credits_error": None},
+          "independent_aws_measurement": False},
+         detail + "; expected contract only, no independent AWS measurement")
+
+
 def check_rendering() -> None:
     try:
         code, body = http("/")
@@ -989,12 +1011,7 @@ console.log(JSON.stringify({
     # indistinguishable from "no credits data yet". That silence nearly got a live IAM
     # gap retired as stale on 2026-09-04 (fleet-runson-observer lacks
     # freetier:GetAccountPlanState). The read now reports itself.
-    credits_error = r.get("credits_error")
-    emit("PASS" if not credits_error else "FAIL", "runson.credits_read",
-         {"credits_error": credits_error, "credits_remaining": r.get("credits_remaining")},
-         {"credits_error": None},
-         "credits read clean" if not credits_error
-         else f"credits read failing ({credits_error}); credits_remaining is null because of this, not because there is no data")
+    check_runson_credits_read(r)
 
     # Second 136p instance: a Cost Explorer failure used to collapse into
     # cost_source="credits" with no reason, so a denied ce:GetCostAndUsage, a CE that
