@@ -5476,9 +5476,18 @@ def _get_shipping_readiness(token, repo=None, default_branch="main"):
     read, so it no longer raises. A TRUNCATED queue (hasNextPage) still raises:
     that IS a failed read, we cannot establish who's queued from a partial page.
 
-    Widened --json selection (added createdAt/updatedAt/reviews/statusCheckRollup)
-    so the 15-stage strip's review-routed/in-review/gate-verdict/conflicted/approved
-    squares derive from THIS single call rather than one query per new square."""
+    Widened --json selection (added createdAt/updatedAt/reviews) so the 15-stage
+    strip's review-routed/in-review/conflicted/approved squares derive from THIS
+    single call rather than one query per new square.
+
+    statusCheckRollup was dropped from this selection (measured live 4:37 PM CDT
+    2026-09-11): with 48 open PRs on armbrain, GitHub's GraphQL backend cannot
+    assemble the check rollup for the PR list in one call any more and returns
+    HTTP 504 - reproduced at --limit 100, 60, 40, and 25, and it is the field, not
+    the row count (100 rows WITHOUT statusCheckRollup succeeds). The gate-verdict
+    square that used to read this field now has no rollup data to read; see
+    GATE_VERDICT_CHECK_NAME's caller, which renders it n/a rather than inventing
+    a number or adding a per-PR call."""
     repo = repo or GITHUB_CI_REPO
     env = dict(os.environ, GH_TOKEN=token)
     def gh_json(args):
@@ -5492,7 +5501,7 @@ def _get_shipping_readiness(token, repo=None, default_branch="main"):
     prs = gh_json(["pr", "list", "--repo", repo, "--state", "open",
                    "--limit", "100", "--search", "sort:created-asc", "--json",
                    "number,title,isDraft,reviewDecision,mergeable,mergeStateStatus,labels,updatedAt,"
-                   "createdAt,reviews,statusCheckRollup"])
+                   "createdAt,reviews"])
     owner, name = repo.split("/")
     query = '''query($owner:String!,$name:String!,$branch:String!){
       repository(owner:$owner,name:$name){mergeQueue(branch:$branch){
@@ -5906,68 +5915,99 @@ def get_pipeline_status(repo=None, default_branch=None, force_refresh=False):
     if token:
         try:
             headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
-            result["green_waiting_prs"], result["queue_prs"], ship_oldest, all_open_prs = _get_shipping_readiness(
-                token, repo=repo, default_branch=default_branch)
-            result["queue_depth"] = len(result["queue_prs"])
-            result["green_waiting"] = len(result["green_waiting_prs"])
-            # Reuse the merge-lane instrument's own cached oldest-wait figure rather than
-            # spending a second GraphQL call - it fails to None, never to 0, on a bad read.
-            # Only meaningful when this repo actually has a merge queue (item 4).
-            result["oldest_awaiting_min"] = (get_merge_lane_status(repo=repo).get("oldest_awaiting_min")
-                                              if ship_oldest.get("has_merge_queue") else None)
-            # SHIP-OLDEST: ages of the oldest merge-queue entry and of the oldest green-eligible
-            # PR (computed inside _get_shipping_readiness from data it already fetched), plus
-            # the oldest open non-draft PR (one search call on its own 300 s cache).
-            result.update(ship_oldest)
-            queue_enqueued_at = result.pop("queue_enqueued_at", {})  # SHIP-SPARK-2: internal only, not part of the payload
-            result["prs_oldest_min"] = _get_prs_oldest_min(headers, repo, force_refresh=force_refresh)
+            # This block (PR-list + merge-queue read, and everything derived from it)
+            # gets its own try/except so a failure here - e.g. a future GitHub 504 -
+            # degrades only the squares that depend on THIS call, not the rest of the
+            # pipeline (issues/PRs/CI/deploy squares below all come from independent
+            # calls and must keep rendering fresh). Previously a single exception
+            # anywhere in this function discarded the whole snapshot and served
+            # last-known-good for all 15 squares - the exact "one 504 takes down
+            # all fifteen" defect this fix addresses.
+            queue_enqueued_at = {}
+            try:
+                result["green_waiting_prs"], result["queue_prs"], ship_oldest, all_open_prs = _get_shipping_readiness(
+                    token, repo=repo, default_branch=default_branch)
+                result["queue_depth"] = len(result["queue_prs"])
+                result["green_waiting"] = len(result["green_waiting_prs"])
+                # Reuse the merge-lane instrument's own cached oldest-wait figure rather than
+                # spending a second GraphQL call - it fails to None, never to 0, on a bad read.
+                # Only meaningful when this repo actually has a merge queue (item 4).
+                result["oldest_awaiting_min"] = (get_merge_lane_status(repo=repo).get("oldest_awaiting_min")
+                                                  if ship_oldest.get("has_merge_queue") else None)
+                # SHIP-OLDEST: ages of the oldest merge-queue entry and of the oldest green-eligible
+                # PR (computed inside _get_shipping_readiness from data it already fetched), plus
+                # the oldest open non-draft PR (one search call on its own 300 s cache).
+                result.update(ship_oldest)
+                queue_enqueued_at = result.pop("queue_enqueued_at", {})  # SHIP-SPARK-2: internal only, not part of the payload
+                result["prs_oldest_min"] = _get_prs_oldest_min(headers, repo, force_refresh=force_refresh)
 
-            # ── 15-stage strip: stages 4,6,7,8,9,11 derive from the single PR-list
-            # call above - zero added GitHub calls for six of the nine new squares.
-            # prs_open itself keeps its own search_count below: that count is exact,
-            # where len(all_open_prs) would cap at the 100-PR page fetched above.
-            opened_ats = [p["createdAt"] for p in all_open_prs if p.get("createdAt")]
-            result["prs_open_last_at"] = max(opened_ats) if opened_ats else None
+                # ── 15-stage strip: stages 4,6,7,8,9,11 derive from the single PR-list
+                # call above - zero added GitHub calls for six of the nine new squares.
+                # prs_open itself keeps its own search_count below: that count is exact,
+                # where len(all_open_prs) would cap at the 100-PR page fetched above.
+                opened_ats = [p["createdAt"] for p in all_open_prs if p.get("createdAt")]
+                result["prs_open_last_at"] = max(opened_ats) if opened_ats else None
 
-            routed = [p for p in all_open_prs
-                      if any(l["name"].lower().endswith(REVIEW_ROUTED_LABEL_SUFFIX) for l in p.get("labels", []))]
-            result["review_routed"] = len(routed)
-            routed_ats = [p["updatedAt"] for p in routed if p.get("updatedAt")]
-            result["review_routed_last_at"] = max(routed_ats) if routed_ats else None
+                routed = [p for p in all_open_prs
+                          if any(l["name"].lower().endswith(REVIEW_ROUTED_LABEL_SUFFIX) for l in p.get("labels", []))]
+                result["review_routed"] = len(routed)
+                routed_ats = [p["updatedAt"] for p in routed if p.get("updatedAt")]
+                result["review_routed_last_at"] = max(routed_ats) if routed_ats else None
 
-            in_rev = [p for p in all_open_prs if p.get("reviewDecision") in ("REVIEW_REQUIRED", "CHANGES_REQUESTED")]
-            result["in_review"] = len(in_rev)
-            rev_subs = [rv.get("submittedAt") for p in in_rev for rv in (p.get("reviews") or []) if rv.get("submittedAt")]
-            result["in_review_last_at"] = max(rev_subs) if rev_subs else None
+                in_rev = [p for p in all_open_prs if p.get("reviewDecision") in ("REVIEW_REQUIRED", "CHANGES_REQUESTED")]
+                result["in_review"] = len(in_rev)
+                rev_subs = [rv.get("submittedAt") for p in in_rev for rv in (p.get("reviews") or []) if rv.get("submittedAt")]
+                result["in_review_last_at"] = max(rev_subs) if rev_subs else None
 
-            def _gate_check(p):
-                for c in (p.get("statusCheckRollup") or []):
-                    if c.get("name") == GATE_VERDICT_CHECK_NAME:
-                        return c
-                return None
-            gate_hits = [(p, _gate_check(p)) for p in all_open_prs]
-            gate_hits = [(p, c) for p, c in gate_hits if c and c.get("conclusion") != "SUCCESS"]
-            result["gate_verdicts"] = len(gate_hits)
-            gate_ats = [c.get("completedAt") for _, c in gate_hits if c.get("completedAt")]
-            result["gate_verdicts_last_at"] = max(gate_ats) if gate_ats else None
+                # statusCheckRollup was dropped from the bulk PR-list query (it, not the
+                # row count, was the 504 cause on this repo's 48 open PRs - see
+                # _get_shipping_readiness). Fetching it per-PR instead would add up to
+                # ~48 GitHub calls per refresh, trading a 504 for rate-limit exhaustion,
+                # so this square is an honest n/a rather than a fabricated number or a
+                # re-added 504.
+                result["gate_verdicts"] = None
+                result["gate_verdicts_last_at"] = None
+                result["gate_verdicts_na_reason"] = (
+                    "statusCheckRollup removed from the bulk PR query (caused GitHub GraphQL "
+                    "504s on this repo's 48 open PRs); a per-PR rollup fetch was not added to "
+                    "avoid an ~48-call/refresh rate-budget risk")
 
-            conflicted = [p for p in all_open_prs if p.get("mergeable") == "CONFLICTING"]
-            result["conflicted"] = len(conflicted)
-            conf_ats = [p["updatedAt"] for p in conflicted if p.get("updatedAt")]
-            result["conflicted_last_at"] = max(conf_ats) if conf_ats else None
+                conflicted = [p for p in all_open_prs if p.get("mergeable") == "CONFLICTING"]
+                result["conflicted"] = len(conflicted)
+                conf_ats = [p["updatedAt"] for p in conflicted if p.get("updatedAt")]
+                result["conflicted_last_at"] = max(conf_ats) if conf_ats else None
 
-            # No history store of mergeable-state transitions exists - a real
-            # count would require polling snapshots over time. Honest n/a per
-            # spec, not an invented number.
-            result["resolved"] = None
-            result["resolved_last_at"] = None
-            result["resolved_na_reason"] = "no snapshot history of mergeable-state transitions to detect a resolve event"
+                # No history store of mergeable-state transitions exists - a real
+                # count would require polling snapshots over time. Honest n/a per
+                # spec, not an invented number.
+                result["resolved"] = None
+                result["resolved_last_at"] = None
+                result["resolved_na_reason"] = "no snapshot history of mergeable-state transitions to detect a resolve event"
 
-            approved = [p for p in all_open_prs if p.get("reviewDecision") == "APPROVED"]
-            result["approved"] = len(approved)
-            appr_ats = [rv.get("submittedAt") for p in approved for rv in (p.get("reviews") or [])
-                        if rv.get("state") == "APPROVED" and rv.get("submittedAt")]
-            result["approved_last_at"] = max(appr_ats) if appr_ats else None
+                approved = [p for p in all_open_prs if p.get("reviewDecision") == "APPROVED"]
+                result["approved"] = len(approved)
+                appr_ats = [rv.get("submittedAt") for p in approved for rv in (p.get("reviews") or [])
+                            if rv.get("state") == "APPROVED" and rv.get("submittedAt")]
+                result["approved_last_at"] = max(appr_ats) if appr_ats else None
+            except Exception as e:
+                logger.warning(f"shipping-readiness read failed ({repo}): {e}")
+                github_fetches_ok = False
+                for field, default in (
+                    ("green_waiting_prs", []), ("queue_prs", []), ("queue_depth", None),
+                    ("green_waiting", None), ("oldest_awaiting_min", None),
+                    ("queue_oldest_min", None), ("green_oldest_min", None),
+                    ("has_merge_queue", None), ("prs_oldest_min", None),
+                    ("prs_open_last_at", None), ("review_routed", None),
+                    ("review_routed_last_at", None), ("in_review", None),
+                    ("in_review_last_at", None), ("gate_verdicts", None),
+                    ("gate_verdicts_last_at", None), ("conflicted", None),
+                    ("conflicted_last_at", None), ("resolved", None),
+                    ("resolved_last_at", None), ("approved", None), ("approved_last_at", None),
+                ):
+                    result.setdefault(field, default)
+                result["gate_verdicts_na_reason"] = "shipping-readiness read (PR list + merge queue) failed this refresh"
+                result["resolved_na_reason"] = "no snapshot history of mergeable-state transitions to detect a resolve event"
+                result["shipping_readiness_na_reason"] = f"PR-list/merge-queue read failed: {e}"
 
             result["dispatched"], result["dispatched_last_at"] = _dispatched_stage()
             result["folded"], result["folded_last_at"] = _folded_stage()
@@ -7164,6 +7204,14 @@ box-shadow:0 0 8px rgba(0,255,242,.18),0 0 16px rgba(255,0,255,.09)}
 .ship-sprite{position:absolute;top:4px;left:4px;width:24px;height:24px;
 background-repeat:no-repeat;image-rendering:pixelated;pointer-events:none;opacity:.95}
 .ship-sprite.dim{opacity:.4}
+/* Remnants (Ben, 4:40 PM CDT): wreckage in place of the machine when a square
+   has NO DATA, not just a measured zero - distinct from .dim (which still
+   shows the live sprite) and from .asm.stalled (which is a live sprite too).
+   background-size/position are set per-sprite inline (frame crop, see
+   REMNANT_SPRITE) - inline style already wins over .ico/.chest-ico/.asm on
+   specificity, so this rule only carries the tint, not geometry. */
+.ship-sprite.remnant{filter:grayscale(.35);opacity:.65}
+.ship-inserter.remnant .inserter-arm{opacity:.15!important;animation:none!important}
 /* Standard icon sheets are Factorio mip chains: 64+32+16+8=120 wide, 64 tall -
    the first (64x64) mip scaled to the 24x24 slot. */
 .ship-sprite.ico{background-size:45px 24px;background-position:0 0}
@@ -8131,17 +8179,44 @@ const SHIP_STAGE_META = {
     'deployed':       {kind: 'machine', sprite: 'rocket-silo.png'},
 };
 
+// Ben, 4:40 PM CDT amendment: a square with NO DATA (unknown) shows Factorio
+// "remnants" - the wreckage where the machine used to be - not a live sprite
+// dimmed. Only the sprites Ben staged have a remnant asset; a stage whose
+// sprite has none (no remnant art exists for it) still falls back to the
+// plain dim treatment rather than inventing a wreck image.
+//
+// size/pos crop ONE frame out of each staged sheet (measured by inspecting
+// the PNGs, not assumed from filenames) rather than squashing the whole
+// sheet into the icon slot: assembling-machine-1-remnants.png is 3 frames
+// stacked 328x282 each; lab-remnants.png is 2 frames 266x196 each; radar and
+// steel-chest are single frames (own baked-in shadow, no cropping needed).
+const REMNANT_SPRITE = {
+    'assembler': { url: '/static/factorio/remnants/assembling-machine-1-remnants.png', size: '28px 72px', pos: '0 0' },
+    'lab.png': { url: '/static/factorio/remnants/lab-remnants.png', size: '33px 48px', pos: '0 0' },
+    'radar.png': { url: '/static/factorio/remnants/radar-remnants.png', size: '32px 24px', pos: 'center' },
+    'chest/steel-chest.png': { url: '/static/factorio/remnants/steel-chest-remnants.png', size: '51px 30px', pos: '0 0' },
+};
 function shipSpriteHtml(cap, unknown) {
     const meta = SHIP_STAGE_META[cap];
     if (!meta) return '';
-    const dimCls = unknown ? ' dim' : '';
+    const remnant = unknown ? REMNANT_SPRITE[meta.sprite] : null;
+    const dimCls = unknown && !remnant ? ' dim' : '';
+    const remnantCls = remnant ? ' remnant' : '';
+    // Remnant crop wins over the .ico/.chest-ico/.asm class's own background-size
+    // via inline style (higher specificity) - no !important needed here.
+    const remnantStyle = remnant ? ';background-size:' + remnant.size + ';background-position:' + remnant.pos : '';
     if (meta.sprite === 'assembler') {
         // Real running/idle/stalled state is applied by driveAssemblerAnim();
         // this just plants the element with the correct static fallback frame.
-        return '<div class="ship-sprite asm' + dimCls + '" data-assembler="1" style="background-image:url(/static/factorio/assembler/assembling-machine-1.png);background-position:0 0"></div>';
+        // When unknown, the remnant art replaces the sheet outright - no frame
+        // stepping, no "stalled" grayscale (it is already wreckage).
+        return '<div class="ship-sprite asm' + dimCls + remnantCls + '" data-assembler="1" style="background-image:url('
+            + (remnant ? remnant.url : '/static/factorio/assembler/assembling-machine-1.png') + ')'
+            + (remnant ? remnantStyle : ';background-position:0 0') + '"></div>';
     }
     const spriteCls = meta.kind === 'chest' ? 'chest-ico' : 'ico';
-    return '<div class="ship-sprite ' + spriteCls + dimCls + '" style="background-image:url(/static/factorio/' + meta.sprite + ')"></div>';
+    return '<div class="ship-sprite ' + spriteCls + dimCls + remnantCls + '" style="background-image:url('
+        + (remnant ? remnant.url : ('/static/factorio/' + meta.sprite)) + ')' + remnantStyle + '"></div>';
 }
 
 // `lastActivity` (last positional arg) is the 15-stage strip's ISO "last activity"
@@ -8241,11 +8316,21 @@ function capacityOutline(card, colour, glow) {
 // every outage found today was an arrow, not a box. Carries the moving/idle
 // state where the held item would be; mirrored on row 2 so it reaches the
 // direction work actually moves.
-function shipInserterHtml(count, dir) {
+function shipInserterHtml(count, dir, unknown) {
     const moving = count > 0;
     const hand = moving ? 'long-handed-inserter-hand-closed.png' : 'long-handed-inserter-hand-open.png';
-    return '<span class="ship-inserter ' + (moving ? 'moving' : 'idle') + '">'
-        + '<span class="inserter-platform"></span>'
+    // Ben's remnants amendment: an arrow with NO measured rate (unknown, not
+    // measured-zero) shows the wrecked inserter platform, arm dimmed to
+    // near-invisible - "nobody knows whether anything is stuck" must never
+    // look like the idle (measured-zero) inserter.
+    const remnantCls = unknown ? ' remnant' : '';
+    // long-handed-inserter-remnants.png measured 134x376: 4 frames stacked
+    // 134x94 each - crop frame 1, don't scale the whole strip into the slot.
+    const platformStyle = unknown
+        ? ' style="background-image:url(/static/factorio/remnants/long-handed-inserter-remnants.png);background-size:30px 84px;background-position:0 0"'
+        : '';
+    return '<span class="ship-inserter ' + (moving ? 'moving' : 'idle') + remnantCls + '">'
+        + '<span class="inserter-platform"' + platformStyle + '></span>'
         + '<span class="inserter-arm" style="background-image:url(/static/factorio/inserter/' + hand + ')"></span>'
         + '</span>';
 }
@@ -8330,7 +8415,7 @@ function shipArrow(square, glyph, arrow, description, legacyCount, width, isBott
         + (agentLane ? ' data-dropdown="' + key + '" aria-controls="ship-list-' + key
             + '" aria-expanded="' + (openShipDropdown === key) + '" onclick="toggleShipDropdown(this.dataset.dropdown)"' : '') + '>'
         + '<svg class="ship-arrow-shape pipe" viewBox="0 0 48 36" preserveAspectRatio="none" aria-hidden="true"><polygon points="' + shipPipePoints(w) + '"/></svg>'
-        + shipInserterHtml(rateForSpeed, dir)
+        + shipInserterHtml(rateForSpeed, dir, !hasRate)
         + '<span class="ship-arrow-badge">' + badge + '</span></' + tag + '>';
 }
 
@@ -8710,13 +8795,25 @@ function refreshShipFlow() {
             el.innerHTML = '<span class="gdim">shipping pipeline warming up (first read since restart still in flight)…</span>';
             return;
         }
+        // Ben, 4:40 PM CDT amendment: even a total GitHub-read failure (no
+        // last-known-good snapshot to fall back on) must render fifteen
+        // wrecked squares in the right layout, not a blank sentence - "Ben
+        // can see at a glance that the shape of the pipeline is intact and
+        // the instrument is what died." The caption stays, as a caption
+        // under the strip, not instead of it.
         if (!d.available) {
             let since = '';
             if (d.gh_auth_failing_since) {
                 const t = new Date(d.gh_auth_failing_since);
                 since = ' since ' + t.toLocaleString('en-US', {month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZone: 'America/Chicago', timeZoneName: 'short'});
             }
-            el.innerHTML = '<span class="gdim">shipping pipeline unavailable (GitHub read failed)' + since + ' — stale, not an outage</span>';
+            const caption = '<div class="ship-unavailable-caption gdim">shipping pipeline unavailable (GitHub read failed)' + since + ' — stale, not an outage</div>';
+            try {
+                el.innerHTML = shipFlowHtml(Object.assign({}, SHIP_BLANK_PIPELINE, d)) + caption;
+                driveAssemblerAnim(Object.assign({}, SHIP_BLANK_PIPELINE, d));
+            } catch (e) {
+                el.innerHTML = caption;
+            }
             return;
         }
         try {
@@ -8749,16 +8846,49 @@ function shipCtStamp(iso, opts) {
 // 12h sparkline, measured rate-pipe arrow and dropdown; the new squares add the
 // age line only. n/a and unknown squares render 'n/a'/'?' with no age rather
 // than inventing a number (Ben's brief, 2026-09-11).
+// Every field shipFlowHtml/shipStage/shipArrow read directly (not via `??`),
+// defaulted to null/empty so a total-failure `d` (see the SHIP_BLANK_PIPELINE
+// caller) renders fifteen honest unknowns, never a string built from two
+// missing numbers reading as a real value ("null/null").
+const SHIP_BLANK_PIPELINE = {
+    bugs_found_24h: null, last_issue_created_at: null, issues_open: null,
+    dispatched: null, dispatched_last_at: null,
+    prs_open: null, prs_open_last_at: null, prs_oldest_min: null,
+    ci_queued: null, ci_running: null, ci_oldest_min: null, ci_last_run_started_at: null,
+    green_waiting: null, green_waiting_prs: [], green_oldest_min: null,
+    green_wait_avg_min: null, green_wait_n: null, green_wait_excluded: null, green_wait_prs: [],
+    review_routed: null, review_routed_last_at: null,
+    in_review: null, in_review_last_at: null,
+    gate_verdicts: null, gate_verdicts_last_at: null,
+    conflicted: null, conflicted_last_at: null,
+    resolved: null, approved: null, approved_last_at: null,
+    has_merge_queue: null, queue_depth: null, queue_oldest_min: null, queue_prs: [],
+    merged_today: null, merged_today_prs: [], merged_last_hour: null, last_merge_at: null,
+    merged_since_min: null, merged_spark: [0, 0, 0, 0, 0, 0, 0],
+    deploy_commits_waiting: null, deploy_since_min: null, deploy_run_id: null, deploy_run_state: null,
+    last_deploy_at: null, last_deploy_sha: null, deploy_configured: null, deploy_state: null,
+    deploy_next_tick_at: null, deploy_run_sha: null,
+    deployed_prs_today: null, deployed_prs_today_list: [],
+    spark12h: {}, arrows: [], folded: null, folded_last_at: null,
+};
 function shipFlowHtml(d) {
-        const ciNum = d.ci_queued + '/' + d.ci_running;
-        const ciCls = d.ci_queued > 5 ? 'hot' : (d.ci_queued > 0 ? 'warn' : 'ok');
+        // A null half must never stringify into "null/null" and read as a real
+        // count - both halves have to be measured or the whole box is unknown.
+        const ciNum = (d.ci_queued === null || d.ci_queued === undefined
+            || d.ci_running === null || d.ci_running === undefined) ? null : (d.ci_queued + '/' + d.ci_running);
+        // ciNum === null (unknown) must stay neutral, never fall through to
+        // the 'ok' default meant for a MEASURED zero - that was a false green.
+        const ciCls = ciNum === null ? '' : (d.ci_queued > 5 ? 'hot' : (d.ci_queued > 0 ? 'warn' : 'ok'));
         const greenCls = d.green_waiting >= 6 ? 'hot' : (d.green_waiting >= 3 ? 'warn' : (d.green_waiting > 0 ? 'ok' : ''));
         const stuck = (d.queue_prs || []).find(pr => pr.state === 'UNMERGEABLE');
         // SHIP-SPARK-3 item 4: has_merge_queue === false means this repo has none
         // configured (GraphQL mergeQueue returned null) - neutral "n/a", never the
         // "0 queued" red alarm a real empty queue on armbrain would show.
         const noQueue = d.has_merge_queue === false;
-        const queueCls = noQueue ? '' : (stuck || d.queue_depth === 0 ? 'hot' : (d.queue_depth === 1 ? 'warn' : 'ok'));
+        // d.queue_depth null (unknown, distinct from noQueue's "no merge queue
+        // configured") must stay neutral - it was falling through to 'ok'.
+        const queueCls = noQueue ? '' : (d.queue_depth === null || d.queue_depth === undefined ? ''
+            : (stuck || d.queue_depth === 0 ? 'hot' : (d.queue_depth === 1 ? 'warn' : 'ok')));
         // SHIP-OLDEST: box colour + "oldest:" sub-line from the age of the oldest item in each
         // box (thresholds in SHIP_OLDEST_THRESHOLDS). A null age keeps the box neutral and reads
         // "oldest: ?"; a count of 0 shows no sub-line and no colour.
