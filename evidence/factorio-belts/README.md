@@ -4,6 +4,30 @@ chain, and rate-driven animation. Captured against this worktree's own Flask
 process (port 5099), not the live `queue-router.service` - that was never
 touched or restarted.
 
+**Round 2 (Elrond review, PR #35, 5 blocking defects - all fixed):**
+1. No stage ever renders a bare `?` any more (ship-num, the issues-rate
+   sparkline panel, the "oldest:" sub-line, and the deploy sub-line all
+   render nothing, or a real word like "unknown"/"n/a", instead) - the sprite
+   or its remnant is the only thing allowed to say "no data" now.
+2. `BUGS FOUND` no longer clips at the left edge - a side effect of fix 5's
+   row rebalance giving row 1 more width per stage.
+3. The boustrophedon turn arrows (`#ship-elbow-1`/`#ship-elbow-2`) are now
+   `position:absolute` and JS-synced (`positionShipElbows`) to sit tucked
+   against the actual corner of the square they turn from, instead of
+   floating in whatever gap a row's shortest column happened to leave.
+4. Belts widened from 56px to 76px (brief's floor was 48px) with larger
+   16px items - no longer reads as a connector widget.
+5. Rows rebalanced from 7/7/1 to 6/4/5 - the two new row breaks fall exactly
+   where the arrow was already decorative (no formal rate/backlog instrument),
+   so no measured belt (issues-prs, prs-ci, ci-green, green-inline,
+   inline-merged, merged-deploy) moved or was dropped.
+
+`FOLDED` and `RESOLVED` were also flagged as "indistinct grey lumps" - checked
+against the source PNGs (`static/factorio/roboport.png`,
+`static/factorio/construction-robot.png`): both are the correct, intended
+sprites per `SHIP_STAGE_META`, not a fallback. They are just inherently
+grey/tan Factorio art at small size; left unchanged.
+
 - `strip-1440-full.png`: full strip at 1440px against a synthetic fixture with
   one deliberately measured-zero/backlogged arrow (`ci-green`), so a backed-up
   belt is visible alongside normal flowing ones.
@@ -14,8 +38,8 @@ touched or restarted.
 - `state-idle.png` / `state-stalled.png` / `state-no-data.png`: three squares
   from the same fixture render, side by side by name - idle (intact, fresh),
   stalled (intact, red "4h" age line, not wreckage), no-data (remnant
-  wreckage sprite, `?` numeral) - proving the three states stay visually
-  distinct, per the lore's explicit "must never look alike" rule.
+  wreckage sprite, no numeral at all) - proving the three states stay
+  visually distinct, per the lore's explicit "must never look alike" rule.
 - `strip-1440-greyscale.png`: `grayscale(100%)` filter applied - the backed-up
   belt is still legible from packing/density alone (shape/mass), not color.
 - `strip-1440-reduced-motion.png`: rendered under

@@ -90,8 +90,30 @@ with sync_playwright() as p:
     assert page.locator('.ship-belt').count() == 12
     assert page.locator('.ship-belt-item').count() > 0
     assert page.locator('.ship-belt-backed-up').count() == 1
+    # Round 2 defect 4: belts must read as belts, not connector widgets - the
+    # brief's >=48px floor, with real margin above it.
+    belt_width = page.eval_on_selector('.ship-belt', 'el => el.getBoundingClientRect().width')
+    assert belt_width >= 64, belt_width
+    # Round 2 defect 5: row 3 is no longer a lone square.
+    assert page.locator('.ship-row-3 .ship-stage').count() == 5
     # No-data state (prs open) shows real remnant wreckage, not a live sprite.
     assert page.locator('[data-square="prs open"] .ship-sprite.remnant').count() == 1
+
+    # Round 2 (Elrond review, PR #35, defect 1): no stage may ever render a
+    # bare '?' - it reads as indistinguishable from the no-data wreckage state
+    # the sprite/remnant already carries. Every one of the 15 stages gets a
+    # real sprite or the documented remnant; the count, sub-lines, and rate
+    # panels render nothing rather than a glyph when a value is unknown.
+    strip_text = strip.inner_text()
+    assert '?' not in strip_text, strip_text
+
+    # Round 2 defect 3: the row-turn elbows must sit tucked against their
+    # anchor square, not floating - within ~40px of it in both axes.
+    for elbow_id, anchor_square in (('ship-elbow-1', 'review routed'), ('ship-elbow-2', 'resolved')):
+        elbow_box = page.locator('#' + elbow_id).bounding_box()
+        anchor_box = page.locator('[data-square="' + anchor_square + '"]').bounding_box()
+        assert elbow_box and anchor_box, (elbow_id, anchor_square)
+        assert abs(elbow_box['y'] - anchor_box['y'] - anchor_box['height']) < 40, (elbow_id, elbow_box, anchor_box)
 
     # Three states side by side, proven never to look alike.
     page.locator('[data-square="bugs found"]').screenshot(path=str(OUT / 'state-idle.png'))

@@ -7155,9 +7155,12 @@ box-shadow:0 0 7px rgba(255,0,68,0.3)}
 .ship-flow-wrap{display:flex;flex-direction:column;gap:0}
 .ship-flow{display:flex;align-items:stretch;gap:0;flex-wrap:wrap;margin:0 0 9px 0}
 .ship-flow.ship-row-2{flex-direction:row-reverse}
-.ship-elbow{font-size:1.3em;line-height:1;color:var(--neon-magenta);text-shadow:0 0 8px var(--neon-magenta);padding:0 22px;margin:-4px 0 2px 0}
-.ship-elbow-right{text-align:right}
-.ship-elbow-left{text-align:left}
+/* Round 2 (Elrond review, PR #35, defect 3): position:absolute + JS sync
+   (positionShipElbows) instead of a full-width text-aligned flow div - see
+   the call site's comment. Removed from flow entirely so it can't leave a
+   gap of its own between rows; z-index above the belts/sprites it sits near. */
+.ship-elbow{position:absolute;z-index:5;font-size:1.3em;line-height:1;color:var(--neon-magenta);
+text-shadow:0 0 8px var(--neon-magenta);pointer-events:none}
 .ship-age{font-size:0.66em;color:#7d8798;white-space:nowrap;margin-top:1px}
 .ship-age.warn{color:var(--neon-yellow)}
 .ship-age.hot{color:var(--neon-red)}
@@ -7498,10 +7501,12 @@ font-size:0.85em;letter-spacing:0.5px;vertical-align:middle}
 .ship-cap{font-size:.65em;letter-spacing:1px}
 .ship-num.stamp{font-size:.85em}
 /* LORE order 11 #2 / order 1: a real belt segment (>=48px), not a glyph with
-   a number beside it. Widened from the old 64px pipe-only slot so the belt
-   reads as a segment rather than a sliver next to the inserter. */
-.ship-arrow{position:relative;flex:0 0 112px;align-self:center;justify-content:center;height:36px;
-gap:2px;padding:0 4px;border:0;background:transparent;color:var(--arrow-color);cursor:pointer;font-size:11px;text-shadow:none}
+   a number beside it. Round 2 (Elrond review, PR #35, defect 4): the first
+   pass's 56px belt still read as "a connector widget, not a belt" - widened
+   again, and the row rebalance (defects 4+5, "the same layout problem") frees
+   up the room to do it without re-cramping the squares. */
+.ship-arrow{position:relative;flex:0 0 132px;align-self:center;justify-content:center;height:36px;
+gap:3px;padding:0 4px;border:0;background:transparent;color:var(--arrow-color);cursor:pointer;font-size:11px;text-shadow:none}
 .ship-arrow.bottleneck{animation:ship-arrow-bottleneck-pulse 1.6s ease-in-out infinite}
 @keyframes ship-arrow-bottleneck-pulse{0%,100%{filter:drop-shadow(0 0 4px var(--neon-red))}50%{filter:drop-shadow(0 0 11px var(--neon-red))}}
 @media(prefers-reduced-motion:reduce){.ship-arrow.bottleneck{animation:none}}
@@ -7509,16 +7514,16 @@ gap:2px;padding:0 4px;border:0;background:transparent;color:var(--arrow-color);c
 /* The belt itself: a scrolling texture tile carrying the order-10 item chain.
    State is rendered, never captioned - order 9's "hover is where the numbers
    live" (native title attr on the arrow, unchanged). */
-.ship-belt{position:relative;width:56px;height:20px;flex:0 0 56px;overflow:hidden;
+.ship-belt{position:relative;width:76px;height:24px;flex:0 0 76px;overflow:hidden;
 border-radius:2px;outline:1px solid var(--arrow-outline)}
 .ship-belt-track{position:absolute;inset:0;background-image:url('/static/factorio/belt/belt-tile.png');
-background-repeat:repeat-x;background-size:16px 16px;image-rendering:pixelated;opacity:.85;
+background-repeat:repeat-x;background-size:18px 18px;image-rendering:pixelated;opacity:.85;
 animation:ship-belt-flow linear infinite;animation-duration:var(--belt-duration,0s);animation-play-state:running}
-@keyframes ship-belt-flow{to{background-position-x:-16px}}
+@keyframes ship-belt-flow{to{background-position-x:-18px}}
 .ship-belt-left .ship-belt-track{animation-name:ship-belt-flow-rev}
-@keyframes ship-belt-flow-rev{to{background-position-x:16px}}
+@keyframes ship-belt-flow-rev{to{background-position-x:18px}}
 .ship-belt-items{position:absolute;inset:0}
-.ship-belt-item{position:absolute;top:50%;width:13px;height:13px;transform:translate(-50%,-50%);
+.ship-belt-item{position:absolute;top:50%;width:16px;height:16px;transform:translate(-50%,-50%);
 filter:drop-shadow(0 1px 1px rgba(0,0,0,.6))}
 .ship-belt-item svg{display:block;width:100%;height:100%}
 /* Order 13's correction: a packed belt is a customer waiting, never the
@@ -7970,10 +7975,13 @@ function shipIssuesClosedRateSeries(samples) {
 }
 function shipIssuesRatePanel(samples) {
     const rates = shipIssuesClosedRateSeries(samples);
-    const current = rates.length ? Number(rates[rates.length - 1].v).toFixed(1) : '?';
+    // Round 2 (Elrond review, PR #35): no history yet renders nothing here,
+    // not a floating '?' - that glyph was reading as a second, competing
+    // no-data signal sitting above the sprite.
+    const current = rates.length ? Number(rates[rates.length - 1].v).toFixed(1) : '';
     return '<div class="ship-issues-rate" title="Net issues closed per hour, trailing one-hour average">'
         + shipHistorySpark(rates, 'issues-closed-per-hour')
-        + '<span class="ship-issues-rate-now" aria-label="Current net issues closed per hour">' + current + '</span></div>';
+        + (current !== '' ? '<span class="ship-issues-rate-now" aria-label="Current net issues closed per hour">' + current + '</span>' : '') + '</div>';
 }
 
 // SHIP-SPARK-3 (carried gap from SHIP-SPARK): real hover proof for the sparkline
@@ -8163,8 +8171,12 @@ function shipOldestClass(box, min) {
     return m < t[0] ? 'merge-green' : (m < t[1] ? 'merge-yellow' : 'merge-red');
 }
 function shipOldestSub(count, min) {
-    // The "oldest:" sub-line: nothing when the box holds nothing, "oldest: ?" when unknown.
-    return Number(count) > 0 ? 'oldest: ' + shipOldestText(min) : '';
+    // The "oldest:" sub-line: nothing when the box holds nothing, and (Round 2,
+    // Elrond review PR #35) nothing when the age itself is unknown either -
+    // "oldest: ?" was still a bare glyph on screen, just wrapped in words.
+    if (!(Number(count) > 0)) return '';
+    if (min === null || min === undefined || isNaN(Number(min))) return '';
+    return 'oldest: ' + shipOldestText(min);
 }
 function shipOldestWords(box, what) {
     // Plain-words definition + thresholds for the tooltip.
@@ -8279,8 +8291,16 @@ function shipSpriteHtml(cap, unknown) {
 function shipStage(num, cap, cls, sub, spark, help, stageCls, dropdownKey, prs, label, hist, sub2, belowCap, lastActivity) {
     const agents = (shipAgents || []).filter(a => a.live && a.square === cap);
     const key = dropdownKey || cap.replaceAll(' ', '-').replaceAll('/', '-');
-    const shownNum = (num === null || num === undefined) ? '?' : num;
-    const unknown = shownNum === '?' || shownNum === 'n/a';
+    // Round 2 (Elrond review, PR #35): a bare "?" glyph is indistinguishable
+    // from the no-data wreckage state it sits next to - the sprite (real or
+    // remnant) is the ONLY thing allowed to say "no data" now. An unknown
+    // count renders nothing at all (no plate, no glyph) rather than '?' -
+    // still never a measured 0. 'n/a' is a distinct, legitimate label (a
+    // measured "not applicable", not an unavailable instrument) and keeps
+    // rendering as text.
+    const isUnknownNum = num === null || num === undefined || num === '?';
+    const shownNum = isUnknownNum ? '' : num;
+    const unknown = isUnknownNum || shownNum === 'n/a';
     const meta = SHIP_STAGE_META[cap];
     const shapeCls = meta ? ' stage-' + meta.kind : '';
     // SHIP-SPARK: the 12h history sparkline renders first, above the number,
@@ -8299,8 +8319,10 @@ function shipStage(num, cap, cls, sub, spark, help, stageCls, dropdownKey, prs, 
          + ' onclick="toggleShipDropdown(this.dataset.dropdown)" onkeydown="shipStageKeydown(event,this.dataset.dropdown)"'
          + (help ? ' title="' + help.replace(/"/g, '') + '"' : '') + '>' + (hist || '')
          + '<div class="ship-sprite-wrap">' + shipSpriteHtml(cap, unknown)
-         // An unknown count renders '?' - it must never read as a measured 0.
-         + '<div class="ship-num ' + (cls || '') + '">' + shownNum + '</div></div>'
+         // An unknown count renders NOTHING here (no plate, no '?' glyph) -
+         // it must never read as a measured 0, and must never look like a
+         // second, competing "no data" signal next to the sprite/remnant.
+         + (shownNum !== '' ? '<div class="ship-num ' + (cls || '') + '">' + shownNum + '</div>' : '') + '</div>'
          + '<div class="ship-cap">' + (label || cap) + '</div>'
          + (belowCap ? '<div class="ship-stage-drain">' + shipEscape(belowCap) + '</div>' : '')
          + (sub ? '<div class="ship-sub">' + sub + '</div>' : '')
@@ -8446,13 +8468,17 @@ const SHIP_ARROW_ITEMS = {
     'dispatched':    ['plate-iron', 'gear'],
     'prs open':      ['gear', 'gear'],
     'ci q/run':      ['gear', 'circuit'],
-    'review routed': ['circuit', 'circuit'],
+    // Round 2 rebalance (PR #35 review): 'in review' and 'folded' are now
+    // within-row arrows (they were row-end dead ends before, with no belt at
+    // all); 'review routed' and 'resolved' are the new row-end dead ends and
+    // no longer need an entry here.
+    'in review':     ['circuit', 'circuit'],
     'gate verdicts': ['circuit', 'circuit-adv'],
     'conflicted':    ['circuit-adv', 'circuit-adv'],
-    'resolved':      ['circuit-adv', 'circuit-adv'],
     'approved':      ['circuit-adv', 'rocket-part'],
     'in line':       ['rocket-part', 'rocket-part'],
     'merged today':  ['rocket-part', 'satellite'],
+    'folded':        ['satellite', 'satellite'],
 };
 // LORE order 1 "the belt backs up" + order 11 #2: a real belt segment
 // carrying the order-10 item, populated by throughput rather than a glyph
@@ -8679,6 +8705,36 @@ function positionShipYard() {
     yard.style.left = (arrowRect.left - wrapRect.left + arrowRect.width / 2) + 'px';
     yard.style.top = (arrowRect.bottom - wrapRect.top + 2) + 'px';
     yard.style.transform = 'translateX(-50%)';
+}
+// Round 2 (Elrond review, PR #35, defect 3): "the boustrophedon turn arrows
+// are drawing outside the belt run" - the elbow used to be a full-width
+// text-aligned div, which floats in whatever gap that row's SHORTEST column
+// happens to leave below it. Tuck each one directly against the actual
+// bottom corner of the square it turns from instead - same bounding-rect-sync
+// pattern as positionShipYard above, same positioning ancestor (the elbow's
+// own parent, #ship-flow, sits inside that same position:relative wrap).
+function positionShipElbows() {
+    const wrap = document.getElementById('ship-flow') && document.getElementById('ship-flow').parentElement;
+    if (!wrap) return;
+    const wrapRect = wrap.getBoundingClientRect();
+    // Elbow 1 turns from row 1's own last square ('review routed') down to
+    // row 2's first ('in review') - tuck it under review routed's right edge.
+    const elbow1 = document.getElementById('ship-elbow-1');
+    const fromRow1 = document.querySelector('#ship-flow .ship-row-1 .ship-stage:last-child');
+    if (elbow1 && fromRow1) {
+        const r = fromRow1.getBoundingClientRect();
+        elbow1.style.left = (r.right - wrapRect.left - 26) + 'px';
+        elbow1.style.top = (r.bottom - wrapRect.top - 6) + 'px';
+    }
+    // Elbow 2 turns from row 2's own last DOM square ('resolved' - visually
+    // leftmost, since row 2 is row-reverse) down to row 3's first ('approved').
+    const elbow2 = document.getElementById('ship-elbow-2');
+    const fromRow2 = document.querySelector('#ship-flow .ship-row-2 .ship-stage:last-child');
+    if (elbow2 && fromRow2) {
+        const r = fromRow2.getBoundingClientRect();
+        elbow2.style.left = (r.left - wrapRect.left) + 'px';
+        elbow2.style.top = (r.bottom - wrapRect.top - 6) + 'px';
+    }
 }
 function renderShipYard(workers, completions) {
     const yard = document.getElementById('ship-yard');
@@ -8968,6 +9024,9 @@ function refreshShipFlow() {
         // SHIP-GAME items 2/5: the first arrow (and its bounding rect) just got
         // rebuilt above - reposition the persistent yard against the new one.
         positionShipYard();
+        // Round 2 (Elrond review, PR #35, defect 3): the row-turn elbows are
+        // freshly recreated by the innerHTML swap above too - sync them now.
+        positionShipElbows();
     }).catch(() => {
         const el = document.getElementById('ship-flow');
         if (el && !el.querySelector('.ship-stage')) el.innerHTML = '<span class="gdim">shipping pipeline failed to load.</span>';
@@ -9036,6 +9095,10 @@ function shipFlowHtml(d) {
         const ciOld = oldestOf('ci q/run', d.ci_queued, d.ci_oldest_min);
         const greenOld = oldestOf('green waiting', d.green_waiting, d.green_oldest_min);
         const queueOld = oldestOf('in queue', d.queue_depth, d.queue_oldest_min);
+        // Round 2 (Elrond review, PR #35): "green waiting: ?" was still a bare
+        // glyph wrapped in words - an unmeasured green_waiting now reads as
+        // "green waiting: n/a" (a real word, not a placeholder character).
+        const greenWaitingText = (d.green_waiting === null || d.green_waiting === undefined) ? 'n/a' : d.green_waiting;
         const greenFirst = d.green_waiting_prs.length ? '#' + d.green_waiting_prs[0].number : '';
         const greenSub = greenFirst + (greenOld.sub ? (greenFirst ? ' · ' : '') + greenOld.sub : '');
         // SHIP-SPARK-2 (Ben 11:12 AM CDT): "Ave: 42m" - mean wait of every PR that entered
@@ -9061,7 +9124,7 @@ function shipFlowHtml(d) {
         const deployWords = ' Commits waiting to deploy: ' + (waiting === null || waiting === undefined ? 'unknown' : waiting) + '.'
             + ' Deployed ' + shipOldestText(d.deploy_since_min) + ' ago.'
             + ((d.deploy_run_id !== null && d.deploy_run_id !== undefined)
-                ? ' Newest deploy-related run: #' + d.deploy_run_id + ' ' + (d.deploy_run_state || '?') + '.' : '');
+                ? ' Newest deploy-related run: #' + d.deploy_run_id + ' ' + (d.deploy_run_state || 'unknown') + '.' : '');
         let mergedSub = d.merged_last_hour !== null && d.merged_last_hour !== undefined ? '60m: ' + d.merged_last_hour : '';
         if (d.last_merge_at) {
             const t = new Date(d.last_merge_at).toLocaleTimeString('en-US', {hour:'numeric', minute:'2-digit', timeZone:'America/Chicago'}).toLowerCase().replace(' ','');
@@ -9090,14 +9153,16 @@ function shipFlowHtml(d) {
             deployStateSub = 'no deploy workflow on ' + (d.repo_name || d.repo_full || 'this repo');
             deployStateCls = '';
         } else if (d.deploy_state === 'shipping') {
-            deployStateSub = 'shipping now · ⎇ ' + (d.deploy_run_sha || '?');
+            // Round 2 (Elrond review, PR #35): a missing detail reads as a
+            // word ("unknown"), never a bare '?' glyph.
+            deployStateSub = 'shipping now · ⎇ ' + (d.deploy_run_sha || 'unknown');
             deployStateCls = 'merge-blue';
         } else if (d.deploy_state === 'held') {
-            deployStateSub = 'held · next tick ' + (d.deploy_next_tick_at ? fmtCT(d.deploy_next_tick_at) : '?');
+            deployStateSub = 'held · next tick ' + (d.deploy_next_tick_at ? fmtCT(d.deploy_next_tick_at) : 'unknown');
             deployStateCls = deployCls;
         } else if (d.deploy_state === 'stalled') {
             const nextTickMs = d.deploy_next_tick_at ? Date.parse(d.deploy_next_tick_at) : NaN;
-            deployStateSub = 'STALLED · tick ' + (Number.isFinite(nextTickMs) ? fmtCT(new Date(nextTickMs - 2 * 3600000).toISOString()) : '?') + ' missed';
+            deployStateSub = 'STALLED · tick ' + (Number.isFinite(nextTickMs) ? fmtCT(new Date(nextTickMs - 2 * 3600000).toISOString()) : 'unknown') + ' missed';
             deployStateCls = 'merge-red merge-pulse';
         } else if (d.deploy_state === 'current') {
             deployStateSub = 'up to date';
@@ -9109,8 +9174,10 @@ function shipFlowHtml(d) {
             {hour:'numeric',minute:'2-digit',hour12:true,timeZone:'America/Chicago'}) + ' CT';
         // Ben 2:46 PM CDT 9/11: "last deploy 2:06 PM CT" -> "X h, Y m ago"; drop the
         // "next held"/"next <time>" line entirely (deployNextLine no longer computed).
+        // Round 2 (Elrond review, PR #35): an unmeasured since_min reads as
+        // 'unknown', never a bare '?' glyph under the sprite.
         const deployLastLine = noDeploy ? deployStateSub
-            : (d.deploy_since_min === null || d.deploy_since_min === undefined ? '?' :
+            : (d.deploy_since_min === null || d.deploy_since_min === undefined ? 'unknown' :
                 Math.floor(Math.max(0, Number(d.deploy_since_min)) / 60) + ' h, ' + (Math.max(0, Math.floor(Number(d.deploy_since_min))) % 60) + ' m ago');
         const sp = d.spark12h || {};
         // SHIP-PIPES: arrows carry rate/backlog/drain from the server; the
@@ -9147,44 +9214,69 @@ function shipFlowHtml(d) {
         const conflictCls = d.conflicted > 0 ? 'hot' : '';
         const gateCls = d.gate_verdicts > 0 ? 'warn' : '';
 
-        // Row 1: bugs found -> issues open -> dispatched -> prs open -> ci q/run
-        // -> review routed -> in review, left to right.
+        // Round 2 (Elrond review, PR #35, defects 4+5 "the same layout
+        // problem"): 7/7/1 read as a nearly-empty last row and squeezed
+        // every belt down to a connector-width sliver. Rebalanced to 6/4/5 -
+        // the two new row breaks (after 'review routed', after 'resolved')
+        // fall exactly where the ORIGINAL layout already had no formal rate
+        // instrument on the outgoing arrow (both were decorative/count-only),
+        // so no real measured belt (issues-prs, prs-ci, ci-green, green-inline,
+        // inline-merged, merged-deploy) moves or is dropped - only decorative
+        // glyph-arrows are added, removed, or relocated.
+        //
+        // Row 1: bugs found -> issues open -> dispatched -> prs open ->
+        // ci q/run -> review routed, left to right.
         const row1 =
             shipStage(d.bugs_found_24h ?? null, 'bugs found', bugsCls, '', null, HELP.bugsFound, '', 'bugs-found', [], null, null, null, null, d.last_issue_created_at) + shipArrow('bugs found', '⚡', null, 'Issues created in the last 24h', null, null, false, String(d.bugs_found_24h ?? '?'), null, 'right') +
             shipStage(d.issues_open, 'issues open', '', '', null, HELP.issues, '', null, null, null, shipIssuesRatePanel(sp.issues), null, arrowByKey['issues-prs'] && arrowByKey['issues-prs'].drain_label, d.last_issue_created_at) + shipArrow('issues open', '🤖', arrowByKey['issues-prs'], 'PRs opened in the last hour, from GitHub search - click for live agent lanes', null, wFor('issues-prs'), isB('issues-prs'), arrowByKey['issues-prs'] && arrowByKey['issues-prs'].label, null, 'right') +
             shipStage(d.dispatched ?? null, 'dispatched', '', '', null, HELP.dispatched, '', 'dispatched', [], null, null, null, null, d.dispatched_last_at) + shipArrow('dispatched', '🤖', null, 'Live dispatched lanes', null, null, false, String(d.dispatched ?? '?'), null, 'right') +
             shipStage(d.prs_open, 'prs open', '', prsOld.sub, null, HELP.prs + shipOldestWords('prs open', 'age of the oldest open, non-draft pull request'), prsOld.cls, null, null, null, shipHistorySpark(sp.prs, 'prs'), null, null, d.prs_open_last_at) + shipArrow('prs open', '⚙', arrowByKey['prs-ci'], 'Distinct PRs with a CI run started this hour, from the GitHub workflow-runs list', d.ci_queued, wFor('prs-ci'), isB('prs-ci'), null, null, 'right') +
-            // SHIP-16-FIX: "green waiting" folded back into ci q/run as a sub-line
-            // instead of its own square (Ben, 2026-09-11) - restores the 7/7/1
-            // boustrophedon; row 2 no longer carries it as a stage.
-            shipStage(ciNum, 'ci q/run', ciCls, ciOld.sub, null, HELP.ciqr + shipOldestWords('ci q/run', 'how long the oldest queued run in the last 48 h has waited to start (since it was re-queued, if it was re-run)') + ' Green waiting: ' + (d.green_waiting ?? '?') + ' PRs approved and green but not yet enqueued.' + greenWaitWords, ciOld.cls, null, null, null, shipHistorySpark(sp.ci, 'ci'), 'green waiting: ' + (d.green_waiting ?? '?') + (greenSub ? ' · ' + greenSub : '') + (greenWaitSub ? ' · ' + greenWaitSub : ''), null, d.ci_last_run_started_at) + shipArrow('ci q/run', '⚙', arrowByKey['ci-green'], 'Distinct PRs with a green Pre-Merge Gate run this hour (workflow 255384592)', d.ci_running, wFor('ci-green'), isB('ci-green'), null, null, 'right') +
-            shipStage(d.review_routed ?? null, 'review routed', '', '', null, HELP.reviewRouted, '', 'review-routed', [], null, null, null, null, d.review_routed_last_at) + shipArrow('review routed', '👀', null, 'PRs carrying a reviewer label', null, null, false, String(d.review_routed ?? '?'), null, 'right') +
-            shipStage(d.in_review ?? null, 'in review', '', '', null, HELP.inReview, '', 'in-review', [], null, null, null, null, d.in_review_last_at);
+            shipStage(ciNum, 'ci q/run', ciCls, ciOld.sub, null, HELP.ciqr + shipOldestWords('ci q/run', 'how long the oldest queued run in the last 48 h has waited to start (since it was re-queued, if it was re-run)') + ' Green waiting: ' + greenWaitingText + ' PRs approved and green but not yet enqueued.' + greenWaitWords, ciOld.cls, null, null, null, shipHistorySpark(sp.ci, 'ci'), 'green waiting: ' + greenWaitingText + (greenSub ? ' · ' + greenSub : '') + (greenWaitSub ? ' · ' + greenWaitSub : ''), null, d.ci_last_run_started_at) + shipArrow('ci q/run', '⚙', arrowByKey['ci-green'], 'Distinct PRs with a green Pre-Merge Gate run this hour (workflow 255384592)', d.ci_running, wFor('ci-green'), isB('ci-green'), null, null, 'right') +
+            // 'review routed' is now row 1's own end - the elbow (not a belt)
+            // carries the turn to 'in review' at the start of row 2.
+            shipStage(d.review_routed ?? null, 'review routed', '', '', null, HELP.reviewRouted, '', 'review-routed', [], null, null, null, null, d.review_routed_last_at);
 
-        // Row 2: gate verdicts -> conflicted -> resolved -> approved -> green
-        // waiting -> in line -> merged today -> folded, in source order; the CSS
-        // row-reverse puts "gate verdicts" at the right edge under "in review".
+        // Row 2: in review -> gate verdicts -> conflicted -> resolved, in
+        // source order; the CSS row-reverse puts 'in review' at the right
+        // edge under 'review routed'.
         const row2 =
+            // NEW decorative arrow (no formal rate instrument existed for this
+            // transition either before or after the rebalance): in review was
+            // previously row 1's own dead end and never needed one.
+            shipStage(d.in_review ?? null, 'in review', '', '', null, HELP.inReview, '', 'in-review', [], null, null, null, null, d.in_review_last_at) + shipArrow('in review', '👁', null, 'PRs currently under human/AI review', null, null, false, String(d.in_review ?? '?'), null, 'left') +
             shipStage(d.gate_verdicts ?? null, 'gate verdicts', gateCls, '', null, HELP.gateVerdicts, '', 'gate-verdicts', [], null, null, null, null, d.gate_verdicts_last_at) + shipArrow('gate verdicts', '⛨', null, 'PRs with a non-passing gate-verdict check', null, null, false, String(d.gate_verdicts ?? '?'), null, 'left') +
             shipStage(d.conflicted ?? null, 'conflicted', conflictCls, '', null, HELP.conflicted, '', 'conflicted', [], null, null, null, null, d.conflicted_last_at) + shipArrow('conflicted', '⚠', null, 'Open PRs with a merge conflict', null, null, false, String(d.conflicted ?? '?'), null, 'left') +
-            shipStage(d.resolved === null || d.resolved === undefined ? 'n/a' : d.resolved, 'resolved', '', '', null, HELP.resolved + ((d.resolved === null || d.resolved === undefined) && d.resolved_na_reason ? ' (' + d.resolved_na_reason + ')' : ''), '', 'resolved', [], null, null, null, null, null) + shipArrow('resolved', '✓', null, 'Conflicts cleared in 24h', null, null, false, String(d.resolved ?? 'n/a'), null, 'left') +
+            // 'resolved' is now row 2's own end - the elbow carries the turn
+            // to 'approved' at the start of row 3 (its old decorative arrow
+            // to 'approved' is dropped along with the row it used to feed).
+            shipStage(d.resolved === null || d.resolved === undefined ? 'n/a' : d.resolved, 'resolved', '', '', null, HELP.resolved + ((d.resolved === null || d.resolved === undefined) && d.resolved_na_reason ? ' (' + d.resolved_na_reason + ')' : ''), '', 'resolved', [], null, null, null, null, null);
+
+        // Row 3: approved -> in line -> merged today -> folded -> deployed,
+        // left to right - five stages fill the row instead of one.
+        const row3 =
             // SHIP-16-FIX: this used to feed the now-removed 'green waiting' square;
             // it now points straight at 'in line' - approved PRs move toward the
             // queue, and green-waiting's own count/age live as ci q/run's sub-line above.
-            shipStage(d.approved ?? null, 'approved', '', '', null, HELP.approved, '', 'approved', [], null, null, null, null, d.approved_last_at) + shipArrow('approved', '✅', arrowByKey['green-inline'], 'Approved PRs not yet merged', null, wFor('green-inline'), isB('green-inline'), null, null, 'left') +
-            shipStage(queueNum, 'in line', queueCls, queueSub, null, queueHelp, queueOld.cls, 'in-line', d.queue_prs, 'in queue', shipHistorySpark(sp.queue, 'queue'), null, null, null) + shipArrow('in line', '⚡', arrowByKey['inline-merged'], 'Merge queue entries', d.queue_depth, wFor('inline-merged'), isB('inline-merged'), null, null, 'left') +
-            shipStage(d.merged_today, 'merged today', 'ok', mergedSub, d.merged_spark, HELP.merged + shipOldestWords('merged today', 'minutes since the last merge'), mergedStage, 'merged-today', d.merged_today_prs, null, shipHistorySpark(sp.merged, 'merged'), null, null, d.last_merge_at) + shipArrow('merged today', '⚡', arrowByKey['merged-deploy'], 'Production deploy workflows in flight, or merge awaiting deploy', shipDeployCount(d), wFor('merged-deploy'), isB('merged-deploy'), null, null, 'left') +
-            shipStage(d.folded ?? null, 'folded', '', '', null, HELP.folded, '', 'folded', [], null, null, null, null, d.folded_last_at);
-
-        // Row 3: the deploy square alone, left-aligned under the end of row 2.
-        const row3 =
+            shipStage(d.approved ?? null, 'approved', '', '', null, HELP.approved, '', 'approved', [], null, null, null, null, d.approved_last_at) + shipArrow('approved', '✅', arrowByKey['green-inline'], 'Approved PRs not yet merged', null, wFor('green-inline'), isB('green-inline'), null, null, 'right') +
+            shipStage(queueNum, 'in line', queueCls, queueSub, null, queueHelp, queueOld.cls, 'in-line', d.queue_prs, 'in queue', shipHistorySpark(sp.queue, 'queue'), null, null, null) + shipArrow('in line', '⚡', arrowByKey['inline-merged'], 'Merge queue entries', d.queue_depth, wFor('inline-merged'), isB('inline-merged'), null, null, 'right') +
+            shipStage(d.merged_today, 'merged today', 'ok', mergedSub, d.merged_spark, HELP.merged + shipOldestWords('merged today', 'minutes since the last merge'), mergedStage, 'merged-today', d.merged_today_prs, null, shipHistorySpark(sp.merged, 'merged'), null, null, d.last_merge_at) + shipArrow('merged today', '⚡', arrowByKey['merged-deploy'], 'Production deploy workflows in flight, or merge awaiting deploy', shipDeployCount(d), wFor('merged-deploy'), isB('merged-deploy'), null, null, 'right') +
+            // NEW decorative arrow: folded->deployed had no arrow at all
+            // before (it was the old row2/row3 break) - now within row 3.
+            shipStage(d.folded ?? null, 'folded', '', '', null, HELP.folded, '', 'folded', [], null, null, null, null, d.folded_last_at) + shipArrow('folded', '🚀', null, 'Deploy workflows folded into this run', null, null, false, String(d.folded ?? '?'), null, 'right') +
             shipStage(noDeploy ? 'n/a' : (d.deployed_prs_today === null || d.deployed_prs_today === undefined ? '?' : d.deployed_prs_today), 'last deploy', 'ok', deployLastLine, null, (noDeploy ? 'no deploy workflow on ' + (d.repo_name || d.repo_full || 'this repo') : HELP.lastdep + shipOldestWords('last deploy', 'minutes since the last deploy, counted only while main has commits newer than it') + deployWords), deployStateCls, 'last-deploy', (d.deployed_prs_today_list || []).map(n => ({number:n,title:'deployed'})), 'deployed', shipHistorySpark(sp.deploy, 'deploy'), null, null, d.last_deploy_at);
 
+        // Round 2 (Elrond review, PR #35, defect 3): the elbows used to be
+        // full-width flow divs, text-aligned - which read as floating in
+        // whitespace whenever the row's shortest column left a gap below it.
+        // They are now position:absolute (ids below), synced by JS
+        // (positionShipElbows) to sit tucked directly against the actual
+        // corner of the square they turn from - see shipYard's identical
+        // pattern for the same reason.
         return shipLegendHtml()
              + '<div class="ship-flow ship-row-1">' + row1 + '</div>'
-             + '<div class="ship-elbow ship-elbow-right">⤵</div>'
+             + '<div class="ship-elbow ship-elbow-right" id="ship-elbow-1">⤵</div>'
              + '<div class="ship-flow ship-row-2">' + row2 + '</div>'
-             + '<div class="ship-elbow ship-elbow-left">⤵</div>'
+             + '<div class="ship-elbow ship-elbow-left" id="ship-elbow-2">⤵</div>'
              + '<div class="ship-flow ship-row-3">' + row3 + '</div>';
 }
 
