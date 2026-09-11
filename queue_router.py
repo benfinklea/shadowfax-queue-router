@@ -5590,12 +5590,65 @@ align-items:center;justify-content:center;gap:2px}
 .ship-pr a{color:var(--neon-cyan)}
 .ship-pr .ship-sub{font-size:inherit}
 .ship-pr .ship-sub.hot{color:var(--neon-red)}
+/* Machine vs robot vs chest shapes (Ben, 3:16-3:25 PM CDT 2026-09-11): a reader
+   must be able to tell at a glance what kind of thing has gone quiet, because
+   the remedy differs. Shape must survive greyscale, so it never rides on
+   colour alone. */
+.ship-stage.stage-machine{border-radius:2px;border:1px solid #2a3450;background:linear-gradient(180deg,rgba(255,255,255,.03),rgba(255,255,255,0))}
+.ship-stage.stage-robot{border-radius:9px;border:1px solid #364563;background:rgba(0,255,242,.035);
+box-shadow:0 0 8px rgba(0,255,242,.18),0 0 16px rgba(255,0,255,.09)}
+.ship-stage.stage-chest{border-radius:3px;border:1px solid #242c42;background:rgba(255,255,255,.012);box-shadow:none}
+/* Chest squares are piles waiting to be collected - staleness there is the
+   loudest signal on the strip, so weight it heavier than any other age. */
+.ship-stage.stage-chest .ship-age{font-weight:800}
+.ship-stage.stage-chest .ship-age.warn{text-shadow:0 0 6px var(--neon-yellow)}
+.ship-stage.stage-chest .ship-age.hot{text-shadow:0 0 10px var(--neon-red),0 0 18px var(--neon-red)}
+.ship-sprite{position:absolute;top:4px;left:4px;width:24px;height:24px;
+background-repeat:no-repeat;image-rendering:pixelated;pointer-events:none;opacity:.95}
+.ship-sprite.dim{opacity:.4}
+/* Standard icon sheets are Factorio mip chains: 64+32+16+8=120 wide, 64 tall -
+   the first (64x64) mip scaled to the 24x24 slot. */
+.ship-sprite.ico{background-size:45px 24px;background-position:0 0}
+.ship-sprite.chest-ico{background-size:24px 30px;background-position:center top}
+.ship-sprite.asm{width:24px;height:24px;background-size:192px 96px;image-rendering:pixelated}
+.ship-legend{display:flex;gap:18px;align-items:center;margin:6px 0 4px;font-size:.72em;color:#c7cee0}
+.ship-legend-chip{display:flex;align-items:center;gap:6px}
+.ship-legend-swatch{width:16px;height:16px;flex:0 0 auto}
+.ship-legend-swatch.stage-machine{border-radius:2px;border:1px solid #2a3450;background:rgba(255,255,255,.03)}
+.ship-legend-swatch.stage-robot{border-radius:6px;border:1px solid #364563;box-shadow:0 0 6px rgba(0,255,242,.3)}
+.ship-legend-swatch.stage-chest{border-radius:2px;border:1px solid #242c42;background-image:url('/static/factorio/chest/steel-chest.png');background-size:16px 20px;background-position:center top}
+/* long-handed-inserter-platform.png is a 4-frame rotation strip, 105x79 per
+   frame; scaled to a 30x23 slot and cropped to frame 1 (east-facing) via
+   background-position - never stretched, so it never distorts. */
+.ship-inserter{position:relative;width:44px;height:32px;flex:0 0 44px;display:flex;align-items:center;justify-content:center}
+.ship-inserter .inserter-platform{position:absolute;left:2px;bottom:0;width:30px;height:23px;
+background-image:url('/static/factorio/inserter/long-handed-inserter-platform.png');
+background-size:120px 23px;background-position:-30px 0;background-repeat:no-repeat;
+image-rendering:pixelated;opacity:.85}
+/* Hand images are a tall 72x164 single frame - scaled with width/height in the
+   SAME ratio as the source (no stretch), then rotated 90deg to reach sideways. */
+.ship-inserter .inserter-arm{position:absolute;left:14px;top:0;width:14px;height:32px;
+background-repeat:no-repeat;background-size:14px 32px;image-rendering:pixelated;
+transform-origin:50% 85%;transform:rotate(90deg);transition:transform .4s ease,opacity .4s ease}
+.ship-arrow-left .ship-inserter .inserter-arm{transform:rotate(-90deg)}
+.ship-inserter.idle .inserter-arm{opacity:.4}
+.ship-inserter.moving .inserter-arm{opacity:1;animation:inserter-reach 1.6s ease-in-out infinite}
+@keyframes inserter-reach{0%,100%{transform:rotate(75deg)}50%{transform:rotate(105deg)}}
+.ship-arrow-left .ship-inserter.moving .inserter-arm{animation:inserter-reach-left 1.6s ease-in-out infinite}
+@keyframes inserter-reach-left{0%,100%{transform:rotate(-75deg)}50%{transform:rotate(-105deg)}}
+@media(prefers-reduced-motion:reduce){.ship-inserter.moving .inserter-arm{animation:none;transform:rotate(90deg)}
+.ship-arrow-left .ship-inserter.moving .inserter-arm{transform:rotate(-90deg)}}
 .ship-stage.merge-green{border-color:rgba(57,255,20,.8);background:rgba(57,255,20,.09)}
 .ship-stage.merge-yellow{border-color:rgba(255,255,0,.8);background:rgba(255,255,0,.09)}
 .ship-stage.merge-red{border-color:rgba(255,0,68,.85);background:rgba(255,0,68,.09)}
 .ship-stage.merge-pulse{animation:merge-rate-pulse 4s ease-in-out infinite}
 @keyframes merge-rate-pulse{0%,100%{opacity:1}50%{opacity:.75}}
 @media(prefers-reduced-motion:reduce){.ship-stage.merge-pulse{animation:none}}
+/* Animated assembler (stage 4, prs open) - real work being assembled. Frame
+   stepping is driven by JS (32 frames, 8x4 grid) since it must mean
+   something: running when work is flowing, frozen at frame 0 when idle,
+   frozen+dimmed when stalled - never a screensaver. */
+.ship-sprite.asm.stalled{opacity:.4;filter:grayscale(.5)}
 .ship-num{font-family:'Orbitron',monospace;font-size:1.5em;font-weight:700;line-height:1;
 color:var(--neon-cyan);text-shadow:0 0 10px var(--neon-cyan)}
 .ship-num.ok{color:var(--neon-green);text-shadow:0 0 10px var(--neon-green)}
@@ -6135,15 +6188,89 @@ function shipAgeHtml(cap, iso) {
     return '<div class="ship-age ' + cls + '" title="' + shipEscape(abs) + '">' + shipAgeText(Math.max(0, ms)) + '</div>';
 }
 
+// Machine (deterministic automation - clock, GitHub, CI, git) vs robot (an AI
+// seat exercising judgement) vs chest (a pile waiting for something to come
+// collect it - Ben, 3:16/3:19/3:25 PM CDT 2026-09-11). Chest wins where it and
+// machine/robot would disagree, because "nothing is processing here" is the
+// sharper fact.
+const SHIP_STAGE_META = {
+    'bugs found':     {kind: 'robot',   sprite: 'repair-pack.png'},
+    'issues open':    {kind: 'chest',   sprite: 'chest/steel-chest.png'},
+    'dispatched':     {kind: 'robot',   sprite: 'inserter.png'},
+    'prs open':       {kind: 'robot',   sprite: 'assembler'},
+    'ci q/run':       {kind: 'machine', sprite: 'lab.png'},
+    'review routed':  {kind: 'chest',   sprite: 'chest/steel-chest.png'},
+    'in review':      {kind: 'robot',   sprite: 'radar.png'},
+    'gate verdicts':  {kind: 'robot',   sprite: 'programmable-speaker.png'},
+    'conflicted':     {kind: 'machine', sprite: 'deconstruction-planner.png'},
+    'resolved':       {kind: 'machine', sprite: 'construction-robot.png'},
+    'approved':       {kind: 'chest',   sprite: 'chest/steel-chest.png'},
+    'in line':        {kind: 'chest',   sprite: 'chest/steel-chest.png'},
+    'merged today':   {kind: 'machine', sprite: 'assembling-machine-3.png'},
+    'folded':         {kind: 'machine', sprite: 'roboport.png'},
+    'deployed':       {kind: 'machine', sprite: 'rocket-silo.png'},
+};
+
+function shipSpriteHtml(cap, unknown) {
+    const meta = SHIP_STAGE_META[cap];
+    if (!meta) return '';
+    const dimCls = unknown ? ' dim' : '';
+    if (meta.sprite === 'assembler') {
+        // Real running/idle/stalled state is applied by driveAssemblerAnim();
+        // this just plants the element with the correct static fallback frame.
+        return '<div class="ship-sprite asm' + dimCls + '" data-assembler="1" style="background-image:url(/static/factorio/assembler/assembling-machine-1.png);background-position:0 0"></div>';
+    }
+    const spriteCls = meta.kind === 'chest' ? 'chest-ico' : 'ico';
+    return '<div class="ship-sprite ' + spriteCls + dimCls + '" style="background-image:url(/static/factorio/' + meta.sprite + ')"></div>';
+}
+
 function shipStage(num, cap, cls, sub, spark, help, stageCls, dropdownKey, prs, lastActivity) {
     const agents = (shipAgents || []).filter(a => a.live && a.square === cap);
     const key = dropdownKey || cap.replaceAll(' ', '-').replaceAll('/', '-');
     const shownNum = (num === null || num === undefined) ? '?' : num;
-    return '<div class="ship-stage ' + (stageCls || '') + '" data-square="' + cap + '"' + (help ? ' title="' + help.replace(/"/g, '') + '"' : '') + '><div class="ship-num ' + (cls || '') + '">' + shownNum + '</div>'
+    const unknown = shownNum === '?' || shownNum === 'n/a';
+    const meta = SHIP_STAGE_META[cap];
+    const shapeCls = meta ? ' stage-' + meta.kind : '';
+    return '<div class="ship-stage' + shapeCls + ' ' + (stageCls || '') + '" data-square="' + cap + '"' + (help ? ' title="' + help.replace(/"/g, '') + '"' : '') + '>'
+         + shipSpriteHtml(cap, unknown)
+         + '<div class="ship-num ' + (cls || '') + '">' + shownNum + '</div>'
          + '<div class="ship-cap">' + cap + '</div>'
          + (sub ? '<div class="ship-sub">' + sub + '</div>' : '')
          + shipAgeHtml(cap, lastActivity)
          + (spark ? sparkHtml(spark) : '') + shipDropdown(key, prs || [], agents) + '</div>';
+}
+
+// stage 4 (prs open) assembler: running when its count is above zero AND its
+// age is inside cadence, frozen at frame 0 when idle (count 0), frozen+dimmed
+// when stalled (age gone amber/red) - a stalled machine that keeps happily
+// animating is exactly the false-green this strip exists to kill.
+const ASM_COLS = 8, ASM_ROWS = 4, ASM_FRAME = 24; // displayed frame size, px
+let asmFrame = 0, asmTimer = null;
+function driveAssemblerAnim(d) {
+    const el = document.querySelector('.ship-sprite[data-assembler="1"]');
+    if (!el) { if (asmTimer) { clearInterval(asmTimer); asmTimer = null; } return; }
+    const count = d.prs_open;
+    const ageMs = d.prs_open_last_at ? Date.now() - Date.parse(d.prs_open_last_at) : null;
+    const cadenceMs = SHIP_STAGE_DEFAULT_CADENCE_MIN * 60000;
+    const stalled = ageMs !== null && Number.isFinite(ageMs) && ageMs >= cadenceMs;
+    const running = !stalled && Number(count) > 0;
+    el.classList.toggle('stalled', stalled);
+    const reduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (asmTimer) { clearInterval(asmTimer); asmTimer = null; }
+    const setFrame = (i) => {
+        const col = i % ASM_COLS, row = Math.floor(i / ASM_COLS) % ASM_ROWS;
+        el.style.backgroundPosition = '-' + (col * ASM_FRAME) + 'px -' + (row * ASM_FRAME) + 'px';
+    };
+    if (!running || reduced) { asmFrame = 0; setFrame(0); return; }
+    asmTimer = setInterval(() => { asmFrame = (asmFrame + 1) % (ASM_COLS * ASM_ROWS); setFrame(asmFrame); }, 90);
+}
+
+function shipLegendHtml() {
+    return '<div class="ship-legend">'
+        + '<div class="ship-legend-chip"><span class="ship-legend-swatch stage-machine"></span>machine - automation (cron/CI/git)</div>'
+        + '<div class="ship-legend-chip"><span class="ship-legend-swatch stage-robot" style="background-image:url(/static/factorio/logistic-robot.png);background-size:16px 8px;background-position:0 0"></span>robot - an AI seat is judging</div>'
+        + '<div class="ship-legend-chip"><span class="ship-legend-swatch stage-chest"></span>chest - waiting for pickup</div>'
+        + '</div>';
 }
 
 // Anchors: "<=1 red, green at 90%/100 runners, glowing blue at 100%/128";
@@ -6167,6 +6294,20 @@ function capacityOutline(card, colour, glow) {
         : 'none');
 }
 
+// The arrows are long-handed inserters (Ben, 3:21 PM CDT 2026-09-11): an
+// inserter is literally the thing that moves items between two machines -
+// every outage found today was an arrow, not a box. Carries the count where
+// the held item would be; mirrored on row 2 so it reaches the direction work
+// actually moves.
+function shipInserterHtml(count, dir) {
+    const moving = count > 0;
+    const hand = moving ? 'long-handed-inserter-hand-closed.png' : 'long-handed-inserter-hand-open.png';
+    return '<span class="ship-inserter ' + (moving ? 'moving' : 'idle') + '">'
+        + '<span class="inserter-platform"></span>'
+        + '<span class="inserter-arm" style="background-image:url(/static/factorio/inserter/' + hand + ')"></span>'
+        + '</span>';
+}
+
 function shipArrow(square, glyph, count, description, dir) {
     const agentLane = glyph === '🤖';
     count = Math.max(0, Number(count) || 0);
@@ -6183,8 +6324,8 @@ function shipArrow(square, glyph, count, description, dir) {
         + '" data-square-left="' + square + '" title="' + label + '" aria-label="' + label + '"'
         + (agentLane ? ' data-dropdown="' + key + '" aria-controls="ship-list-' + key
             + '" aria-expanded="' + (openShipDropdown === key) + '" onclick="toggleShipDropdown(this.dataset.dropdown)"' : '') + '>'
-        + '<svg class="ship-arrow-shape" viewBox="0 0 48 36" preserveAspectRatio="none" aria-hidden="true"><polygon points="1,6 33,6 33,1 47,18 33,35 33,30 1,30 6,18"/></svg>'
-        + '<span class="ship-arrow-badge">' + glyph + ' ' + count + '</span></' + tag + '>';
+        + shipInserterHtml(count, dir)
+        + '<span class="ship-arrow-badge">' + count + '</span></' + tag + '>';
 }
 
 function shipDeployCount(d) {
@@ -6223,6 +6364,7 @@ function refreshShipFlow() {
         }
         try {
             el.innerHTML = shipFlowHtml(d);
+            driveAssemblerAnim(d);
         } catch (e) {
             // A JS exception here must never blank the whole panel (Ben's
             // "degrade to ?" requirement) - fall back to the pre-15-stage
@@ -6297,7 +6439,8 @@ function shipFlowHtml(d) {
     // Row 3: stage 15 alone, left-aligned under stage 14.
     const row3 = shipStage(d.deploys_ok_today ?? null, 'deployed', '', deploySub, null, HELP.lastdep, '', 'deployed', [], d.last_deploy_at);
 
-    return '<div class="ship-flow ship-row-1">' + row1 + '</div>'
+    return shipLegendHtml()
+         + '<div class="ship-flow ship-row-1">' + row1 + '</div>'
          + '<div class="ship-elbow ship-elbow-right">⤵</div>'
          + '<div class="ship-flow ship-row-2">' + row2 + '</div>'
          + '<div class="ship-elbow ship-elbow-left">⤵</div>'
