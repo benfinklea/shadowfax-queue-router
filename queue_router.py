@@ -5632,6 +5632,83 @@ def _get_merged_today_prs(headers, today, repo=None):
     return [{"number": p["number"], "title": p["title"]} for p in items]
 
 
+def _closed_issue_timings(headers, repo, deploy_runs, limit=10):
+    """Recently closed issues with the two durations Ben asked for on row 3:
+    bug found (issue created) -> dispatched (the lane launch script for that
+    issue was written), and dispatched -> deployed (the first green
+    push/dispatch production deploy run that started after the closing PR
+    merged, taken as finished at that run's updated_at). A leg that cannot
+    be measured is None - never a guess. Two GitHub reads: the closed-issues
+    list and one GraphQL query for the closing PRs; deploy runs come from
+    the deploys-today scan already done this refresh."""
+    r = requests.get(f"https://api.github.com/repos/{repo}/issues",
+                     params={"state": "closed", "sort": "updated", "direction": "desc", "per_page": 30},
+                     headers=headers, timeout=8)
+    r.raise_for_status()
+    issues = [i for i in r.json() if "pull_request" not in i][:limit]
+    if not issues:
+        return []
+    owner, name = repo.split("/", 1)
+    fields = " ".join(
+        f'i{k}:issue(number:{int(i["number"])})'
+        '{closedByPullRequestsReferences(first:3){nodes{number mergedAt commits(first:1){nodes{commit{committedDate}}}}}}'
+        for k, i in enumerate(issues))
+    query = "query($owner:String!,$name:String!){repository(owner:$owner,name:$name){" + fields + "}}"
+    g = requests.post("https://api.github.com/graphql", json={"query": query, "variables": {"owner": owner, "name": name}},
+                      headers=headers, timeout=8)
+    g.raise_for_status()
+    rows = ((g.json().get("data") or {}).get("repository") or {})
+
+    def parse(ts):
+        return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc) if ts else None
+
+    def fmt(dt):
+        return dt.strftime("%Y-%m-%dT%H:%M:%SZ") if dt else None
+
+    def mins(a, b):
+        return int((b - a).total_seconds() // 60) if a and b and b >= a else None
+
+    deploys = sorted(
+        ((parse(x.get("run_started_at") or x.get("created_at")), x) for x in (deploy_runs or [])
+         if x.get("conclusion") == "success" and x.get("event") in ("push", "workflow_dispatch")
+         and (x.get("run_started_at") or x.get("created_at"))),
+        key=lambda pair: pair[0])
+    out = []
+    for k, i in enumerate(issues):
+        n = int(i["number"])
+        created = parse(i.get("created_at"))
+        prs = (((rows.get(f"i{k}") or {}).get("closedByPullRequestsReferences") or {}).get("nodes") or [])
+        merged = min((parse(p.get("mergedAt")) for p in prs if p.get("mergedAt")), default=None)
+        # "Dispatched": the lane launch script's write time when one was
+        # recorded for this issue (only a handful ever were - there is no
+        # on-disk dispatch ledger per issue), else the first commit on the
+        # PR that closed it - the earliest GitHub-visible sign a worker
+        # started on it. Neither -> n/a, never a guess.
+        dispatched = None
+        launch = f"/workspace/planning/state/issue-{n}-launch.sh" if repo == GITHUB_CI_REPO else None
+        if launch and os.path.exists(launch):
+            dispatched = datetime.fromtimestamp(os.stat(launch).st_mtime, timezone.utc)
+        else:
+            firsts = [parse((((p.get("commits") or {}).get("nodes") or [{}])[0].get("commit") or {}).get("committedDate"))
+                      for p in prs]
+            firsts = [f for f in firsts if f]
+            dispatched = min(firsts) if firsts else None
+        deployed = None
+        if merged:
+            for started, run in deploys:
+                if started >= merged:
+                    deployed = parse(run.get("updated_at")) or started
+                    break
+        out.append({
+            "number": n, "title": (i.get("title") or "")[:80],
+            "created_at": i.get("created_at"), "closed_at": i.get("closed_at"),
+            "dispatched_at": fmt(dispatched), "merged_at": fmt(merged), "deployed_at": fmt(deployed),
+            "bug_to_dispatch_min": mins(created, dispatched),
+            "dispatch_to_deploy_min": mins(dispatched, deployed),
+        })
+    return out
+
+
 def _get_deployed_prs_today(headers, merged_today_prs, deployed_sha, repo):
     """Return today's merged PR numbers whose merge commit is reachable from production.
 
@@ -6107,6 +6184,9 @@ def get_pipeline_status(repo=None, default_branch=None, force_refresh=False):
             dep_ok = dep_fail = dep_live = 0
             live_started_min = None
             dep_days = [0] * 7
+            # Every deploy run seen this refresh (last 7 days) - reused by the
+            # closed-issue timings below, no second fetch.
+            deploy_runs_seen = []
             if deploy_workflow_ids:
                 deploy_url = f"https://api.github.com/repos/{repo}/actions/workflows/{deploy_workflow_ids[0]}/runs"
                 for page in (1, 2, 3):
@@ -6118,6 +6198,7 @@ def get_pipeline_status(repo=None, default_branch=None, force_refresh=False):
                     runs = r.json().get("workflow_runs", [])
                     if not runs:
                         break
+                    deploy_runs_seen.extend(runs)
                     for run in runs:
                         run_ct = None
                         try:
@@ -6222,6 +6303,14 @@ def get_pipeline_status(repo=None, default_branch=None, force_refresh=False):
             except Exception as e:
                 logger.warning("deployed-PR ancestry lookup failed (%s): %s", repo, e)
                 result["deployed_prs_today"], result["deployed_prs_today_list"] = None, []
+            # Ben: the closed-issues list on row 3 - two measured legs per
+            # issue, n/a where a leg has no instrument. Null (not []) when
+            # the read itself failed, so the panel says n/a, never "none".
+            try:
+                result["closed_issue_timings"] = _closed_issue_timings(headers, repo, deploy_runs_seen)
+            except Exception as e:
+                logger.warning("closed-issue timings failed (%s): %s", repo, e)
+                result["closed_issue_timings"] = None
             github_reads_ok = github_fetches_ok and all(result.get(field) is not None for field in (
                 "issues_open", "prs_open", "merged_today", "ci_queued", "ci_running"
             ))
@@ -7327,9 +7416,13 @@ transform-origin:50% 100%;transform:rotate(var(--arm-rest,90deg));transition:tra
 .ship-inserter.moving .inserter-arm{opacity:1;animation-name:inserter-swing;
 animation-timing-function:ease-in-out;animation-iteration-count:infinite;
 animation-duration:var(--swing-duration,1.6s);animation-delay:var(--swing-delay,0s)}
+/* Ben: a real inserter swings the full 180 - pickup on one side of its
+   base, drop on the opposite side. --arm-rest is the DROP side (the belt
+   for a loading inserter, the stage for an unloading one); pickup is the
+   far side, 180 degrees away; the arm sweeps over the top between them. */
 @keyframes inserter-swing{
-0%,100%{transform:rotate(calc(var(--arm-rest,90deg) - 75deg))}
-50%{transform:rotate(calc(var(--arm-rest,90deg) + 75deg))}
+0%,100%{transform:rotate(calc(var(--arm-rest,90deg) - 180deg))}
+50%{transform:rotate(var(--arm-rest,90deg))}
 }
 /* A backed-up (bottleneck) handoff freezes the arm at the pickup end (the
    swing's own 0%/100% extreme) instead of the resting middle - it reached,
@@ -7338,7 +7431,7 @@ animation-duration:var(--swing-duration,1.6s);animation-delay:var(--swing-delay,
    after it so a bottleneck arrow that also happens to have rate>0 still
    freezes rather than swings. */
 .ship-inserter.backed-up .inserter-arm{animation:none!important;opacity:1;
-transform:rotate(calc(var(--arm-rest,90deg) - 75deg))}
+transform:rotate(calc(var(--arm-rest,90deg) - 180deg))}
 @media(prefers-reduced-motion:reduce){.ship-inserter.moving .inserter-arm{animation:none;transform:rotate(var(--arm-rest,90deg))}}
 /* No card border left to color for deploy state (order 11) - the state
    becomes a glow on the sprite itself instead. */
@@ -7670,6 +7763,16 @@ gap:0;padding:2px 0;align-self:center;align-items:center}
    unloading one on the left - mirror the arrow's own row to match the
    row-reversed row it sits in. */
 .ship-row-2 .ship-arrow-vbelt{flex-direction:row-reverse}
+/* Row 3's closed-issues list (Ben) - same dark plate as the captions. */
+.ship-closed{align-self:flex-start;margin-left:48px;margin-top:8px;background:rgba(0,0,0,.66);border-radius:4px;
+padding:6px 10px;color:#fff;font-size:.72em;font-family:'Orbitron',monospace;letter-spacing:.5px;min-width:380px;max-width:560px}
+.ship-closed-head{display:grid;grid-template-columns:1fr 78px 92px;gap:8px;text-transform:uppercase;color:#c7cee0;
+font-size:.85em;border-bottom:1px solid #556;padding-bottom:3px;margin-bottom:3px;white-space:nowrap}
+.ship-closed-row{display:grid;grid-template-columns:56px 1fr 78px 92px;gap:8px;line-height:1.5;white-space:nowrap}
+.ship-closed-title{overflow:hidden;text-overflow:ellipsis;color:#e6e9f0}
+.ship-closed-num{color:var(--neon-cyan)}
+.ship-closed-t{text-align:right;font-variant-numeric:tabular-nums}
+.ship-closed-na{color:#aab;grid-template-columns:1fr}
 /* The belt itself: a scrolling texture tile carrying the order-17 item
    chain. State is rendered, never captioned - order 9's "hover is where the
    numbers live" (native title attr on the arrow, unchanged). LORE order 17
@@ -8600,6 +8703,29 @@ function driveAssemblerAnim(d) {
     asmTimer = setInterval(() => { asmFrame = (asmFrame + 1) % (ASM_COLS * ASM_ROWS); setFrame(asmFrame); }, interval);
 }
 
+// Ben: "to the right in the open space on row 3, keep a list of all the
+// issues we've closed with 2 numbers: time (hh:mm) from Bug found to
+// dispatched and from Dispatched to Deployed." Minutes come measured from
+// the server (closed_issue_timings); a null leg renders n/a, never a guess.
+function shipMinsHM(m) {
+    if (m === null || m === undefined) return 'n/a';
+    const h = Math.floor(m / 60), mm = m % 60;
+    return String(h).padStart(2, '0') + ':' + String(mm).padStart(2, '0');
+}
+function shipClosedIssuesHtml(list) {
+    const title = 'CLOSED ISSUES - hours:minutes from bug found (issue created) to dispatched (the lane launch when one was recorded, else the first commit on the PR that fixed it), and from dispatched to deployed (the first green production deploy that started after that PR merged). n/a = that leg has no measurement.';
+    let rows;
+    if (list === null || list === undefined) rows = '<div class="ship-closed-row ship-closed-na">n/a</div>';
+    else if (!list.length) rows = '<div class="ship-closed-row ship-closed-na">none closed recently</div>';
+    else rows = list.map(r => '<div class="ship-closed-row">'
+        + '<span class="ship-closed-num">#' + r.number + '</span>'
+        + '<span class="ship-closed-title">' + shipEscape(r.title || '') + '</span>'
+        + '<span class="ship-closed-t">' + shipMinsHM(r.bug_to_dispatch_min) + '</span>'
+        + '<span class="ship-closed-t">' + shipMinsHM(r.dispatch_to_deploy_min) + '</span></div>').join('');
+    return '<div class="ship-closed" title="' + title + '">'
+        + '<div class="ship-closed-head"><span>closed issues</span><span class="ship-closed-t">bug &rarr; disp</span><span class="ship-closed-t">disp &rarr; deploy</span></div>'
+        + rows + '</div>';
+}
 function shipLegendHtml() {
     return '<div class="ship-legend">'
         + '<div class="ship-legend-chip"><span class="ship-legend-swatch stage-machine"></span>machine - automation (cron/CI/git)</div>'
@@ -8899,6 +9025,13 @@ function shipArrow(square, glyph, arrow, description, legacyCount, width, isBott
     // inserter sits at the belt's own beginning (top if flowing down, bottom
     // if flowing up) or end (the opposite), never centered beside it.
     const vDown = !vertical || elbowId ? true : shipVbeltFlowsDown(square);
+    // Ben asked what "remnant" means: it is NOT time-based - it is the wreck
+    // sprite for a handoff we have no measurement for at all (the count is
+    // n/a). A handoff with a plain count but no rate instrument shows an
+    // intact, idle (open-hand, still) inserter instead; only a measured
+    // rate makes it swing. Before this it wrecked every un-instrumented
+    // arrow even when the count was known.
+    const noData = !hasRate && knownCount === null;
     const loadAlign = (vertical && !elbowId) ? (vDown ? 'align-top' : 'align-bottom') : null;
     const unloadAlign = (vertical && !elbowId) ? (vDown ? 'align-bottom' : 'align-top') : null;
     return '<' + tag + (agentLane ? ' type="button"' : ' role="img"') + ' class="ship-arrow' + (isBottleneck ? ' bottleneck' : '') + dirCls + '"'
@@ -8910,9 +9043,9 @@ function shipArrow(square, glyph, arrow, description, legacyCount, width, isBott
         // (upstream, places items on) then unloading (downstream, takes them
         // off) - same rate/backedUp/unknown state on both, but each gets its
         // own phase seed so they are never mirror-synced.
-        + shipInserterHtml(rateForSpeed, armRest, !hasRate, square + '-load', isBottleneck, duration, loadAlign)
+        + shipInserterHtml(rateForSpeed, armRest, noData, square + '-load', isBottleneck, duration, loadAlign)
         + shipBeltHtml(square, hasRate, rateForSpeed, isBottleneck, knownCount, dir, vertical, vDown, backlog)
-        + shipInserterHtml(rateForSpeed, armRest, !hasRate, square + '-unload', isBottleneck, duration, unloadAlign)
+        + shipInserterHtml(rateForSpeed, armRest, noData, square + '-unload', isBottleneck, duration, unloadAlign)
         + '</' + tag + '>';
 }
 
@@ -9449,6 +9582,7 @@ const SHIP_BLANK_PIPELINE = {
     last_deploy_at: null, last_deploy_sha: null, deploy_configured: null, deploy_state: null,
     deploy_next_tick_at: null, deploy_run_sha: null,
     deployed_prs_today: null, deployed_prs_today_list: [],
+    closed_issue_timings: null,
     spark12h: {}, arrows: [], folded: null, folded_last_at: null,
 };
 function shipFlowHtml(d) {
@@ -9664,7 +9798,8 @@ function shipFlowHtml(d) {
         // Row 3: deployed, alone for now (Ben: "it's ok if the bottom row
         // only has 1 or two" - more steps are expected to land here).
         const row3 =
-            shipStage(noDeploy ? 'n/a' : (d.deployed_prs_today === null || d.deployed_prs_today === undefined ? '?' : d.deployed_prs_today), 'last deploy', 'ok', deployLastLine, null, (noDeploy ? 'no deploy workflow on ' + (d.repo_name || d.repo_full || 'this repo') : HELP.lastdep + shipOldestWords('last deploy', 'minutes since the last deploy, counted only while main has commits newer than it') + deployWords), deployStateCls, 'last-deploy', (d.deployed_prs_today_list || []).map(n => ({number:n,title:'deployed'})), 'deployed', shipHistorySpark(sp.deploy, 'deploy'), null, null, d.last_deploy_at);
+            shipStage(noDeploy ? 'n/a' : (d.deployed_prs_today === null || d.deployed_prs_today === undefined ? '?' : d.deployed_prs_today), 'last deploy', 'ok', deployLastLine, null, (noDeploy ? 'no deploy workflow on ' + (d.repo_name || d.repo_full || 'this repo') : HELP.lastdep + shipOldestWords('last deploy', 'minutes since the last deploy, counted only while main has commits newer than it') + deployWords), deployStateCls, 'last-deploy', (d.deployed_prs_today_list || []).map(n => ({number:n,title:'deployed'})), 'deployed', shipHistorySpark(sp.deploy, 'deploy'), null, null, d.last_deploy_at)
+            + shipClosedIssuesHtml(d.closed_issue_timings);
 
         // Round 2 (Elrond review, PR #35, defect 3): the turns used to be a
         // bare glyph in a full-width flow div, text-aligned - which read as

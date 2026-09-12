@@ -48,6 +48,13 @@ pipeline_fixture = dict(
     last_deploy_sha='b494d7e', last_deploy_at='2026-09-11T20:20:00Z',
     deployed_prs_today=3, deployed_prs_today_list=[101, 102, 103],
     green_waiting=0, green_waiting_prs=[],
+    # Ben's row-3 closed-issues list: one issue with both legs measured, one
+    # with neither (a lane never launched for it) - the second must render
+    # n/a twice, never a guess.
+    closed_issue_timings=[
+        {'number': 7265, 'title': 'Capture memory button icon', 'bug_to_dispatch_min': 148, 'dispatch_to_deploy_min': 311},
+        {'number': 7301, 'title': 'Prospect list sort order', 'bug_to_dispatch_min': None, 'dispatch_to_deploy_min': None},
+    ],
     arrows=[
         {'key': 'issues-prs', 'rate_per_hour': 6, 'backlog': 4, 'drain_hours': 0.7},
         {'key': 'prs-ci', 'rate_per_hour': 3, 'backlog': 2, 'drain_hours': 0.7},
@@ -248,6 +255,17 @@ with sync_playwright() as p:
     for sq in ('in review', 'folded'):
         assert not flows_up(sq), (sq, 'row-end belt must flow down')
 
+    # Ben's closed-issues list on row 3: hh:mm for each measured leg, n/a for
+    # an unmeasured one - and it sits to the right of DEPLOYED on row 3.
+    closed = page.locator('.ship-row-3 .ship-closed')
+    assert closed.count() == 1
+    closed_text = closed.inner_text()
+    assert '#7265' in closed_text and '02:28' in closed_text and '05:11' in closed_text, closed_text
+    assert '#7301' in closed_text and closed_text.count('n/a') >= 2, closed_text
+    deployed_box = page.locator('[data-square="last deploy"]').bounding_box()
+    closed_box = closed.bounding_box()
+    assert closed_box['x'] > deployed_box['x'] + deployed_box['width'], (closed_box, deployed_box)
+
     # Round 2 (Elrond review, PR #35, defect 1): no stage may ever render a
     # bare '?' - it reads as indistinguishable from the no-data wreckage state
     # the sprite/remnant already carries. Every one of the 15 stages gets a
@@ -337,6 +355,20 @@ with sync_playwright() as p:
     assert issues_arm['duration'] != prsci_arm['duration'], (issues_arm, prsci_arm)
     assert issues_arm['delay'] != prsci_arm['delay'], (issues_arm, prsci_arm)
     assert dispatched_arm['name'] == 'none', dispatched_arm
+    # Ben asked what "remnant" means: not time-based - the wreck sprite only
+    # when the handoff's count is n/a. 'dispatched' has a plain count (2) and
+    # no rate instrument, so its inserters are intact and idle, not wrecked;
+    # 'resolved' (count n/a in this fixture) is the one that wrecks.
+    dispatched_cls = page.locator('.ship-arrow[data-square-left="dispatched"] > .ship-inserter').nth(0).get_attribute('class')
+    assert 'remnant' not in dispatched_cls and 'idle' in dispatched_cls, dispatched_cls
+    resolved_cls = page.locator('.ship-arrow[data-square-left="resolved"] > .ship-inserter').nth(0).get_attribute('class')
+    assert 'remnant' in resolved_cls, resolved_cls
+    # Ben: the swing is the full 180 - pickup one side of the base, drop on
+    # the other. Read the keyframe rule itself: its two extremes are 180deg
+    # apart.
+    kf = page.evaluate('''() => { for (const ss of document.styleSheets) { let rules; try { rules = ss.cssRules; } catch (e) { continue; }
+        for (const r of rules) { if (r.type === CSSRule.KEYFRAMES_RULE && r.name === 'inserter-swing') return Array.from(r.cssRules).map(k => k.keyText + ' ' + k.style.transform); } } return null; }''')
+    assert kf and any('- 180deg' in k for k in kf) and any('50% rotate(var(--arm-rest' in k for k in kf), kf
     # ci-green is the fixture's bottleneck (rate 0, backlog 5) - BOTH its
     # inserters (loading and unloading) must freeze at the pickup end, not
     # swing, even though the arrow IS measured. A single frozen arm on a
