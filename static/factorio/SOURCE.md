@@ -20,6 +20,13 @@ URL, so this is ordinary personal use of assets he already paid for.
 
 - `assembler/`, `belt/`, `chest/`, `inserter/`, `lab/`, `radar/`, `signal/`,
   `silo/` — cropped frames/tiles used by the shipping strip's sprites.
+  `inserter/` holds the FAST inserter sheets (platform, hand-base, hand-open,
+  hand-closed - 2026-09-12, Ben: "swap out all the long handled inserters
+  with fast inserters"); the long-handed sheets they replaced were deleted,
+  not kept alongside. `belt/` also carries `belt-tile-vertical.png` /
+  `belt-tile-vertical-up.png`: the sheet's own south/north straight-belt
+  frames cropped to one 64px tread period and pre-scaled to the strip's
+  28px belt width.
 - `remnants/` — wreckage art shown for a stage/arrow with no measured data.
 - `biter/` (order 15, 2026-09-11) — `small-biter.png`, `medium-biter.png`,
   `small-biter-corpse.png`. Used for the `BUGS FOUND` stage: corpse at a

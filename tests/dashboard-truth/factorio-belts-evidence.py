@@ -363,6 +363,12 @@ with sync_playwright() as p:
     assert 'remnant' not in dispatched_cls and 'idle' in dispatched_cls, dispatched_cls
     resolved_cls = page.locator('.ship-arrow[data-square-left="resolved"] > .ship-inserter').nth(0).get_attribute('class')
     assert 'remnant' in resolved_cls, resolved_cls
+    # Ben: "swap out all the long handled inserters with fast inserters" -
+    # every platform is the fast (blue) inserter sheet; nothing long-handed
+    # is served any more.
+    plat = page.locator('.ship-inserter .inserter-platform').first.evaluate("el => getComputedStyle(el).backgroundImage")
+    assert 'fast-inserter-platform' in plat, plat
+    assert page.locator('.ship-inserter [style*="long-handed"]').count() == 0
     # Ben: the swing is the full 180 - pickup one side of the base, drop on
     # the other. Read the keyframe rule itself: its two extremes are 180deg
     # apart.

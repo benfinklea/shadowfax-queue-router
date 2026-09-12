@@ -7369,16 +7369,18 @@ filter:var(--ground-shadow)}
 .ship-legend-swatch.stage-machine{border-radius:2px;border:1px solid #2a3450;background:rgba(255,255,255,.03)}
 .ship-legend-swatch.stage-robot{border-radius:6px;border:1px solid #364563;box-shadow:0 0 6px rgba(0,255,242,.3)}
 .ship-legend-swatch.stage-chest{border-radius:2px;border:1px solid #242c42;background-image:url('/static/factorio/chest/steel-chest.png');background-size:16px 20px;background-position:center top}
-/* long-handed-inserter-platform.png is a 4-frame rotation strip, 105x79 per
-   frame; scaled to a 30x23 slot and cropped to frame 1 (east-facing) via
-   background-position - never stretched, so it never distorts. */
+/* fast-inserter-platform.png (Ben: "swap out all the long handled
+   inserters with fast inserters") is a 4-frame rotation strip, 105x79 per
+   frame - same sheet layout as the long-handed one it replaces; scaled to
+   a 30x23 slot and cropped to frame 1 (east-facing) via background-position
+   - never stretched, so it never distorts. */
 /* flex:0 0 auto (not a fixed basis) - same reasoning as .ship-belt-vertical
    below: this sits in both a row-direction parent (plain/vbelt arrows) and
    a column-direction one (the row-turn arrows), and a fixed flex-basis
    would hijack whichever axis is "main" in each. */
 .ship-inserter{position:relative;width:34px;height:32px;flex:0 0 auto;display:flex;align-items:center;justify-content:center}
 .ship-inserter .inserter-platform{position:absolute;left:0;bottom:0;width:30px;height:23px;
-background-image:url('/static/factorio/inserter/long-handed-inserter-platform.png');
+background-image:url('/static/factorio/inserter/fast-inserter-platform.png');
 background-size:120px 23px;background-position:-30px 0;background-repeat:no-repeat;
 image-rendering:pixelated;opacity:.85;filter:var(--ground-shadow)}
 /* Hand images are a tall 72x164 single frame - scaled with width/height in the
@@ -7421,8 +7423,10 @@ animation-duration:var(--swing-duration,1.6s);animation-delay:var(--swing-delay,
    for a loading inserter, the stage for an unloading one); pickup is the
    far side, 180 degrees away; the arm sweeps over the top between them. */
 @keyframes inserter-swing{
-0%,100%{transform:rotate(calc(var(--arm-rest,90deg) - 180deg))}
-50%{transform:rotate(var(--arm-rest,90deg))}
+0%{transform:rotate(calc(var(--arm-rest,90deg) - 180deg));background-image:url('/static/factorio/inserter/fast-inserter-hand-closed.png')}
+50%{transform:rotate(var(--arm-rest,90deg));background-image:url('/static/factorio/inserter/fast-inserter-hand-closed.png')}
+50.01%{background-image:url('/static/factorio/inserter/fast-inserter-hand-open.png')}
+100%{transform:rotate(calc(var(--arm-rest,90deg) - 180deg));background-image:url('/static/factorio/inserter/fast-inserter-hand-open.png')}
 }
 /* A backed-up (bottleneck) handoff freezes the arm at the pickup end (the
    swing's own 0%/100% extreme) instead of the resting middle - it reached,
@@ -8768,7 +8772,12 @@ function shipStagePhase(square) {
     return (h % 997) / 997;
 }
 
-// The arrows are long-handed inserters (Ben, 3:21 PM CDT 2026-09-11): an
+// The arrows are fast inserters (Ben, 2026-09-12: "swap out all the long
+// handled inserters with fast inserters" - the blue ones; the sheets share
+// the long-handed layout exactly, so only the art changed). The swing
+// keyframes also switch the hand: closed (carrying) from pickup to drop,
+// open (empty) on the way back - a real inserter animation, not one still
+// frame rotating. Originally long-handed (Ben, 3:21 PM CDT 2026-09-11): an
 // inserter is literally the thing that moves items between two machines -
 // every outage found today was an arrow, not a box. Carries the moving/idle
 // state where the held item would be; mirrored on row 2 so it reaches the
@@ -8788,7 +8797,7 @@ function shipStagePhase(square) {
 // sit beside a belt whose flow is always downward.
 function shipInserterHtml(count, armRest, unknown, phaseSeed, backedUp, swingDuration, alignCls) {
     const moving = count > 0;
-    const hand = moving ? 'long-handed-inserter-hand-closed.png' : 'long-handed-inserter-hand-open.png';
+    const hand = moving ? 'fast-inserter-hand-closed.png' : 'fast-inserter-hand-open.png';
     // Ben's remnants amendment: an arrow with NO measured rate (unknown, not
     // measured-zero) shows the wrecked inserter platform, arm dimmed to
     // near-invisible - "nobody knows whether anything is stuck" must never
@@ -8800,10 +8809,10 @@ function shipInserterHtml(count, armRest, unknown, phaseSeed, backedUp, swingDur
     // centered beside it - alignCls carries that ('align-top'/'align-bottom'),
     // set by the caller from the belt's own flow direction.
     const alignClsStr = alignCls ? ' ' + alignCls : '';
-    // long-handed-inserter-remnants.png measured 134x376: 4 frames stacked
+    // fast-inserter-remnants.png measured 134x376: 4 frames stacked
     // 134x94 each - crop frame 1, don't scale the whole strip into the slot.
     const platformStyle = unknown
-        ? ' style="background-image:url(/static/factorio/remnants/long-handed-inserter-remnants.png);background-size:30px 84px;background-position:0 0"'
+        ? ' style="background-image:url(/static/factorio/remnants/fast-inserter-remnants.png);background-size:30px 84px;background-position:0 0"'
         : '';
     const phase = shipStagePhase(phaseSeed);
     const swingVars = '--arm-rest:' + armRest + 'deg;' + ((moving && swingDuration)

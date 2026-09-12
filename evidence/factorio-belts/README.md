@@ -364,3 +364,21 @@ Chevron direction is one known remaining nit from the belt-tile fix: the
 tile's arrows point sideways (rightward) even on the two vertical belts,
 since rotating just the background pattern (not the whole element) isn't a
 plain CSS operation - flagged rather than left silent, not blocking.
+
+## Ben's live session, 2026-09-11 evening -> 2026-09-12 (after order 17)
+
+Ben drove this round directly from his own Factorio builds (screenshots pulled from `Bens-Mac.local` over SSH each time). Every item below is a change he asked for by looking at a render, in order:
+
+- **All 14 belts vertical.** His custom rig showed a vertical belt bridging two side-by-side buildings, so the boustrophedon never had to change - only the belt inside each arrow slot did (`.ship-arrow-vbelt`, in-row, normal flow; `.ship-arrow-vertical` stays the row-end column).
+- **Inserters flank the belt left/right**, reaching both the stage before and the stage after; each sits at the belt's own beginning or end (top/bottom by flow direction), never centered beside it. Row 2 (row-reversed) mirrors so the loading inserter is on the upstream (right) side.
+- **Belts alternate direction** along a row (chevrons and item motion): row 1 starts down; row 2 starts UP because the row-end belt feeding it comes down. Row-end belts always flow down.
+- **Belts are queues.** A belt shows one item per job waiting to enter the next stage (`arrow.backlog`, cap 7), piled from the exit end. The stage number is jobs being worked; rate only sets scroll speed. `CI Q/RUN` became `CI RUN` with its queue on the belt to its left (server: prs-ci backlog = `ci_queued`).
+- **7 / 7 / 1 rows**, row-end belts run beside the last stage all the way down to beside the next row's first stage (JS-sized sprite-top to sprite-bottom, re-run after fonts load), rows 56px apart, DEPLOYED lined up under FOLDED.
+- **Real belt art.** The first vertical tile was the horizontal frame rotated (one rail, seams). Now the sheet's own north/south frames, one 64px tread period, pre-scaled to the 28px belt width, `repeat-y`.
+- **Captions and time stamps on a dark plate**, white text (Ben could not read the grey-on-sand).
+- **Assemblers where work happens, chests where it waits**; biter and silo unchanged.
+- **Fast inserters** (blue) replace the long-handed ones - same sheet layout, art swapped, long-handed files deleted. The arm pivots on the tripod's bearing (measured in the platform frame), is ~1.5x the tripod's width like his close-up, swings the **full 180** (pickup one side, drop the other, over the top), and switches hand sprite: closed while carrying to the drop, open on the way back.
+- **Remnant** now means only "the count is n/a" - it was wrecking every un-instrumented handoff even with a known count. Not time-based.
+- **Closed-issues list** on row 3: the 10 most recently closed issues with hh:mm bug found -> dispatched and dispatched -> deployed. Dispatched = lane launch time when recorded, else the first commit on the fixing PR (no per-issue dispatch ledger exists on disk); deployed = first green production deploy run started after that PR merged. n/a for any unmeasured leg. Verified against live GitHub (e.g. #6976: 186:19 / 05:51).
+
+Every change above has a named assertion in `tests/dashboard-truth/factorio-belts-evidence.py` (row counts, row-end column geometry and in-frame, chevron sequence per row, loading-inserter side per row, queue items, closed-issues panel, 180-degree keyframes, fast-inserter platforms, remnant-only-when-n/a). Suite green on every push; screenshots regenerated each run and synced to Ben's Mac.
