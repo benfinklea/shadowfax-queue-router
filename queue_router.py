@@ -5437,7 +5437,10 @@ def _build_ship_arrows(result, rates):
     # source in plain words, so the row compares one unit of work left to right.
     specs = [
         ("issues-prs", "PRs opened in the last hour, from GitHub search (click the button for live agent lanes)", rates.get("pr_created_hour"), result.get("issues_open")),
-        ("prs-ci", "Distinct PRs with a CI run started this hour, from GitHub's workflow-runs list", rates.get("runs_created_hour"), result.get("prs_open")),
+        # Ben: "the Queue is the number of items on the belt to the left of CI
+        # RUN" - this belt's backlog is the CI queue itself (runs waiting to
+        # start), not the count of open PRs behind it.
+        ("prs-ci", "Distinct PRs with a CI run started this hour, from GitHub's workflow-runs list", rates.get("runs_created_hour"), ci_queued),
         ("ci-green", "Distinct PRs with a green Pre-Merge Gate run this hour (workflow 255384592), from GitHub's workflow-runs list", rates.get("runs_success_hour"), ci_backlog),
         ("green-inline", "Green eligible PRs not yet enqueued (approx., via merges/hr)", merged_hour, result.get("green_waiting")),
         ("inline-merged", "Merge queue entries (approx., via merges/hr)", merged_hour, result.get("queue_depth")),
@@ -5627,6 +5630,83 @@ def _get_merged_today_prs(headers, today, repo=None):
         raise ValueError("Merged-today search changed during pagination")
     items.sort(key=lambda p: p["pull_request"]["merged_at"], reverse=True)
     return [{"number": p["number"], "title": p["title"]} for p in items]
+
+
+def _closed_issue_timings(headers, repo, deploy_runs, limit=10):
+    """Recently closed issues with the two durations Ben asked for on row 3:
+    bug found (issue created) -> dispatched (the lane launch script for that
+    issue was written), and dispatched -> deployed (the first green
+    push/dispatch production deploy run that started after the closing PR
+    merged, taken as finished at that run's updated_at). A leg that cannot
+    be measured is None - never a guess. Two GitHub reads: the closed-issues
+    list and one GraphQL query for the closing PRs; deploy runs come from
+    the deploys-today scan already done this refresh."""
+    r = requests.get(f"https://api.github.com/repos/{repo}/issues",
+                     params={"state": "closed", "sort": "updated", "direction": "desc", "per_page": 30},
+                     headers=headers, timeout=8)
+    r.raise_for_status()
+    issues = [i for i in r.json() if "pull_request" not in i][:limit]
+    if not issues:
+        return []
+    owner, name = repo.split("/", 1)
+    fields = " ".join(
+        f'i{k}:issue(number:{int(i["number"])})'
+        '{closedByPullRequestsReferences(first:3){nodes{number mergedAt commits(first:1){nodes{commit{committedDate}}}}}}'
+        for k, i in enumerate(issues))
+    query = "query($owner:String!,$name:String!){repository(owner:$owner,name:$name){" + fields + "}}"
+    g = requests.post("https://api.github.com/graphql", json={"query": query, "variables": {"owner": owner, "name": name}},
+                      headers=headers, timeout=8)
+    g.raise_for_status()
+    rows = ((g.json().get("data") or {}).get("repository") or {})
+
+    def parse(ts):
+        return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc) if ts else None
+
+    def fmt(dt):
+        return dt.strftime("%Y-%m-%dT%H:%M:%SZ") if dt else None
+
+    def mins(a, b):
+        return int((b - a).total_seconds() // 60) if a and b and b >= a else None
+
+    deploys = sorted(
+        ((parse(x.get("run_started_at") or x.get("created_at")), x) for x in (deploy_runs or [])
+         if x.get("conclusion") == "success" and x.get("event") in ("push", "workflow_dispatch")
+         and (x.get("run_started_at") or x.get("created_at"))),
+        key=lambda pair: pair[0])
+    out = []
+    for k, i in enumerate(issues):
+        n = int(i["number"])
+        created = parse(i.get("created_at"))
+        prs = (((rows.get(f"i{k}") or {}).get("closedByPullRequestsReferences") or {}).get("nodes") or [])
+        merged = min((parse(p.get("mergedAt")) for p in prs if p.get("mergedAt")), default=None)
+        # "Dispatched": the lane launch script's write time when one was
+        # recorded for this issue (only a handful ever were - there is no
+        # on-disk dispatch ledger per issue), else the first commit on the
+        # PR that closed it - the earliest GitHub-visible sign a worker
+        # started on it. Neither -> n/a, never a guess.
+        dispatched = None
+        launch = f"/workspace/planning/state/issue-{n}-launch.sh" if repo == GITHUB_CI_REPO else None
+        if launch and os.path.exists(launch):
+            dispatched = datetime.fromtimestamp(os.stat(launch).st_mtime, timezone.utc)
+        else:
+            firsts = [parse((((p.get("commits") or {}).get("nodes") or [{}])[0].get("commit") or {}).get("committedDate"))
+                      for p in prs]
+            firsts = [f for f in firsts if f]
+            dispatched = min(firsts) if firsts else None
+        deployed = None
+        if merged:
+            for started, run in deploys:
+                if started >= merged:
+                    deployed = parse(run.get("updated_at")) or started
+                    break
+        out.append({
+            "number": n, "title": (i.get("title") or "")[:80],
+            "created_at": i.get("created_at"), "closed_at": i.get("closed_at"),
+            "dispatched_at": fmt(dispatched), "merged_at": fmt(merged), "deployed_at": fmt(deployed),
+            "bug_to_dispatch_min": mins(created, dispatched),
+            "dispatch_to_deploy_min": mins(dispatched, deployed),
+        })
+    return out
 
 
 def _get_deployed_prs_today(headers, merged_today_prs, deployed_sha, repo):
@@ -6104,6 +6184,9 @@ def get_pipeline_status(repo=None, default_branch=None, force_refresh=False):
             dep_ok = dep_fail = dep_live = 0
             live_started_min = None
             dep_days = [0] * 7
+            # Every deploy run seen this refresh (last 7 days) - reused by the
+            # closed-issue timings below, no second fetch.
+            deploy_runs_seen = []
             if deploy_workflow_ids:
                 deploy_url = f"https://api.github.com/repos/{repo}/actions/workflows/{deploy_workflow_ids[0]}/runs"
                 for page in (1, 2, 3):
@@ -6115,6 +6198,7 @@ def get_pipeline_status(repo=None, default_branch=None, force_refresh=False):
                     runs = r.json().get("workflow_runs", [])
                     if not runs:
                         break
+                    deploy_runs_seen.extend(runs)
                     for run in runs:
                         run_ct = None
                         try:
@@ -6219,6 +6303,14 @@ def get_pipeline_status(repo=None, default_branch=None, force_refresh=False):
             except Exception as e:
                 logger.warning("deployed-PR ancestry lookup failed (%s): %s", repo, e)
                 result["deployed_prs_today"], result["deployed_prs_today_list"] = None, []
+            # Ben: the closed-issues list on row 3 - two measured legs per
+            # issue, n/a where a leg has no instrument. Null (not []) when
+            # the read itself failed, so the panel says n/a, never "none".
+            try:
+                result["closed_issue_timings"] = _closed_issue_timings(headers, repo, deploy_runs_seen)
+            except Exception as e:
+                logger.warning("closed-issue timings failed (%s): %s", repo, e)
+                result["closed_issue_timings"] = None
             github_reads_ok = github_fetches_ok and all(result.get(field) is not None for field in (
                 "issues_open", "prs_open", "merged_today", "ci_queued", "ci_running"
             ))
@@ -6871,6 +6963,21 @@ def index():
 --glow-green:0 0 10px #39ff14,0 0 20px #39ff14,0 0 40px #39ff1488;
 --glow-red:0 0 10px #ff0044,0 0 20px #ff0044,0 0 40px #ff004488;
 --glow-yellow:0 0 10px #ffff00,0 0 20px #ffff00,0 0 40px #ffff0088;
+/* LORE order 16 #2: every entity casts a soft shadow down-and-right at the
+   same angle - "nothing in our render casts anything, so every sprite looks
+   pasted on rather than sitting on the ground." One shared term, appended to
+   every filter: rule that touches a sprite (filter does not merge across
+   the cascade, so each override has to repeat this var rather than losing
+   the shadow when it wins). */
+--ground-shadow:drop-shadow(3px 5px 2px rgba(0,0,0,.55));
+/* Round 2 on PR #36 (Elrond review): the ground went back to its real light
+   tan tone, which made every plain light-grey label (captions, age lines,
+   sub-lines, the legend) low-contrast where it sits directly on the
+   texture with no card behind it any more. Solved at the text, not the
+   terrain, per the review: a small dark outline plus a soft dark glow,
+   readable over light OR dark ground. The count itself already had its own
+   opaque dark plate (order 11) - this is for everything that doesn't. */
+--text-outline:-1px -1px 1.5px #000,1px -1px 1.5px #000,-1px 1px 1.5px #000,1px 1px 1.5px #000,0 0 5px rgba(0,0,0,.85);
 }
 *{box-sizing:border-box}
 body{font-family:'Rajdhani',sans-serif;background:var(--bg-dark);color:#e0e0e0;padding:20px;margin:0;
@@ -7152,16 +7259,41 @@ box-shadow:0 0 7px rgba(255,0,68,0.3)}
 .ft-routes{display:flex;gap:3px;flex-wrap:wrap;margin-top:5px}
 /* One-row glance strip: CI queue + route health + agents, ~1/3 the height of
    the three cards it replaced (Ben, 2026-07-29). Numbers big, words small. */
-.ship-flow-wrap{display:flex;flex-direction:column;gap:0}
+/* LORE order 16 #1: textured ground instead of flat navy - "the single
+   biggest tell". static/factorio/ground/ground-tile.png is a straight crop
+   of the staged sand sheet at its own real colour - no grayscale, no
+   re-tint. Round 2 on PR #36 (Elrond): the first pass darkened the tile
+   toward the dashboard's own navy palette to protect the numerals: that
+   was solving legibility at the terrain, and it stopped looking like
+   Factorio's own light tan sand. Legibility is now solved at the text
+   instead (--text-outline below, and the .ship-num plate), so the ground
+   can stay close to its real tone. */
+/* Round 2 on PR #36 (Elrond review): BUGS FOUND clipped again - the order-16
+   belt widening (76px->96px, arrow 132px->146px) squeezed row 1's six stage
+   boxes down to 95px, narrower than "BUGS FOUND"'s own 101px caption width,
+   so the centered nowrap caption bled 3px past the row's own left edge -
+   exactly where the screenshot crop is, with nothing beyond it to absorb the
+   overflow. Fixed with real horizontal padding rather than re-tuning belt/
+   stage widths against each other again (fragile - it would just regress
+   the next time either changes): now there is always slack for an
+   edge-stage caption to overflow into, independent of exactly how wide the
+   belts get tuned to be. */
+.ship-flow-wrap{display:flex;flex-direction:column;gap:0;padding:0 64px;
+background-image:url('/static/factorio/ground/ground-tile.png');
+background-repeat:repeat;background-size:128px 128px;border-radius:6px}
+/* LORE order 17 #3: row1 and row2 (not row3, nothing follows it) get a much
+   bigger bottom margin than before - room for the vertical belt (2
+   inserters + belt, ~144px tall) that now sits in the turn between rows,
+   position:absolute and JS-synced (positionShipElbows), replacing the old
+   bare turn glyph that only needed a few px of clearance. */
 .ship-flow{display:flex;align-items:stretch;gap:0;flex-wrap:wrap;margin:0 0 9px 0}
+/* Ben: "the rows can be closer together" - the row-end belt now spans
+   from the from-stage's top to the to-stage's bottom regardless of this
+   gap (positionShipElbows sizes it), so the gap only needs to be enough
+   for the belt to visibly read as a run between the rows, not to hold it. */
+.ship-flow.ship-row-1,.ship-flow.ship-row-2{margin-bottom:56px}
 .ship-flow.ship-row-2{flex-direction:row-reverse}
-/* Round 2 (Elrond review, PR #35, defect 3): position:absolute + JS sync
-   (positionShipElbows) instead of a full-width text-aligned flow div - see
-   the call site's comment. Removed from flow entirely so it can't leave a
-   gap of its own between rows; z-index above the belts/sprites it sits near. */
-.ship-elbow{position:absolute;z-index:5;font-size:1.3em;line-height:1;color:var(--neon-magenta);
-text-shadow:0 0 8px var(--neon-magenta);pointer-events:none}
-.ship-age{font-size:0.66em;color:#7d8798;white-space:nowrap;margin-top:1px}
+.ship-age{font-size:0.66em;color:#7d8798;white-space:nowrap;margin-top:1px;text-shadow:var(--text-outline)}
 .ship-age.warn{color:var(--neon-yellow)}
 .ship-age.hot{color:var(--neon-red)}
 .ship-logo{width:30px;height:30px;display:block;margin:0 auto 3px auto;
@@ -7203,19 +7335,20 @@ align-items:center;justify-content:center;gap:2px;cursor:pointer}
    still legible without a rectangle around it. */
 .ship-stage.stage-machine{background:none;border:0;border-radius:0}
 .ship-stage.stage-robot{background:none;border:0;border-radius:0;box-shadow:none}
-.ship-stage.stage-robot .ship-sprite{filter:drop-shadow(0 0 5px rgba(0,255,242,.55)) drop-shadow(0 0 9px rgba(255,0,255,.28))}
+.ship-stage.stage-robot .ship-sprite{filter:drop-shadow(0 0 5px rgba(0,255,242,.55)) drop-shadow(0 0 9px rgba(255,0,255,.28)) var(--ground-shadow)}
 .ship-stage.stage-chest{background:none;border:0;border-radius:0;box-shadow:none}
 /* Chest squares are piles waiting to be collected - staleness there is the
    loudest signal on the strip, so weight it heavier than any other age. */
 .ship-stage.stage-chest .ship-age{font-weight:800}
-.ship-stage.stage-chest .ship-age.warn{text-shadow:0 0 6px var(--neon-yellow)}
-.ship-stage.stage-chest .ship-age.hot{text-shadow:0 0 10px var(--neon-red),0 0 18px var(--neon-red)}
+.ship-stage.stage-chest .ship-age.warn{text-shadow:0 0 6px var(--neon-yellow),var(--text-outline)}
+.ship-stage.stage-chest .ship-age.hot{text-shadow:0 0 10px var(--neon-red),0 0 18px var(--neon-red),var(--text-outline)}
 /* Order 11: the sprite rendered LARGE (64px at 1440px, not the old 24px
    corner icon) sitting in its own wrap so the count numeral can overlay it
    directly instead of living in a caption below a card. */
 .ship-sprite-wrap{position:relative;width:64px;height:64px;margin:0 auto;flex:0 0 auto}
 .ship-sprite{position:absolute;inset:0;width:64px;height:64px;
-background-repeat:no-repeat;image-rendering:pixelated;pointer-events:none;opacity:.95}
+background-repeat:no-repeat;image-rendering:pixelated;pointer-events:none;opacity:.95;
+filter:var(--ground-shadow)}
 .ship-sprite.dim{opacity:.4}
 /* Remnants (Ben, 4:40 PM CDT): wreckage in place of the machine when a square
    has NO DATA, not just a measured zero - distinct from .dim (which still
@@ -7223,47 +7356,98 @@ background-repeat:no-repeat;image-rendering:pixelated;pointer-events:none;opacit
    background-size/position are set per-sprite inline (frame crop, see
    REMNANT_SPRITE) - inline style already wins over .ico/.chest-ico/.asm on
    specificity, so this rule only carries the tint, not geometry. */
-.ship-sprite.remnant{filter:grayscale(.35);opacity:.65}
+.ship-sprite.remnant{filter:grayscale(.35) var(--ground-shadow);opacity:.65}
 .ship-inserter.remnant .inserter-arm{opacity:.15!important;animation:none!important}
 /* Standard icon sheets are Factorio mip chains: 64+32+16+8=120 wide, 64 tall -
    the first (64x64) mip scaled to the 24x24 slot. */
 .ship-sprite.ico{background-size:120px 64px;background-position:0 0}
 .ship-sprite.chest-ico{background-size:64px 80px;background-position:center top}
 .ship-sprite.asm{width:64px;height:64px;background-size:512px 256px;image-rendering:pixelated}
-.ship-legend{display:flex;gap:18px;align-items:center;margin:6px 0 4px;font-size:.72em;color:#c7cee0}
+.ship-legend{display:flex;gap:18px;align-items:center;margin:6px 0 4px;font-size:.72em;color:#c7cee0;text-shadow:var(--text-outline)}
 .ship-legend-chip{display:flex;align-items:center;gap:6px}
 .ship-legend-swatch{width:16px;height:16px;flex:0 0 auto}
 .ship-legend-swatch.stage-machine{border-radius:2px;border:1px solid #2a3450;background:rgba(255,255,255,.03)}
 .ship-legend-swatch.stage-robot{border-radius:6px;border:1px solid #364563;box-shadow:0 0 6px rgba(0,255,242,.3)}
 .ship-legend-swatch.stage-chest{border-radius:2px;border:1px solid #242c42;background-image:url('/static/factorio/chest/steel-chest.png');background-size:16px 20px;background-position:center top}
-/* long-handed-inserter-platform.png is a 4-frame rotation strip, 105x79 per
-   frame; scaled to a 30x23 slot and cropped to frame 1 (east-facing) via
-   background-position - never stretched, so it never distorts. */
-.ship-inserter{position:relative;width:44px;height:32px;flex:0 0 44px;display:flex;align-items:center;justify-content:center}
-.ship-inserter .inserter-platform{position:absolute;left:2px;bottom:0;width:30px;height:23px;
-background-image:url('/static/factorio/inserter/long-handed-inserter-platform.png');
+/* fast-inserter-platform.png (Ben: "swap out all the long handled
+   inserters with fast inserters") is a 4-frame rotation strip, 105x79 per
+   frame - same sheet layout as the long-handed one it replaces; scaled to
+   a 30x23 slot and cropped to frame 1 (east-facing) via background-position
+   - never stretched, so it never distorts. */
+/* flex:0 0 auto (not a fixed basis) - same reasoning as .ship-belt-vertical
+   below: this sits in both a row-direction parent (plain/vbelt arrows) and
+   a column-direction one (the row-turn arrows), and a fixed flex-basis
+   would hijack whichever axis is "main" in each. */
+.ship-inserter{position:relative;width:34px;height:32px;flex:0 0 auto;display:flex;align-items:center;justify-content:center}
+.ship-inserter .inserter-platform{position:absolute;left:0;bottom:0;width:30px;height:23px;
+background-image:url('/static/factorio/inserter/fast-inserter-platform.png');
 background-size:120px 23px;background-position:-30px 0;background-repeat:no-repeat;
-image-rendering:pixelated;opacity:.85}
+image-rendering:pixelated;opacity:.85;filter:var(--ground-shadow)}
 /* Hand images are a tall 72x164 single frame - scaled with width/height in the
-   SAME ratio as the source (no stretch), then rotated 90deg to reach sideways. */
-.ship-inserter .inserter-arm{position:absolute;left:14px;top:0;width:14px;height:32px;
-background-repeat:no-repeat;background-size:14px 32px;image-rendering:pixelated;
-transform-origin:50% 85%;transform:rotate(90deg);transition:transform .4s ease,opacity .4s ease}
-.ship-arrow-left .ship-inserter .inserter-arm{transform:rotate(-90deg)}
+   SAME ratio as the source (no stretch). LORE order 17: --arm-rest replaces
+   the old fixed rotate(90deg)/rotate(-90deg) pair with a per-instance angle
+   (set inline alongside --swing-duration/--swing-delay) so ONE set of rules
+   covers every orientation an inserter can sit in now - horizontal
+   left-to-right (90deg), horizontal right-to-left (-90deg), and vertical,
+   always reaching downward for a top-to-bottom belt (180deg) - instead of a
+   separate hardcoded keyframe/override pair per direction. */
+/* Ben: "the base of the swinging arm should be midpoint on the tripod".
+   The platform frame's hub sits at ~(15.7, 20.6) of the 34x32 slot (105x79
+   native frame drawn at 30x23, bottom-left); the arm sprite's mounting
+   base is its very bottom edge, so the pivot is 50% 100% of the arm and
+   the arm is placed so that point lands on the hub. */
+/* Hub (the bearing ring) measured at (51,29) of the 105x79 platform frame
+   -> (14.6, 17.4) in the 34x32 slot with the platform bottom-left. The arm
+   is 20x46 (sprite aspect kept, longer like the reference - about 1.5x the
+   tripod's width) and pivots at its own bottom edge, placed on the hub. */
+.ship-inserter{z-index:2}
+/* Ben: "you've stretched out the blue arms - make them their normal size."
+   A fast inserter reaches one tile: in his close-up the extended arm is
+   about the tripod's own width, not 1.5x it. 13x30 (sprite aspect kept),
+   still pivoting at its bottom edge on the hub at (14.6, 17.4). */
+.ship-inserter .inserter-arm{position:absolute;left:8px;top:-13px;width:13px;height:30px;
+background-repeat:no-repeat;background-size:13px 30px;image-rendering:pixelated;
+transform-origin:50% 100%;transform:rotate(var(--arm-rest,90deg));transition:transform .4s ease,opacity .4s ease}
 .ship-inserter.idle .inserter-arm{opacity:.4}
-.ship-inserter.moving .inserter-arm{opacity:1;animation:inserter-reach 1.6s ease-in-out infinite}
-@keyframes inserter-reach{0%,100%{transform:rotate(75deg)}50%{transform:rotate(105deg)}}
-.ship-arrow-left .ship-inserter.moving .inserter-arm{animation:inserter-reach-left 1.6s ease-in-out infinite}
-@keyframes inserter-reach-left{0%,100%{transform:rotate(-75deg)}50%{transform:rotate(-105deg)}}
-@media(prefers-reduced-motion:reduce){.ship-inserter.moving .inserter-arm{animation:none;transform:rotate(90deg)}
-.ship-arrow-left .ship-inserter.moving .inserter-arm{transform:rotate(-90deg)}}
+/* LORE order 14 "the inserters must swing": a real Factorio inserter's arm
+   rotates through roughly 180 degrees between the pickup and drop side - the
+   old 30-degree "inserter-reach" wiggle read as a nervous twitch, not a
+   swing. Duration comes from --swing-duration (order 9's clamped
+   rate_per_hour mapping, set alongside --belt-duration in shipArrow - same
+   handoff, same speed); animation-delay is a per-inserter negative offset
+   (--swing-delay, from shipStagePhase) so two inserters on the same belt -
+   or a whole row of them - swing staggered, never in lockstep. The arc is
+   always +-75deg around --arm-rest, so the same keyframes serve every
+   orientation. */
+.ship-inserter.moving .inserter-arm{opacity:1;animation-name:inserter-swing;
+animation-timing-function:ease-in-out;animation-iteration-count:infinite;
+animation-duration:var(--swing-duration,1.6s);animation-delay:var(--swing-delay,0s)}
+/* Ben: a real inserter swings the full 180 - pickup on one side of its
+   base, drop on the opposite side. --arm-rest is the DROP side (the belt
+   for a loading inserter, the stage for an unloading one); pickup is the
+   far side, 180 degrees away; the arm sweeps over the top between them. */
+@keyframes inserter-swing{
+0%{transform:rotate(calc(var(--arm-rest,90deg) - 180deg));background-image:url('/static/factorio/inserter/fast-inserter-hand-closed.png')}
+50%{transform:rotate(var(--arm-rest,90deg));background-image:url('/static/factorio/inserter/fast-inserter-hand-closed.png')}
+50.01%{background-image:url('/static/factorio/inserter/fast-inserter-hand-open.png')}
+100%{transform:rotate(calc(var(--arm-rest,90deg) - 180deg));background-image:url('/static/factorio/inserter/fast-inserter-hand-open.png')}
+}
+/* A backed-up (bottleneck) handoff freezes the arm at the pickup end (the
+   swing's own 0%/100% extreme) instead of the resting middle - it reached,
+   grabbed, and cannot release because the belt it feeds is jammed; that is
+   the information, not an idle machine. Same specificity as .moving, placed
+   after it so a bottleneck arrow that also happens to have rate>0 still
+   freezes rather than swings. */
+.ship-inserter.backed-up .inserter-arm{animation:none!important;opacity:1;
+transform:rotate(calc(var(--arm-rest,90deg) - 180deg))}
+@media(prefers-reduced-motion:reduce){.ship-inserter.moving .inserter-arm{animation:none;transform:rotate(var(--arm-rest,90deg))}}
 /* No card border left to color for deploy state (order 11) - the state
    becomes a glow on the sprite itself instead. */
-.ship-stage.merge-green .ship-sprite{filter:drop-shadow(0 0 8px rgba(57,255,20,.9))}
-.ship-stage.merge-yellow .ship-sprite{filter:drop-shadow(0 0 8px rgba(255,255,0,.9))}
-.ship-stage.merge-red .ship-sprite{filter:drop-shadow(0 0 8px rgba(255,0,68,.9))}
+.ship-stage.merge-green .ship-sprite{filter:drop-shadow(0 0 8px rgba(57,255,20,.9)) var(--ground-shadow)}
+.ship-stage.merge-yellow .ship-sprite{filter:drop-shadow(0 0 8px rgba(255,255,0,.9)) var(--ground-shadow)}
+.ship-stage.merge-red .ship-sprite{filter:drop-shadow(0 0 8px rgba(255,0,68,.9)) var(--ground-shadow)}
 /* SHIP-SPARK-2 item 6: the deploy box while a deploy run is actually shipping. */
-.ship-stage.merge-blue .ship-sprite{filter:drop-shadow(0 0 8px rgba(0,168,255,.9))}
+.ship-stage.merge-blue .ship-sprite{filter:drop-shadow(0 0 8px rgba(0,168,255,.9)) var(--ground-shadow)}
 .ship-stage.merge-pulse .ship-sprite{animation:merge-rate-pulse 4s ease-in-out infinite}
 @keyframes merge-rate-pulse{0%,100%{opacity:1}50%{opacity:.75}}
 @media(prefers-reduced-motion:reduce){.ship-stage.merge-pulse .ship-sprite{animation:none}}
@@ -7271,21 +7455,26 @@ transform-origin:50% 85%;transform:rotate(90deg);transition:transform .4s ease,o
    stepping is driven by JS (32 frames, 8x4 grid) since it must mean
    something: running when work is flowing, frozen at frame 0 when idle,
    frozen+dimmed when stalled - never a screensaver. */
-.ship-sprite.asm.stalled{opacity:.4;filter:grayscale(.5)}
+.ship-sprite.asm.stalled{opacity:.4;filter:grayscale(.5) var(--ground-shadow)}
 /* The count overlays the sprite's base in a small dark plate (order 11: "if
    the sprite cannot carry the number legibly... the way Factorio itself
    labels things") rather than sitting in a caption under a card. */
+/* Round 2 on PR #36: plate opacity bumped .72->.85 now that the ground
+   behind it is light tan instead of dark navy - order 11's own plate
+   mechanism ("if the sprite cannot carry the number legibly... a small
+   dark plate over the sprite's base") is the fix Ben asked for, solved at
+   the text rather than by darkening the terrain again. */
 .ship-num{position:absolute;left:50%;bottom:1px;transform:translateX(-50%);z-index:2;
 font-family:'Orbitron',monospace;font-size:1.05em;font-weight:700;line-height:1.3;
-white-space:nowrap;background:rgba(6,10,20,.72);border-radius:3px;padding:0 5px;
+white-space:nowrap;background:rgba(6,10,20,.85);border-radius:3px;padding:0 5px;
 color:var(--neon-cyan);text-shadow:0 0 8px var(--neon-cyan)}
 .ship-num.ok{color:var(--neon-green);text-shadow:0 0 10px var(--neon-green)}
 .ship-num.warn{color:var(--neon-yellow);text-shadow:0 0 10px var(--neon-yellow)}
 .ship-num.hot{color:var(--neon-red);text-shadow:0 0 10px var(--neon-red)}
 .ship-num.stamp{font-size:.82em;white-space:nowrap}
 .ship-cap{font-family:'Orbitron',monospace;font-size:0.72em;letter-spacing:1.5px;
-text-transform:uppercase;color:#c7cee0;white-space:nowrap}
-.ship-sub{font-size:0.78em;color:#c7cee0;white-space:nowrap}
+text-transform:uppercase;color:#c7cee0;white-space:nowrap;text-shadow:var(--text-outline)}
+.ship-sub{font-size:0.78em;color:#c7cee0;white-space:nowrap;text-shadow:var(--text-outline)}
 .ship-arrow{display:flex;align-items:center;padding:0 9px;color:var(--neon-magenta);
 font-size:0.9em;text-shadow:0 0 8px var(--neon-magenta)}
 .ship-spark{display:flex;align-items:flex-end;gap:2px;height:11px;margin-top:3px}
@@ -7497,40 +7686,166 @@ vertical-align:middle}
 .ship-repo-refreshing{margin-left:8px;color:var(--neon-yellow);font-family:'Rajdhani',sans-serif;
 font-size:0.85em;letter-spacing:0.5px;vertical-align:middle}
 .ship-flow{flex-wrap:nowrap;align-items:stretch}
-.ship-stage{flex:1 1 0;min-width:0;padding:8px 6px}
-.ship-cap{font-size:.65em;letter-spacing:1px}
+/* Ben: rows 2/3 (4 and 5 stages) read too spread-out next to row 1's 6 -
+   flex:1 1 0 stretched every stage to fill the row's full width equally,
+   so a row with fewer stages gave each one a bigger share and pushed them
+   apart. flex:0 0 auto sizes every stage the same across all three rows
+   regardless of how many share the row - the leftover width now collects
+   at the row's own far edge instead of between every stage. */
+.ship-stage{flex:0 1 auto;min-width:0;padding:8px 3px}
+/* 7 stages per row (Ben) at a 1440 viewport: captions may wrap to a
+   second line and sub-lines may wrap too - the numerals stay full size
+   (legibility beats fidelity applies to the count, not the label). */
+.ship-cap{font-size:.6em;letter-spacing:.5px;white-space:normal;line-height:1.15;max-width:96px}
+.ship-sub{font-size:.72em;white-space:normal;max-width:110px}
+/* Ben: "give the stage text more contrast - I can't read them. Same for
+   the time stamps." Light-grey text with an outline still sank into the
+   tan sand; the fix is the same one order 11 already permits for the
+   count - a dark plate behind the text, white on it. Warn/hot ages keep
+   their yellow/red on the same plate. */
+.ship-cap,.ship-sub,.ship-age,.ship-stage-drain{color:#fff;background:rgba(0,0,0,.66);
+padding:1px 5px;border-radius:3px;display:inline-block;text-shadow:0 1px 1px #000}
+.ship-cap{margin-top:2px}
+.ship-age{margin-top:2px;color:#f2f4f8}
+.ship-sub{color:#f2f4f8}
 .ship-num.stamp{font-size:.85em}
 /* LORE order 11 #2 / order 1: a real belt segment (>=48px), not a glyph with
    a number beside it. Round 2 (Elrond review, PR #35, defect 4): the first
    pass's 56px belt still read as "a connector widget, not a belt" - widened
    again, and the row rebalance (defects 4+5, "the same layout problem") frees
    up the room to do it without re-cramping the squares. */
-.ship-arrow{position:relative;flex:0 0 132px;align-self:center;justify-content:center;height:36px;
-gap:3px;padding:0 4px;border:0;background:transparent;color:var(--arrow-color);cursor:pointer;font-size:11px;text-shadow:none}
+/* LORE order 16 #3/#6: gap tightened to 1px and padding to 2px (from 3px/4px)
+   so the belt and inserter read as one continuous mechanism, not two boxes
+   with a visible seam between them - "a belt that starts and stops reads
+   as an icon". LORE order 17 #4: widened again (146px->164px) to fit TWO
+   inserters (loading + unloading) plus the belt in between. */
+.ship-arrow{position:relative;flex:0 0 164px;align-self:center;justify-content:center;height:36px;
+gap:1px;padding:0 2px;border:0;background:transparent;color:var(--arrow-color);cursor:pointer;font-size:11px;text-shadow:none}
 .ship-arrow.bottleneck{animation:ship-arrow-bottleneck-pulse 1.6s ease-in-out infinite}
 @keyframes ship-arrow-bottleneck-pulse{0%,100%{filter:drop-shadow(0 0 4px var(--neon-red))}50%{filter:drop-shadow(0 0 11px var(--neon-red))}}
 @media(prefers-reduced-motion:reduce){.ship-arrow.bottleneck{animation:none}}
 .ship-arrow:focus-visible{outline:2px solid var(--arrow-color);outline-offset:2px}
-/* The belt itself: a scrolling texture tile carrying the order-10 item chain.
-   State is rendered, never captioned - order 9's "hover is where the numbers
-   live" (native title attr on the arrow, unchanged). */
-.ship-belt{position:relative;width:76px;height:24px;flex:0 0 76px;overflow:hidden;
-border-radius:2px;outline:1px solid var(--arrow-outline)}
+/* LORE order 17 #3: the vertical belt at a row turn - position:absolute (JS-
+   synced by positionShipElbows, same as the plain turn glyph it replaces) so
+   it can sit in the gap between two rows rather than inside either row's
+   own flex flow; flex-direction:column stacks loading inserter / belt /
+   unloading inserter top to bottom. */
+/* Ben's reference: the row-end belt is one tall column running BESIDE the
+   row's last stage all the way down to beside the next row's first stage
+   ("go all the way down to carry work to the next row" - not floating in
+   the gap between rows). Both inserters sit on the stage side of it, one
+   at the very top (loading from the stage above) and one at the very
+   bottom (unloading into the stage below). Height is set by
+   positionShipElbows to span exactly from the top of the from-stage to
+   the bottom of the to-stage. */
+.ship-arrow-vertical{position:absolute;display:block;flex:0 0 auto;width:64px;height:200px;
+padding:0;z-index:4}
+.ship-arrow-vertical .ship-belt-vertical{position:absolute;top:0;bottom:0;height:auto;left:36px}
+.ship-arrow-vertical .ship-inserter{position:absolute;left:0}
+.ship-arrow-vertical .ship-inserter:first-child{top:0}
+.ship-arrow-vertical .ship-inserter:last-child{bottom:0}
+/* Row 2 ends on the LEFT (row-reverse), so its row-end belt sits on the
+   left of the stage with the inserters on the belt's right. */
+.ship-arrow-vertical.ship-arrow-left .ship-belt-vertical{left:0}
+.ship-arrow-vertical.ship-arrow-left .ship-inserter{left:30px}
+/* Ben's own built reference (a vertical belt bridging two side-by-side
+   buildings) - correction after the first pass stacked the inserters
+   above/below the belt: "the inserters go to the left and right of the
+   belt, not above and below - they have to reach both the block before and
+   the block after." Two side-by-side stages are reached sideways, so the
+   inserters stay in a horizontal row (like plain .ship-arrow) - only the
+   belt element between them is the tall vertical one. The two row-turn
+   arrows (.ship-arrow-vertical above) are the opposite case: the blocks
+   they connect really are stacked above/below on screen, so those stay a
+   column stack. */
+.ship-arrow-vbelt{flex-direction:row;flex:0 0 auto;width:auto;height:auto;
+gap:0;padding:2px 0;align-self:center;align-items:center}
+/* Ben's built reference: each inserter sits at the belt's own beginning or
+   end - top or bottom - never centered beside it, so it visibly interacts
+   with the correct extreme of the belt (where items actually enter/exit)
+   rather than floating at the belt's midpoint. */
+.ship-inserter.align-top{align-self:flex-start}
+.ship-inserter.align-bottom{align-self:flex-end}
+/* Ben: row 2 flows right-to-left, so its loading inserter (DOM-first) must
+   sit on the RIGHT of the belt, beside the stage it loads from, and the
+   unloading one on the left - mirror the arrow's own row to match the
+   row-reversed row it sits in. */
+.ship-row-2 .ship-arrow-vbelt{flex-direction:row-reverse}
+/* Row 3's closed-issues list (Ben) - same dark plate as the captions. */
+.ship-closed{align-self:flex-start;margin-left:48px;margin-top:8px;background:rgba(0,0,0,.66);border-radius:4px;
+padding:6px 10px;color:#fff;font-size:.72em;font-family:'Orbitron',monospace;letter-spacing:.5px;min-width:380px;max-width:560px}
+.ship-closed-head{display:grid;grid-template-columns:1fr 78px 92px;gap:8px;text-transform:uppercase;color:#c7cee0;
+font-size:.85em;border-bottom:1px solid #556;padding-bottom:3px;margin-bottom:3px;white-space:nowrap}
+.ship-closed-row{display:grid;grid-template-columns:56px 1fr 78px 92px;gap:8px;line-height:1.5;white-space:nowrap}
+.ship-closed-title{overflow:hidden;text-overflow:ellipsis;color:#e6e9f0}
+.ship-closed-num{color:var(--neon-cyan)}
+.ship-closed-t{text-align:right;font-variant-numeric:tabular-nums}
+.ship-closed-na{color:#aab;grid-template-columns:1fr}
+/* The belt itself: a scrolling texture tile carrying the order-17 item
+   chain. State is rendered, never captioned - order 9's "hover is where the
+   numbers live" (native title attr on the arrow, unchanged). LORE order 17
+   #2: no border/outline any more - "don't put boxes around the belts", the
+   same card-on-a-sprite mistake order 11 already deleted from the stages.
+   The backed-up (jam) state still reads red, via a glow only, no box. */
+.ship-belt{position:relative;width:72px;height:24px;flex:0 0 72px;overflow:hidden;border-radius:2px}
 .ship-belt-track{position:absolute;inset:0;background-image:url('/static/factorio/belt/belt-tile.png');
 background-repeat:repeat-x;background-size:18px 18px;image-rendering:pixelated;opacity:.85;
 animation:ship-belt-flow linear infinite;animation-duration:var(--belt-duration,0s);animation-play-state:running}
-@keyframes ship-belt-flow{to{background-position-x:-18px}}
+/* LORE order 17 #3 direction fix: Ben's report - "moving right to left but
+   should move left to right" - the tile's own chevrons point toward the
+   flow direction, but the old keyframe slid background-position-x NEGATIVE
+   for the default (left-to-right) case, which visually drags the pattern
+   backward against its own chevrons. Flipped: positive for the default
+   direction, negative for the row-2 mirrored (right-to-left) case. */
+@keyframes ship-belt-flow{to{background-position-x:18px}}
 .ship-belt-left .ship-belt-track{animation-name:ship-belt-flow-rev}
-@keyframes ship-belt-flow-rev{to{background-position-x:18px}}
+@keyframes ship-belt-flow-rev{to{background-position-x:-18px}}
+/* LORE order 17 #3: the vertical belts at the two row-turn handoffs - swaps
+   the long axis and scrolls top-to-bottom (never bottom-to-top - a vertical
+   belt is always downstream-is-down here, so there is no "vertical-left"
+   mirror to carry). */
+/* flex:0 0 auto (not a fixed flex-basis) so width/height below aren't
+   hijacked by whichever axis happens to be the parent's main axis - this
+   belt sits inside a column-direction parent (.ship-arrow-vertical, the
+   row-turn) AND a row-direction one (.ship-arrow-vbelt, in-row) now. */
+/* Ben: "buildings are not lined up... that's so there is more belt so it
+   will show more items on the belt so I can see when they're backed up" -
+   taller than the original 72px so a jam visibly piles up along real belt
+   length, not just a couple of dots. */
+.ship-belt-vertical{width:28px;height:140px;flex:0 0 auto}
+/* Ben's built reference: each belt segment's own chevron faces the actual
+   direction of travel (down), not sideways - the base tile's chevron is
+   baked in pointing right (it's a horizontal-belt asset), so a vertical
+   belt swaps to a separately pre-rotated tile (belt-tile-vertical.png,
+   rotated -90deg/clockwise from the same source so a rightward chevron
+   becomes a downward one) rather than trying to CSS-rotate the live
+   non-square element, which would fight its own width/height. */
+/* Ben: "you've not assembled the transport belts correctly" - the first
+   vertical tile was the HORIZONTAL frame rotated, which only carries one
+   rail and tiled with seams. These are the sheet's own north/south frames
+   (both side rails, one 64px tread period), pre-scaled to exactly the
+   belt's width so repeat-y gives one seamless column. */
+.ship-belt-vertical .ship-belt-track{background-image:url('/static/factorio/belt/belt-tile-vertical.png');
+background-size:28px 25px;background-repeat:repeat-y;animation-name:ship-belt-flow-vertical}
+@keyframes ship-belt-flow-vertical{to{background-position-y:25px}}
+/* Ben's built reference: consecutive in-row belts alternate their own flow
+   direction (down, up, down, up...), each with its own pre-rotated chevron
+   tile facing the direction it actually travels - never a downward tile on
+   a belt that flows up. */
+.ship-belt-vertical-up .ship-belt-track{background-image:url('/static/factorio/belt/belt-tile-vertical-up.png');
+animation-name:ship-belt-flow-vertical-up}
+@keyframes ship-belt-flow-vertical-up{to{background-position-y:-25px}}
 .ship-belt-items{position:absolute;inset:0}
-.ship-belt-item{position:absolute;top:50%;width:16px;height:16px;transform:translate(-50%,-50%);
+.ship-belt-item{position:absolute;top:50%;left:50%;width:16px;height:16px;transform:translate(-50%,-50%);
 filter:drop-shadow(0 1px 1px rgba(0,0,0,.6))}
-.ship-belt-item svg{display:block;width:100%;height:100%}
+.ship-belt-vertical .ship-belt-item{left:50%}
+.ship-belt-item-img{width:100%;height:100%;background-repeat:no-repeat;image-rendering:pixelated}
 /* Order 13's correction: a packed belt is a customer waiting, never the
    game's neutral "satisfying full belt" - same red treatment as a stalled
    machine, not just density. Order 1: reuses the arrow's own existing
-   bottleneck flag rather than adding a second signal. */
-.ship-belt-backed-up{outline-color:var(--neon-red);box-shadow:0 0 8px var(--neon-red)}
+   bottleneck flag rather than adding a second signal. Glow only (order 17
+   #2 removed the belt's border/outline) - a halo, not a box. */
+.ship-belt-backed-up{box-shadow:0 0 8px var(--neon-red)}
 .ship-belt-backed-up .ship-belt-track{animation:none;filter:saturate(1.4)}
 /* starved: a MEASURED zero rate - the belt is real, just not moving. */
 .ship-belt-starved .ship-belt-track{animation:none;opacity:.3}
@@ -7548,8 +7863,8 @@ filter:drop-shadow(0 1px 1px rgba(0,0,0,.6))}
 gap:5px;width:100%;height:22px}
 .ship-issues-rate .ship-history-spark{min-width:0}
 .ship-issues-rate-now{font-family:'Orbitron',monospace;font-size:.72em;color:#c7cee0;
-font-variant-numeric:tabular-nums;line-height:1}
-.ship-stage-drain{font-size:.62em;color:#8a94ad;line-height:1.1;margin-top:2px;white-space:nowrap}
+font-variant-numeric:tabular-nums;line-height:1;text-shadow:var(--text-outline)}
+.ship-stage-drain{font-size:.62em;color:#8a94ad;line-height:1.1;margin-top:2px;white-space:nowrap;text-shadow:var(--text-outline)}
 /* SHIP-GAME items 2-5: one robot+house per running worker, in a small "yard"
    strip anchored under the first (issues->prs) arrow via JS position-sync
    (positionShipYard) rather than being part of that arrow's own rebuilt HTML -
@@ -8221,19 +8536,24 @@ function shipAgeHtml(cap, iso) {
 // sharper fact.
 const SHIP_STAGE_META = {
     'bugs found':     {kind: 'robot',   sprite: 'repair-pack.png'},
+    // Ben: an assembling machine wherever work is HAPPENING (dispatched,
+    // ci run, in review, gate verdicts, merged, folded); the steel chest
+    // wherever work is just WAITING (issues open, prs open, review routed,
+    // conflicted, resolved, approved, in queue). Bugs found (biter) and
+    // deployed (silo) stay as they were.
     'issues open':    {kind: 'chest',   sprite: 'chest/steel-chest.png'},
-    'dispatched':     {kind: 'robot',   sprite: 'inserter.png'},
-    'prs open':       {kind: 'robot',   sprite: 'assembler'},
-    'ci q/run':       {kind: 'machine', sprite: 'lab.png'},
+    'dispatched':     {kind: 'machine', sprite: 'assembling-machine-3.png'},
+    'prs open':       {kind: 'chest',   sprite: 'chest/steel-chest.png'},
+    'ci q/run':       {kind: 'machine', sprite: 'assembling-machine-3.png'},
     'review routed':  {kind: 'chest',   sprite: 'chest/steel-chest.png'},
-    'in review':      {kind: 'robot',   sprite: 'radar.png'},
-    'gate verdicts':  {kind: 'robot',   sprite: 'programmable-speaker.png'},
-    'conflicted':     {kind: 'machine', sprite: 'deconstruction-planner.png'},
-    'resolved':       {kind: 'machine', sprite: 'construction-robot.png'},
+    'in review':      {kind: 'machine', sprite: 'assembling-machine-3.png'},
+    'gate verdicts':  {kind: 'machine', sprite: 'assembling-machine-3.png'},
+    'conflicted':     {kind: 'chest',   sprite: 'chest/steel-chest.png'},
+    'resolved':       {kind: 'chest',   sprite: 'chest/steel-chest.png'},
     'approved':       {kind: 'chest',   sprite: 'chest/steel-chest.png'},
     'in line':        {kind: 'chest',   sprite: 'chest/steel-chest.png'},
     'merged today':   {kind: 'machine', sprite: 'assembling-machine-3.png'},
-    'folded':         {kind: 'machine', sprite: 'roboport.png'},
+    'folded':         {kind: 'machine', sprite: 'assembling-machine-3.png'},
     'deployed':       {kind: 'machine', sprite: 'rocket-silo.png'},
     // Row 3's shipStage() call uses 'last deploy' as its own cap/data-square
     // (the box's caption text is the separate `label` param, 'deployed') -
@@ -8263,9 +8583,31 @@ const REMNANT_SPRITE = {
     'radar.png': { url: '/static/factorio/remnants/radar-remnants.png', size: '85px 64px', pos: 'center' },
     'chest/steel-chest.png': { url: '/static/factorio/remnants/steel-chest-remnants.png', size: '136px 80px', pos: '0 0' },
 };
-function shipSpriteHtml(cap, unknown) {
-    const meta = SHIP_STAGE_META[cap];
+// LORE order 15: BUGS FOUND is a biter, not a fixed sprite - bugs are the
+// thing attacking the line, not a machine in it. Which biter depends on the
+// count: reuses the EXACT thresholds `bugsCls` already uses for the
+// number's own colour (0 neutral, 1-4 warn, >=5 hot) so the sprite says the
+// same thing the colour already says, not a second, independently-tuned
+// judgement call. Zero is the corpse (calm, healthy, nothing attacking) -
+// deliberately NOT the same asset as the no-data/remnant case below, per
+// the brief's "no bugs and nobody knows must never look alike".
+function shipBugsFoundSprite(num) {
+    const n = Number(num);
+    if (n === 0) return 'biter/small-biter-corpse.png';
+    return n >= 5 ? 'biter/medium-biter.png' : 'biter/small-biter.png';
+}
+function shipSpriteHtml(cap, unknown, num) {
+    let meta = SHIP_STAGE_META[cap];
     if (!meta) return '';
+    if (cap === 'bugs found') {
+        // Unknown (no measured count at all) still needs A biter sprite to
+        // dim - small-biter is the neutral base for that, since we do not
+        // know if it would have been few or many. No remnant crop exists for
+        // any biter sprite (none were staged), so this stage falls back to
+        // the plain dim treatment on unknown, same as every other sprite
+        // with no dedicated remnant art (inserter.png, programmable-speaker.png, etc).
+        meta = { kind: meta.kind, sprite: unknown ? 'biter/small-biter.png' : shipBugsFoundSprite(num) };
+    }
     const remnant = unknown ? REMNANT_SPRITE[meta.sprite] : null;
     const dimCls = unknown && !remnant ? ' dim' : '';
     const remnantCls = remnant ? ' remnant' : '';
@@ -8318,7 +8660,7 @@ function shipStage(num, cap, cls, sub, spark, help, stageCls, dropdownKey, prs, 
          + ' role="button" tabindex="0" aria-haspopup="true" aria-expanded="' + open + '" aria-controls="ship-list-' + key + '"'
          + ' onclick="toggleShipDropdown(this.dataset.dropdown)" onkeydown="shipStageKeydown(event,this.dataset.dropdown)"'
          + (help ? ' title="' + help.replace(/"/g, '') + '"' : '') + '>' + (hist || '')
-         + '<div class="ship-sprite-wrap">' + shipSpriteHtml(cap, unknown)
+         + '<div class="ship-sprite-wrap">' + shipSpriteHtml(cap, unknown, num)
          // An unknown count renders NOTHING here (no plate, no '?' glyph) -
          // it must never read as a measured 0, and must never look like a
          // second, competing "no data" signal next to the sprite/remnant.
@@ -8369,6 +8711,29 @@ function driveAssemblerAnim(d) {
     asmTimer = setInterval(() => { asmFrame = (asmFrame + 1) % (ASM_COLS * ASM_ROWS); setFrame(asmFrame); }, interval);
 }
 
+// Ben: "to the right in the open space on row 3, keep a list of all the
+// issues we've closed with 2 numbers: time (hh:mm) from Bug found to
+// dispatched and from Dispatched to Deployed." Minutes come measured from
+// the server (closed_issue_timings); a null leg renders n/a, never a guess.
+function shipMinsHM(m) {
+    if (m === null || m === undefined) return 'n/a';
+    const h = Math.floor(m / 60), mm = m % 60;
+    return String(h).padStart(2, '0') + ':' + String(mm).padStart(2, '0');
+}
+function shipClosedIssuesHtml(list) {
+    const title = 'CLOSED ISSUES - hours:minutes from bug found (issue created) to dispatched (the lane launch when one was recorded, else the first commit on the PR that fixed it), and from dispatched to deployed (the first green production deploy that started after that PR merged). n/a = that leg has no measurement.';
+    let rows;
+    if (list === null || list === undefined) rows = '<div class="ship-closed-row ship-closed-na">n/a</div>';
+    else if (!list.length) rows = '<div class="ship-closed-row ship-closed-na">none closed recently</div>';
+    else rows = list.map(r => '<div class="ship-closed-row">'
+        + '<span class="ship-closed-num">#' + r.number + '</span>'
+        + '<span class="ship-closed-title">' + shipEscape(r.title || '') + '</span>'
+        + '<span class="ship-closed-t">' + shipMinsHM(r.bug_to_dispatch_min) + '</span>'
+        + '<span class="ship-closed-t">' + shipMinsHM(r.dispatch_to_deploy_min) + '</span></div>').join('');
+    return '<div class="ship-closed" title="' + title + '">'
+        + '<div class="ship-closed-head"><span>closed issues</span><span class="ship-closed-t">bug &rarr; disp</span><span class="ship-closed-t">disp &rarr; deploy</span></div>'
+        + rows + '</div>';
+}
 function shipLegendHtml() {
     return '<div class="ship-legend">'
         + '<div class="ship-legend-chip"><span class="ship-legend-swatch stage-machine"></span>machine - automation (cron/CI/git)</div>'
@@ -8398,27 +8763,68 @@ function capacityOutline(card, colour, glow) {
         : 'none');
 }
 
-// The arrows are long-handed inserters (Ben, 3:21 PM CDT 2026-09-11): an
+// LORE order 14: a stable, deterministic per-stage phase in [0,1) so a row of
+// swinging arms staggers instead of swinging in lockstep (which reads as a
+// screensaver, not a factory). Hashed from the square name rather than
+// threaded through as a numeric index - the name already IS a stable,
+// unique key for the stage's fixed position in the strip, so it satisfies
+// the same "stable across renders, not random per frame" requirement
+// without adding an index parameter to every shipArrow/shipStage call site.
+function shipStagePhase(square) {
+    let h = 0;
+    for (let i = 0; i < square.length; i++) h = (h * 31 + square.charCodeAt(i)) >>> 0;
+    return (h % 997) / 997;
+}
+
+// The arrows are fast inserters (Ben, 2026-09-12: "swap out all the long
+// handled inserters with fast inserters" - the blue ones; the sheets share
+// the long-handed layout exactly, so only the art changed). The swing
+// keyframes also switch the hand: closed (carrying) from pickup to drop,
+// open (empty) on the way back - a real inserter animation, not one still
+// frame rotating. Originally long-handed (Ben, 3:21 PM CDT 2026-09-11): an
 // inserter is literally the thing that moves items between two machines -
 // every outage found today was an arrow, not a box. Carries the moving/idle
 // state where the held item would be; mirrored on row 2 so it reaches the
 // direction work actually moves.
-function shipInserterHtml(count, dir, unknown) {
+// LORE order 14: `phaseSeed` (for the stagger phase) and `swingDuration`/
+// `backedUp` (arm swing speed and the frozen-at-pickup jam state) are new -
+// swingDuration is the same order-9-clamped value shipArrow already computes
+// for the belt (same handoff, same speed), never invented for an unmeasured
+// arrow (those arrive as `unknown` and never carry a real swingDuration).
+// LORE order 17: every belt now carries TWO of these (a loading inserter and
+// an unloading inserter - see shipArrow) - `phaseSeed` is the caller's own
+// unique key per instance (e.g. square+'-load' / square+'-unload') so the
+// two on one belt are never phase-twins, and `armRest` (degrees) is the
+// resting/pickup angle: 90 for a left-to-right horizontal belt, -90 for
+// right-to-left, 180 for a vertical (top-to-bottom) belt - both the loading
+// and unloading inserter on a vertical belt reach straight down, since both
+// sit beside a belt whose flow is always downward.
+function shipInserterHtml(count, armRest, unknown, phaseSeed, backedUp, swingDuration, alignCls) {
     const moving = count > 0;
-    const hand = moving ? 'long-handed-inserter-hand-closed.png' : 'long-handed-inserter-hand-open.png';
+    const hand = moving ? 'fast-inserter-hand-closed.png' : 'fast-inserter-hand-open.png';
     // Ben's remnants amendment: an arrow with NO measured rate (unknown, not
     // measured-zero) shows the wrecked inserter platform, arm dimmed to
     // near-invisible - "nobody knows whether anything is stuck" must never
     // look like the idle (measured-zero) inserter.
     const remnantCls = unknown ? ' remnant' : '';
-    // long-handed-inserter-remnants.png measured 134x376: 4 frames stacked
+    const backedUpCls = backedUp ? ' backed-up' : '';
+    // Ben's built-reference correction: on an in-row vertical belt, each
+    // inserter sits at the belt's own beginning or end (top or bottom), not
+    // centered beside it - alignCls carries that ('align-top'/'align-bottom'),
+    // set by the caller from the belt's own flow direction.
+    const alignClsStr = alignCls ? ' ' + alignCls : '';
+    // fast-inserter-remnants.png measured 134x376: 4 frames stacked
     // 134x94 each - crop frame 1, don't scale the whole strip into the slot.
     const platformStyle = unknown
-        ? ' style="background-image:url(/static/factorio/remnants/long-handed-inserter-remnants.png);background-size:30px 84px;background-position:0 0"'
+        ? ' style="background-image:url(/static/factorio/remnants/fast-inserter-remnants.png);background-size:30px 84px;background-position:0 0"'
         : '';
-    return '<span class="ship-inserter ' + (moving ? 'moving' : 'idle') + remnantCls + '">'
+    const phase = shipStagePhase(phaseSeed);
+    const swingVars = '--arm-rest:' + armRest + 'deg;' + ((moving && swingDuration)
+        ? '--swing-duration:' + swingDuration + 's;--swing-delay:-' + (phase * swingDuration).toFixed(3) + 's;'
+        : '');
+    return '<span class="ship-inserter ' + (moving ? 'moving' : 'idle') + remnantCls + backedUpCls + alignClsStr + '">'
         + '<span class="inserter-platform"' + platformStyle + '></span>'
-        + '<span class="inserter-arm" style="background-image:url(/static/factorio/inserter/' + hand + ')"></span>'
+        + '<span class="inserter-arm" style="' + swingVars + 'background-image:url(/static/factorio/inserter/' + hand + ')"></span>'
         + '</span>';
 }
 
@@ -8438,83 +8844,115 @@ function shipDrainText(drain) {
     return n + 'h to drain';
 }
 
-// LORE order 10 "THE ITEM": what actually rides the belt between stages, and
-// how it transforms - ore -> plate -> gear -> circuit -> advanced circuit ->
-// rocket part -> satellite. The order-10 text names a staged
-// static/factorio/items/ directory; it was never actually committed to this
-// repo (checked - the directory does not exist), so these are small original
-// inline SVGs, the same "own art, no Wube bytes" precedent already used for
-// the SHIP-GAME-3 yard robots, not crops of Wube's item icons.
-const SHIP_ITEM_SVG = {
-    'ore-iron': '<svg viewBox="0 0 16 16"><path d="M2 10l2-5 4-2 4 1 3 4-2 5-5 1z" fill="#9fb0c9" stroke="#5c6b82" stroke-width="1"/></svg>',
-    'ore-copper': '<svg viewBox="0 0 16 16"><path d="M2 10l2-5 4-2 4 1 3 4-2 5-5 1z" fill="#d9793d" stroke="#8a4a20" stroke-width="1"/></svg>',
-    'plate-iron': '<svg viewBox="0 0 16 16"><rect x="2" y="6" width="12" height="4" rx="1" fill="#c8d0dc" stroke="#5c6b82" stroke-width="1"/></svg>',
-    'gear': '<svg viewBox="0 0 16 16"><g fill="#aab2c4" stroke="#5c6b82" stroke-width=".6"><rect x="7" y="0" width="2" height="3"/><rect x="7" y="13" width="2" height="3"/><rect x="0" y="7" width="3" height="2"/><rect x="13" y="7" width="3" height="2"/><rect x="1.6" y="1.6" width="2.8" height="2.8" transform="rotate(45 3 3)"/><rect x="11.6" y="1.6" width="2.8" height="2.8" transform="rotate(45 13 3)"/><rect x="1.6" y="11.6" width="2.8" height="2.8" transform="rotate(45 3 13)"/><rect x="11.6" y="11.6" width="2.8" height="2.8" transform="rotate(45 13 13)"/><circle cx="8" cy="8" r="5"/></g><circle cx="8" cy="8" r="2.2" fill="#1c2438"/></svg>',
-    'circuit': '<svg viewBox="0 0 16 16"><rect x="1.5" y="3" width="13" height="10" rx="1" fill="#1d5c3a" stroke="#39ff8a" stroke-width="1"/><g fill="#39ff8a"><circle cx="4" cy="6" r="1"/><circle cx="8" cy="6" r="1"/><circle cx="12" cy="6" r="1"/><circle cx="4" cy="10" r="1"/><circle cx="8" cy="10" r="1"/><circle cx="12" cy="10" r="1"/></g></svg>',
-    'circuit-adv': '<svg viewBox="0 0 16 16"><rect x="1.5" y="3" width="13" height="10" rx="1" fill="#1d5c3a" stroke="#39ff8a" stroke-width="1"/><rect x="4.5" y="5.5" width="7" height="5" rx=".6" fill="#ff4d6a" stroke="#ffb0bd" stroke-width=".6"/></svg>',
-    'rocket-part': '<svg viewBox="0 0 16 16"><path d="M8 1l4 4v6l-4 4-4-4V5z" fill="#e8ecf5" stroke="#8a94ad" stroke-width="1"/></svg>',
-    'satellite': '<svg viewBox="0 0 16 16"><rect x="6" y="5" width="4" height="6" rx=".6" fill="#cfd8e6" stroke="#8a94ad" stroke-width=".8"/><rect x="0.5" y="6.5" width="4.5" height="3" fill="#39d7ff" stroke="#1a8fb8" stroke-width=".5"/><rect x="11" y="6.5" width="4.5" height="3" fill="#39d7ff" stroke="#1a8fb8" stroke-width=".5"/><line x1="8" y1="5" x2="8" y2="2" stroke="#cfd8e6" stroke-width="1"/></svg>',
+// LORE order 17 "THE REAL ITEM CHAIN": Ben's own crafting-chain list, one
+// item per arrow across the 14 sequential handoffs between the 15 stages -
+// bug first, rocket last. Deduped per his own note: "Red Circuit" and
+// "advanced circuit" are the same Factorio item, not two, which is what
+// makes the count land on exactly 14. static/factorio/items/ is staged now
+// (round 1's inline SVGs used the same names as a placeholder while it
+// didn't exist - replaced here with the real assets). 'bugs found' uses the
+// biter art already staged for that square (order 15) rather than a
+// duplicate copy under items/. Keyed by the arrow's own `square` (upstream
+// stage) name, same convention as every other per-arrow lookup in this file.
+const SHIP_ARROW_ITEM = {
+    'bugs found':    'biter/small-biter.png',
+    'issues open':   'items/lab.png',
+    'dispatched':    'items/copper-ore.png',
+    'prs open':      'items/copper-plate.png',
+    'ci q/run':      'items/copper-cable.png',
+    'review routed': 'items/electronic-circuit.png',   // row 1 -> row 2 turn (vertical belt)
+    'in review':     'items/advanced-circuit.png',
+    'gate verdicts': 'items/speed-module.png',
+    'conflicted':    'items/speed-module-2.png',
+    'resolved':      'items/speed-module-3.png',       // row 2 -> row 3 turn (vertical belt)
+    'approved':      'items/processing-unit.png',
+    'in line':       'items/car.png',
+    'merged today':  'items/tank.png',
+    'folded':        'items/rocket.png',
 };
-// Bugs are copper, features are iron (order 10); from the gear onward the
-// chain converges, since past that point the pipeline treats them
-// identically. Keyed by the arrow's own `square` (upstream stage) name -
-// value is [item riding the belt, item it becomes at the downstream
-// inserter]. Arrows with no entry here (row-end joints like "in review" and
-// "folded"->deploy, which only carry the boustrophedon elbow) render no belt
-// items - there is no straight-through arrow there to draw one on.
-const SHIP_ARROW_ITEMS = {
-    'bugs found':    ['ore-copper', 'ore-iron'],
-    'issues open':   ['ore-iron', 'plate-iron'],
-    'dispatched':    ['plate-iron', 'gear'],
-    'prs open':      ['gear', 'gear'],
-    'ci q/run':      ['gear', 'circuit'],
-    // Round 2 rebalance (PR #35 review): 'in review' and 'folded' are now
-    // within-row arrows (they were row-end dead ends before, with no belt at
-    // all); 'review routed' and 'resolved' are the new row-end dead ends and
-    // no longer need an entry here.
-    'in review':     ['circuit', 'circuit'],
-    'gate verdicts': ['circuit', 'circuit-adv'],
-    'conflicted':    ['circuit-adv', 'circuit-adv'],
-    'approved':      ['circuit-adv', 'rocket-part'],
-    'in line':       ['rocket-part', 'rocket-part'],
-    'merged today':  ['rocket-part', 'satellite'],
-    'folded':        ['satellite', 'satellite'],
-};
+// Ben's correction on the built reference: consecutive in-row vertical belts
+// alternate their own flow direction (down, up, down, up...) rather than all
+// pointing the same way - restarting at "down" per row, matching the
+// reference's own single-row demo. Purely a per-segment rendering choice
+// (the OVERALL item chain still always reads bug->rocket left to right);
+// only which end of THIS belt is "up" vs "down" flips.
+const SHIP_VBELT_ROW_ORDER = [
+    ['bugs found', 'issues open', 'dispatched', 'prs open', 'ci q/run', 'review routed'],
+    ['gate verdicts', 'conflicted', 'resolved', 'approved', 'in line', 'merged today'],
+];
+function shipVbeltFlowsDown(square) {
+    for (let r = 0; r < SHIP_VBELT_ROW_ORDER.length; r++) {
+        const idx = SHIP_VBELT_ROW_ORDER[r].indexOf(square);
+        // Ben: the row-end belt into row 2 "comes down on the right, so the
+        // next ones should be up, then down, then up" - row 1 has nothing
+        // feeding it so it starts down; every later row starts UP because
+        // the row-end belt that just fed it came down.
+        if (idx !== -1) return r === 0 ? idx % 2 === 0 : idx % 2 === 1;
+    }
+    return true;
+}
+// Standard 120x64 mip-chain sheet (order 11's own convention) - scaled to
+// whatever pixel size the belt slot calls for, first frame only.
+function shipItemImgHtml(itemPath, sizePx) {
+    const w = Math.round(sizePx * 120 / 64);
+    return '<div class="ship-belt-item-img" style="width:' + sizePx + 'px;height:' + sizePx + 'px;'
+        + 'background-image:url(/static/factorio/' + itemPath + ');'
+        + 'background-size:' + w + 'px ' + sizePx + 'px;background-position:0 0"></div>';
+}
 // LORE order 1 "the belt backs up" + order 11 #2: a real belt segment
-// carrying the order-10 item, populated by throughput rather than a glyph
+// carrying the order-17 item, populated by throughput rather than a glyph
 // with a number beside it. `hasRate`/`rate`/`backedUp` are the same
 // instrumentation shipArrow already computes for the (now-removed) pipe
 // polygon; `knownCount` is the plain count fallback for the several arrows
-// that have never had a formal rate/backlog instrument (bugs found,
-// dispatched, review routed, gate verdicts, conflicted, resolved) - a known
-// number with no rate shows still items, never zero items (which would lie
-// and read as starved) and never motion (which would invent a speed, the
-// exact false-green order 9 warns against).
-function shipBeltHtml(square, hasRate, rate, backedUp, knownCount, dir) {
-    const items = SHIP_ARROW_ITEMS[square];
-    if (!items) return '';
-    const upItem = items[0], downItem = items[1];
+// that have never had a formal rate/backlog instrument. `vertical` (order
+// 17 #3) swaps the belt's own long axis and the item layout from left/right
+// to top/bottom - see the call site for which two arrows use it.
+// Ben's model: "the work in between the boxes are queues" - a belt shows
+// the jobs WAITING to enter the next stage, one item per job (capped at
+// what fits nose to tail), piled up from the downstream end the way a real
+// queue backs up against the inserter that drains it. The stage's own
+// number is what's being worked on right now; the inserter is the job
+// starting. Rate still sets the belt's scroll speed; it no longer invents
+// an item count.
+const SHIP_BELT_CAPACITY = 7;
+function shipBeltHtml(square, hasRate, rate, backedUp, knownCount, dir, vertical, vDown, backlog) {
+    const itemPath = SHIP_ARROW_ITEM[square];
+    if (!itemPath) return '';
     let state, slots;
-    if (hasRate) {
-        if (backedUp) { state = 'backed-up'; slots = 5; }
-        else if (Number(rate) === 0) { state = 'starved'; slots = 0; }
-        else { state = 'flowing'; slots = Math.max(1, Math.min(4, Math.round(1 + Math.max(0.2, Math.min(3, Number(rate) / 4))))); }
+    const backlogKnown = backlog !== null && backlog !== undefined;
+    if (hasRate && backlogKnown) {
+        slots = Math.min(SHIP_BELT_CAPACITY, Math.max(0, Math.round(Number(backlog))));
+        if (backedUp) state = 'backed-up';
+        else if (Number(rate) === 0) state = 'starved';
+        else state = 'flowing';
+    } else if (hasRate) {
+        // Rate measured but no queue count: the belt moves, nothing is
+        // claimed to be on it - never a made-up number of items.
+        slots = 0; state = backedUp ? 'backed-up' : (Number(rate) === 0 ? 'starved' : 'flowing');
     } else if (knownCount !== null) {
-        state = 'known'; slots = Math.max(1, Math.min(3, Math.round(Math.sqrt(Math.max(1, knownCount)))));
+        // No rate instrument, only a plain count of what is waiting to move
+        // on from the stage before - shown as the queue, standing still.
+        state = 'known'; slots = Math.min(SHIP_BELT_CAPACITY, Math.max(0, Math.round(knownCount)));
     } else {
         state = 'unknown'; slots = 0;
     }
+    const itemSize = vertical ? 15 : 16;
+    const step = 84 / (SHIP_BELT_CAPACITY - 1);
     let itemsHtml = '';
     for (let i = 0; i < slots; i++) {
-        // The item changes shape AT the inserter, not while sitting in a
-        // square (order 10) - only the slot nearest the downstream box
-        // carries the transformed shape.
-        const kind = (i === slots - 1 && slots > 1) ? downItem : upItem;
-        const t = slots === 1 ? 0.5 : i / (slots - 1);
-        const pos = dir === 'left' ? (92 - 84 * t) : (8 + 84 * t);
-        itemsHtml += '<span class="ship-belt-item" style="left:' + pos.toFixed(1) + '%">' + SHIP_ITEM_SVG[kind] + '</span>';
+        // Item 0 sits at the DOWNSTREAM end (against the unloading inserter);
+        // each further item queues one step back toward the upstream end.
+        // A vertical belt's vDown says which end is downstream (bottom when
+        // flowing down, top when flowing up - consecutive in-row belts
+        // alternate, per Ben's built reference); a horizontal belt's dir
+        // says the same.
+        const fromDownstream = 92 - step * i;
+        const fromUpstream = 8 + step * i;
+        const pos = vertical ? (vDown ? fromDownstream : fromUpstream) : (dir === 'left' ? fromUpstream : fromDownstream);
+        const axis = vertical ? 'top' : 'left';
+        itemsHtml += '<span class="ship-belt-item" style="' + axis + ':' + pos.toFixed(1) + '%">' + shipItemImgHtml(itemPath, itemSize) + '</span>';
     }
-    const dirCls = dir === 'left' ? ' ship-belt-left' : '';
+    const dirCls = vertical ? (' ship-belt-vertical' + (vDown ? '' : ' ship-belt-vertical-up')) : (dir === 'left' ? ' ship-belt-left' : '');
     return '<div class="ship-belt ship-belt-' + state + dirCls + '">'
         + '<div class="ship-belt-track"></div>'
         + '<div class="ship-belt-items">' + itemsHtml + '</div></div>';
@@ -8546,7 +8984,16 @@ function shipBeltHtml(square, hasRate, rate, backedUp, knownCount, dir) {
 // separate pipe-width visual would be the "second signal" the lore says not
 // to add. Numbers live in the native `title` tooltip only (order 9: "hover is
 // where the numbers live") - there is no more always-visible badge text.
-function shipArrow(square, glyph, arrow, description, legacyCount, width, isBottleneck, arrowLabel, drainLabelText, dir) {
+// LORE order 17 #3: `vertical` (with `elbowId`) renders this same arrow as a
+// vertical, top-to-bottom belt instead of a horizontal one - used for the
+// two row-turn handoffs (review routed->in review, resolved->approved),
+// which are already a genuine downward transition in the boustrophedon (row
+// 2 sits below row 1 on screen), unlike the 12 within-row handoffs between
+// side-by-side stages, which stay horizontal - see the PR body for why a
+// literal vertical belt everywhere would mean abandoning the boustrophedon
+// layout itself. `elbowId` makes it position:absolute + JS-synced
+// (positionShipElbows), same pattern as the plain turn glyph it replaces.
+function shipArrow(square, glyph, arrow, description, legacyCount, width, isBottleneck, arrowLabel, drainLabelText, dir, vertical, elbowId) {
     const agentLane = glyph === '🤖';
     const rate = arrow ? arrow.rate_per_hour : null;
     const backlog = arrow ? arrow.backlog : null;
@@ -8567,7 +9014,7 @@ function shipArrow(square, glyph, arrow, description, legacyCount, width, isBott
     const backlogText = (backlog === null || backlog === undefined) ? 'unknown waiting' : backlog + ' waiting';
     const label = shipEscape(description + ': ' + rateText + ', ' + backlogText + ', ' + shipDrainText(drain));
     const tag = agentLane ? 'button' : 'span';
-    const dirCls = dir === 'left' ? ' ship-arrow-left' : '';
+    const dirCls = (dir === 'left' ? ' ship-arrow-left' : '') + (vertical ? (elbowId ? ' ship-arrow-vertical' : ' ship-arrow-vbelt') : '');
     // Six arrows (bugs found/dispatched/review routed/gate verdicts/conflicted/
     // resolved) have never had a formal rate/backlog instrument - only a plain
     // count via arrowLabel (e.g. "5", or "?"/"n/a" when unavailable). Parsed
@@ -8575,12 +9022,43 @@ function shipArrow(square, glyph, arrow, description, legacyCount, width, isBott
     // items on their outbound belt rather than always reading starved.
     const knownCount = (!hasRate && arrowLabel !== undefined && arrowLabel !== null && arrowLabel !== '' && !Number.isNaN(Number(arrowLabel)))
         ? Number(arrowLabel) : null;
-    return '<' + tag + (agentLane ? ' type="button"' : ' role="img"') + ' class="ship-arrow' + (isBottleneck ? ' bottleneck' : '') + dirCls + '" style="' + style
+    // Only the row-turn belts (elbowId set) genuinely sit between a stage
+    // ABOVE and a stage BELOW, so only those sweep on the vertical (180deg)
+    // arc. The in-row vertical belts (vbelt) sit BESIDE two side-by-side
+    // stages - Ben's correction - so their inserters swing horizontally,
+    // same as a plain (non-vertical) arrow.
+    // Every inserter reaches sideways now - the row-end belts included:
+    // per Ben's reference, that tall belt runs BESIDE the last stage of the
+    // row down to beside the first stage of the next, with both inserters
+    // on the stage side of it, one at its top and one at its bottom.
+    const armRest = dir === 'left' ? -90 : 90;
+    // Ben's built reference: the two row-end belts stay downstream-is-down
+    // (the stage before really is above, the stage after really is below);
+    // the 12 in-row belts alternate per SHIP_VBELT_ROW_ORDER, and each
+    // inserter sits at the belt's own beginning (top if flowing down, bottom
+    // if flowing up) or end (the opposite), never centered beside it.
+    const vDown = !vertical || elbowId ? true : shipVbeltFlowsDown(square);
+    // Ben asked what "remnant" means: it is NOT time-based - it is the wreck
+    // sprite for a handoff we have no measurement for at all (the count is
+    // n/a). A handoff with a plain count but no rate instrument shows an
+    // intact, idle (open-hand, still) inserter instead; only a measured
+    // rate makes it swing. Before this it wrecked every un-instrumented
+    // arrow even when the count was known.
+    const noData = !hasRate && knownCount === null;
+    const loadAlign = (vertical && !elbowId) ? (vDown ? 'align-top' : 'align-bottom') : null;
+    const unloadAlign = (vertical && !elbowId) ? (vDown ? 'align-bottom' : 'align-top') : null;
+    return '<' + tag + (agentLane ? ' type="button"' : ' role="img"') + ' class="ship-arrow' + (isBottleneck ? ' bottleneck' : '') + dirCls + '"'
+        + (elbowId ? ' id="' + elbowId + '"' : '') + ' style="' + style
         + '" data-square-left="' + square + '" title="' + label + '" aria-label="' + label + '"'
         + (agentLane ? ' data-dropdown="' + key + '" aria-controls="ship-list-' + key
             + '" aria-expanded="' + (openShipDropdown === key) + '" onclick="toggleShipDropdown(this.dataset.dropdown)"' : '') + '>'
-        + shipBeltHtml(square, hasRate, rateForSpeed, isBottleneck, knownCount, dir)
-        + shipInserterHtml(rateForSpeed, dir, !hasRate)
+        // LORE order 17 #4: an inserter on BOTH sides of the belt - loading
+        // (upstream, places items on) then unloading (downstream, takes them
+        // off) - same rate/backedUp/unknown state on both, but each gets its
+        // own phase seed so they are never mirror-synced.
+        + shipInserterHtml(rateForSpeed, armRest, noData, square + '-load', isBottleneck, duration, loadAlign)
+        + shipBeltHtml(square, hasRate, rateForSpeed, isBottleneck, knownCount, dir, vertical, vDown, backlog)
+        + shipInserterHtml(rateForSpeed, armRest, noData, square + '-unload', isBottleneck, duration, unloadAlign)
         + '</' + tag + '>';
 }
 
@@ -8707,34 +9185,79 @@ function positionShipYard() {
     yard.style.transform = 'translateX(-50%)';
 }
 // Round 2 (Elrond review, PR #35, defect 3): "the boustrophedon turn arrows
-// are drawing outside the belt run" - the elbow used to be a full-width
-// text-aligned div, which floats in whatever gap that row's SHORTEST column
-// happens to leave below it. Tuck each one directly against the actual
-// bottom corner of the square it turns from instead - same bounding-rect-sync
-// pattern as positionShipYard above, same positioning ancestor (the elbow's
+// are drawing outside the belt run" - the turn used to be a full-width
+// text-aligned glyph div, which floats in whatever gap that row's SHORTEST
+// column happens to leave below it. Tuck each one directly under the actual
+// corner of the square it turns from instead - same bounding-rect-sync
+// pattern as positionShipYard above, same positioning ancestor (each turn's
 // own parent, #ship-flow, sits inside that same position:relative wrap).
+// LORE order 17 #3: each turn is now a real vertical belt (38px wide,
+// ~144px tall - see .ship-arrow-vertical) instead of a small glyph, so it is
+// centered ON the corner rather than flush against it, and dropped fully
+// below the row (row1/row2 now carry the extra margin-bottom for exactly
+// this) instead of overlapping its bottom edge by a few px.
+window.addEventListener('resize', () => positionShipElbows());
 function positionShipElbows() {
     const wrap = document.getElementById('ship-flow') && document.getElementById('ship-flow').parentElement;
     if (!wrap) return;
     const wrapRect = wrap.getBoundingClientRect();
     // Elbow 1 turns from row 1's own last square ('review routed') down to
-    // row 2's first ('in review') - tuck it under review routed's right edge.
-    const elbow1 = document.getElementById('ship-elbow-1');
-    const fromRow1 = document.querySelector('#ship-flow .ship-row-1 .ship-stage:last-child');
-    if (elbow1 && fromRow1) {
-        const r = fromRow1.getBoundingClientRect();
-        elbow1.style.left = (r.right - wrapRect.left - 26) + 'px';
-        elbow1.style.top = (r.bottom - wrapRect.top - 6) + 'px';
+    // row 2's first ('in review') - center it under review routed's right
+    // edge. Anchored by data-square directly (not :last-child) - LORE order
+    // 17 #3 made the vertical belt itself row1's actual last DOM child now
+    // (appended after the 'review routed' stage), so ':last-child' matched
+    // nothing and this silently never positioned at all until fixed.
+    // Ben's reference: the row-end belt is a tall column BESIDE the row's
+    // last stage, running down to beside the next row's first stage - so it
+    // spans from the from-stage's top to the to-stage's bottom, sitting just
+    // outside the from-stage's outer edge (right for row 1, left for the
+    // row-reversed row 2). Both stages' sprites are what the inserters at
+    // its top/bottom visibly reach into.
+    const place = (elbowId, fromSel, toSel, side) => {
+        const elbow = document.getElementById(elbowId);
+        const from = document.querySelector(fromSel);
+        const to = document.querySelector(toSel);
+        if (!elbow || !from || !to) return;
+        // Ben: the inserters at the belt's top and bottom must sit level
+        // with the two machines (sprites) they reach into, not with the
+        // stage boxes' outer edges (which include captions, sparklines and
+        // sub-lines) - so the belt spans sprite-top to sprite-bottom.
+        const fs = from.querySelector('.ship-sprite-wrap') || from;
+        const ts = to.querySelector('.ship-sprite-wrap') || to;
+        const f = fs.getBoundingClientRect();
+        const t = ts.getBoundingClientRect();
+        const fb = from.getBoundingClientRect();
+        const tb = to.getBoundingClientRect();
+        const top = Math.min(f.top, t.top);
+        const bottom = Math.max(f.bottom, t.bottom);
+        elbow.style.top = (top - wrapRect.top) + 'px';
+        elbow.style.height = (bottom - top) + 'px';
+        // Sit just outside the two machines (sprites), then clamp inside the
+        // strip - row 3's box being wider than row 2's last had pushed the
+        // whole row-2 -> row-3 belt off the left edge of the frame.
+        let edge = side === 'right' ? Math.max(f.right, t.right) + 4 : Math.min(f.left, t.left) - 4 - elbow.offsetWidth;
+        const flowRect = document.getElementById('ship-flow').getBoundingClientRect();
+        edge = Math.max(flowRect.left + 2, Math.min(edge, flowRect.right - 2 - elbow.offsetWidth));
+        elbow.style.left = (edge - wrapRect.left) + 'px';
+    };
+    // Row 1 ends on the right at 'in review'; row 2 (row-reverse) starts on
+    // the right at 'gate verdicts', directly under it.
+    place('ship-elbow-1', '#ship-flow .ship-row-1 [data-square="in review"]', '#ship-flow .ship-row-2 [data-square="gate verdicts"]', 'right');
+    // Ben: DEPLOYED sits directly under FOLDED - line the two sprites'
+    // centres up (row 3's box is wider than row 2's last, so left-aligning
+    // the boxes leaves the machine itself sitting off to the right).
+    const folded = document.querySelector('#ship-flow .ship-row-2 [data-square="folded"] .ship-sprite-wrap');
+    const deployedStage = document.querySelector('#ship-flow .ship-row-3 [data-square="last deploy"]');
+    const deployed = deployedStage && deployedStage.querySelector('.ship-sprite-wrap');
+    if (folded && deployed) {
+        deployedStage.style.marginLeft = '';
+        const fc = folded.getBoundingClientRect(); const dc = deployed.getBoundingClientRect();
+        const delta = (fc.left + fc.width / 2) - (dc.left + dc.width / 2);
+        if (Math.abs(delta) > 1) deployedStage.style.marginLeft = delta + 'px';
     }
-    // Elbow 2 turns from row 2's own last DOM square ('resolved' - visually
-    // leftmost, since row 2 is row-reverse) down to row 3's first ('approved').
-    const elbow2 = document.getElementById('ship-elbow-2');
-    const fromRow2 = document.querySelector('#ship-flow .ship-row-2 .ship-stage:last-child');
-    if (elbow2 && fromRow2) {
-        const r = fromRow2.getBoundingClientRect();
-        elbow2.style.left = (r.left - wrapRect.left) + 'px';
-        elbow2.style.top = (r.bottom - wrapRect.top - 6) + 'px';
-    }
+    // Row 2 ends on the left at 'folded'; row 3 starts on the left at
+    // 'last deploy' (DEPLOYED).
+    place('ship-elbow-2', '#ship-flow .ship-row-2 [data-square="folded"]', '#ship-flow .ship-row-3 [data-square="last deploy"]', 'left');
 }
 function renderShipYard(workers, completions) {
     const yard = document.getElementById('ship-yard');
@@ -9026,7 +9549,12 @@ function refreshShipFlow() {
         positionShipYard();
         // Round 2 (Elrond review, PR #35, defect 3): the row-turn elbows are
         // freshly recreated by the innerHTML swap above too - sync them now.
+        // The row-end belts are sized to the stages' rendered heights, which
+        // still shift when Orbitron finishes loading (measured: 8px), so run
+        // again once fonts settle and again a beat later for late images.
         positionShipElbows();
+        if (document.fonts && document.fonts.ready) document.fonts.ready.then(positionShipElbows);
+        setTimeout(positionShipElbows, 400);
     }).catch(() => {
         const el = document.getElementById('ship-flow');
         if (el && !el.querySelector('.ship-stage')) el.innerHTML = '<span class="gdim">shipping pipeline failed to load.</span>';
@@ -9067,16 +9595,19 @@ const SHIP_BLANK_PIPELINE = {
     last_deploy_at: null, last_deploy_sha: null, deploy_configured: null, deploy_state: null,
     deploy_next_tick_at: null, deploy_run_sha: null,
     deployed_prs_today: null, deployed_prs_today_list: [],
+    closed_issue_timings: null,
     spark12h: {}, arrows: [], folded: null, folded_last_at: null,
 };
 function shipFlowHtml(d) {
-        // A null half must never stringify into "null/null" and read as a real
-        // count - both halves have to be measured or the whole box is unknown.
-        const ciNum = (d.ci_queued === null || d.ci_queued === undefined
-            || d.ci_running === null || d.ci_running === undefined) ? null : (d.ci_queued + '/' + d.ci_running);
-        // ciNum === null (unknown) must stay neutral, never fall through to
-        // the 'ok' default meant for a MEASURED zero - that was a false green.
-        const ciCls = ciNum === null ? '' : (d.ci_queued > 5 ? 'hot' : (d.ci_queued > 0 ? 'warn' : 'ok'));
+        // Ben: "CI Q/RUN" -> "CI RUN" - the queue count now lives on the belt
+        // to this stage's left (prs open -> ci run), driven by the same
+        // ci_queued backlog via arrowByKey['prs-ci'] - this box shows only
+        // what's actually running, not a combined "queued/running" string.
+        const ciNum = (d.ci_running === null || d.ci_running === undefined) ? null : d.ci_running;
+        // No hot/warn coloring here any more - that was flagging a big
+        // QUEUE, which is now the belt's own backed-up/packed signal, not
+        // this box's. A running count isn't inherently urgent.
+        const ciCls = '';
         const greenCls = d.green_waiting >= 6 ? 'hot' : (d.green_waiting >= 3 ? 'warn' : (d.green_waiting > 0 ? 'ok' : ''));
         const stuck = (d.queue_prs || []).find(pr => pr.state === 'UNMERGEABLE');
         // SHIP-SPARK-3 item 4: has_merge_queue === false means this repo has none
@@ -9227,61 +9758,72 @@ function shipFlowHtml(d) {
         // Row 1: bugs found -> issues open -> dispatched -> prs open ->
         // ci q/run -> review routed, left to right.
         const row1 =
-            shipStage(d.bugs_found_24h ?? null, 'bugs found', bugsCls, '', null, HELP.bugsFound, '', 'bugs-found', [], null, null, null, null, d.last_issue_created_at) + shipArrow('bugs found', '⚡', null, 'Issues created in the last 24h', null, null, false, String(d.bugs_found_24h ?? '?'), null, 'right') +
-            shipStage(d.issues_open, 'issues open', '', '', null, HELP.issues, '', null, null, null, shipIssuesRatePanel(sp.issues), null, arrowByKey['issues-prs'] && arrowByKey['issues-prs'].drain_label, d.last_issue_created_at) + shipArrow('issues open', '🤖', arrowByKey['issues-prs'], 'PRs opened in the last hour, from GitHub search - click for live agent lanes', null, wFor('issues-prs'), isB('issues-prs'), arrowByKey['issues-prs'] && arrowByKey['issues-prs'].label, null, 'right') +
-            shipStage(d.dispatched ?? null, 'dispatched', '', '', null, HELP.dispatched, '', 'dispatched', [], null, null, null, null, d.dispatched_last_at) + shipArrow('dispatched', '🤖', null, 'Live dispatched lanes', null, null, false, String(d.dispatched ?? '?'), null, 'right') +
-            shipStage(d.prs_open, 'prs open', '', prsOld.sub, null, HELP.prs + shipOldestWords('prs open', 'age of the oldest open, non-draft pull request'), prsOld.cls, null, null, null, shipHistorySpark(sp.prs, 'prs'), null, null, d.prs_open_last_at) + shipArrow('prs open', '⚙', arrowByKey['prs-ci'], 'Distinct PRs with a CI run started this hour, from the GitHub workflow-runs list', d.ci_queued, wFor('prs-ci'), isB('prs-ci'), null, null, 'right') +
-            shipStage(ciNum, 'ci q/run', ciCls, ciOld.sub, null, HELP.ciqr + shipOldestWords('ci q/run', 'how long the oldest queued run in the last 48 h has waited to start (since it was re-queued, if it was re-run)') + ' Green waiting: ' + greenWaitingText + ' PRs approved and green but not yet enqueued.' + greenWaitWords, ciOld.cls, null, null, null, shipHistorySpark(sp.ci, 'ci'), 'green waiting: ' + greenWaitingText + (greenSub ? ' · ' + greenSub : '') + (greenWaitSub ? ' · ' + greenWaitSub : ''), null, d.ci_last_run_started_at) + shipArrow('ci q/run', '⚙', arrowByKey['ci-green'], 'Distinct PRs with a green Pre-Merge Gate run this hour (workflow 255384592)', d.ci_running, wFor('ci-green'), isB('ci-green'), null, null, 'right') +
-            // 'review routed' is now row 1's own end - the elbow (not a belt)
-            // carries the turn to 'in review' at the start of row 2.
-            shipStage(d.review_routed ?? null, 'review routed', '', '', null, HELP.reviewRouted, '', 'review-routed', [], null, null, null, null, d.review_routed_last_at);
+            // LORE order 15: unknown bugs_found_24h renders 'n/a' (Round 3's
+            // rule - never empty, never a bare '?') the same way gate_verdicts
+            // and resolved already do.
+            shipStage(d.bugs_found_24h === null || d.bugs_found_24h === undefined ? 'n/a' : d.bugs_found_24h, 'bugs found', bugsCls, '', null, HELP.bugsFound, '', 'bugs-found', [], null, null, null, null, d.last_issue_created_at) + shipArrow('bugs found', '⚡', null, 'Issues created in the last 24h', null, null, false, String(d.bugs_found_24h ?? '?'), null, 'right', true) +
+            shipStage(d.issues_open, 'issues open', '', '', null, HELP.issues, '', null, null, null, shipIssuesRatePanel(sp.issues), null, arrowByKey['issues-prs'] && arrowByKey['issues-prs'].drain_label, d.last_issue_created_at) + shipArrow('issues open', '🤖', arrowByKey['issues-prs'], 'PRs opened in the last hour, from GitHub search - click for live agent lanes', null, wFor('issues-prs'), isB('issues-prs'), arrowByKey['issues-prs'] && arrowByKey['issues-prs'].label, null, 'right', true) +
+            shipStage(d.dispatched ?? null, 'dispatched', '', '', null, HELP.dispatched, '', 'dispatched', [], null, null, null, null, d.dispatched_last_at) + shipArrow('dispatched', '🤖', null, 'Live dispatched lanes', null, null, false, String(d.dispatched ?? '?'), null, 'right', true) +
+            shipStage(d.prs_open, 'prs open', '', prsOld.sub, null, HELP.prs + shipOldestWords('prs open', 'age of the oldest open, non-draft pull request'), prsOld.cls, null, null, null, shipHistorySpark(sp.prs, 'prs'), null, null, d.prs_open_last_at) + shipArrow('prs open', '⚙', arrowByKey['prs-ci'], 'Distinct PRs with a CI run started this hour, from the GitHub workflow-runs list', d.ci_queued, wFor('prs-ci'), isB('prs-ci'), null, null, 'right', true) +
+            shipStage(ciNum, 'ci q/run', ciCls, ciOld.sub, null, HELP.ciqr + shipOldestWords('ci q/run', 'how long the oldest queued run in the last 48 h has waited to start (since it was re-queued, if it was re-run)') + ' Green waiting: ' + greenWaitingText + ' PRs approved and green but not yet enqueued.' + greenWaitWords, ciOld.cls, null, null, 'ci run', shipHistorySpark(sp.ci, 'ci'), 'green waiting: ' + greenWaitingText + (greenSub ? ' · ' + greenSub : '') + (greenWaitSub ? ' · ' + greenWaitSub : ''), null, d.ci_last_run_started_at) + shipArrow('ci q/run', '⚙', arrowByKey['ci-green'], 'Distinct PRs with a green Pre-Merge Gate run this hour (workflow 255384592)', d.ci_running, wFor('ci-green'), isB('ci-green'), null, null, 'right', true) +
+            // 'review routed' is row 1's own end - LORE order 17 #3: the turn
+            // to 'in review' at the start of row 2 is now a real vertical
+            // belt (position:absolute, JS-synced - see positionShipElbows),
+            // not a bare glyph, carrying item #6 (Green Circuit) of the
+            // order-17 chain.
+            shipStage(d.review_routed ?? null, 'review routed', '', '', null, HELP.reviewRouted, '', 'review-routed', [], null, null, null, null, d.review_routed_last_at) + shipArrow('review routed', '⤵', null, 'Reviewed items moving into review', null, null, false, String(d.review_routed ?? '?'), null, 'right', true) +
+            // Ben: 7 stages per row. 'in review' is row 1's 7th and its own
+            // end - the turn down to 'gate verdicts' at the start of row 2 is
+            // the tall row-end belt (position:absolute, JS-sized to span both
+            // rows - see positionShipElbows), carrying item #7 (Red Circuit).
+            shipStage(d.in_review ?? null, 'in review', '', '', null, HELP.inReview, '', 'in-review', [], null, null, null, null, d.in_review_last_at)
+            + shipArrow('in review', '👁', null, 'PRs currently under human/AI review', null, null, false, String(d.in_review ?? '?'), null, 'right', true, 'ship-elbow-1');
 
-        // Row 2: in review -> gate verdicts -> conflicted -> resolved, in
-        // source order; the CSS row-reverse puts 'in review' at the right
-        // edge under 'review routed'.
+        // Row 2: gate verdicts -> conflicted -> resolved -> approved -> in
+        // line -> merged today -> folded, in source order; the CSS
+        // row-reverse puts 'gate verdicts' at the right edge under 'in
+        // review'.
         const row2 =
-            // NEW decorative arrow (no formal rate instrument existed for this
-            // transition either before or after the rebalance): in review was
-            // previously row 1's own dead end and never needed one.
-            shipStage(d.in_review ?? null, 'in review', '', '', null, HELP.inReview, '', 'in-review', [], null, null, null, null, d.in_review_last_at) + shipArrow('in review', '👁', null, 'PRs currently under human/AI review', null, null, false, String(d.in_review ?? '?'), null, 'left') +
             // Round 3 (Elrond review, PR #35): gate_verdicts has been null
             // since PR #34 dropped statusCheckRollup - the same "I cannot
             // know this" status as 'resolved', so it renders 'n/a' the same
             // way (was rendering nothing at all - a stage with no number and
             // no n/a is its own, different, confusing state).
-            shipStage(d.gate_verdicts === null || d.gate_verdicts === undefined ? 'n/a' : d.gate_verdicts, 'gate verdicts', gateCls, '', null, HELP.gateVerdicts + ((d.gate_verdicts === null || d.gate_verdicts === undefined) && d.gate_verdicts_na_reason ? ' (' + d.gate_verdicts_na_reason + ')' : ''), '', 'gate-verdicts', [], null, null, null, null, d.gate_verdicts_last_at) + shipArrow('gate verdicts', '⛨', null, 'PRs with a non-passing gate-verdict check', null, null, false, String(d.gate_verdicts ?? '?'), null, 'left') +
-            shipStage(d.conflicted ?? null, 'conflicted', conflictCls, '', null, HELP.conflicted, '', 'conflicted', [], null, null, null, null, d.conflicted_last_at) + shipArrow('conflicted', '⚠', null, 'Open PRs with a merge conflict', null, null, false, String(d.conflicted ?? '?'), null, 'left') +
-            // 'resolved' is now row 2's own end - the elbow carries the turn
-            // to 'approved' at the start of row 3 (its old decorative arrow
-            // to 'approved' is dropped along with the row it used to feed).
-            shipStage(d.resolved === null || d.resolved === undefined ? 'n/a' : d.resolved, 'resolved', '', '', null, HELP.resolved + ((d.resolved === null || d.resolved === undefined) && d.resolved_na_reason ? ' (' + d.resolved_na_reason + ')' : ''), '', 'resolved', [], null, null, null, null, null);
-
-        // Row 3: approved -> in line -> merged today -> folded -> deployed,
-        // left to right - five stages fill the row instead of one.
-        const row3 =
+            shipStage(d.gate_verdicts === null || d.gate_verdicts === undefined ? 'n/a' : d.gate_verdicts, 'gate verdicts', gateCls, '', null, HELP.gateVerdicts + ((d.gate_verdicts === null || d.gate_verdicts === undefined) && d.gate_verdicts_na_reason ? ' (' + d.gate_verdicts_na_reason + ')' : ''), '', 'gate-verdicts', [], null, null, null, null, d.gate_verdicts_last_at) + shipArrow('gate verdicts', '⛨', null, 'PRs with a non-passing gate-verdict check', null, null, false, String(d.gate_verdicts ?? '?'), null, 'left', true) +
+            shipStage(d.conflicted ?? null, 'conflicted', conflictCls, '', null, HELP.conflicted, '', 'conflicted', [], null, null, null, null, d.conflicted_last_at) + shipArrow('conflicted', '⚠', null, 'Open PRs with a merge conflict', null, null, false, String(d.conflicted ?? '?'), null, 'left', true) +
+            // 'resolved' is row 2's own end - LORE order 17 #3: the turn to
+            // 'approved' at the start of row 3 is now a real vertical belt
+            // too, carrying item #10 (Speed Module 3).
+            shipStage(d.resolved === null || d.resolved === undefined ? 'n/a' : d.resolved, 'resolved', '', '', null, HELP.resolved + ((d.resolved === null || d.resolved === undefined) && d.resolved_na_reason ? ' (' + d.resolved_na_reason + ')' : ''), '', 'resolved', [], null, null, null, null, null) + shipArrow('resolved', '⤵', null, 'Resolved conflicts moving toward approval', null, null, false, String(d.resolved ?? 'n/a'), null, 'left', true) +
             // SHIP-16-FIX: this used to feed the now-removed 'green waiting' square;
             // it now points straight at 'in line' - approved PRs move toward the
-            // queue, and green-waiting's own count/age live as ci q/run's sub-line above.
-            shipStage(d.approved ?? null, 'approved', '', '', null, HELP.approved, '', 'approved', [], null, null, null, null, d.approved_last_at) + shipArrow('approved', '✅', arrowByKey['green-inline'], 'Approved PRs not yet merged', null, wFor('green-inline'), isB('green-inline'), null, null, 'right') +
-            shipStage(queueNum, 'in line', queueCls, queueSub, null, queueHelp, queueOld.cls, 'in-line', d.queue_prs, 'in queue', shipHistorySpark(sp.queue, 'queue'), null, null, null) + shipArrow('in line', '⚡', arrowByKey['inline-merged'], 'Merge queue entries', d.queue_depth, wFor('inline-merged'), isB('inline-merged'), null, null, 'right') +
-            shipStage(d.merged_today, 'merged today', 'ok', mergedSub, d.merged_spark, HELP.merged + shipOldestWords('merged today', 'minutes since the last merge'), mergedStage, 'merged-today', d.merged_today_prs, null, shipHistorySpark(sp.merged, 'merged'), null, null, d.last_merge_at) + shipArrow('merged today', '⚡', arrowByKey['merged-deploy'], 'Production deploy workflows in flight, or merge awaiting deploy', shipDeployCount(d), wFor('merged-deploy'), isB('merged-deploy'), null, null, 'right') +
-            // NEW decorative arrow: folded->deployed had no arrow at all
-            // before (it was the old row2/row3 break) - now within row 3.
-            shipStage(d.folded ?? null, 'folded', '', '', null, HELP.folded, '', 'folded', [], null, null, null, null, d.folded_last_at) + shipArrow('folded', '🚀', null, 'Deploy workflows folded into this run', null, null, false, String(d.folded ?? '?'), null, 'right') +
-            shipStage(noDeploy ? 'n/a' : (d.deployed_prs_today === null || d.deployed_prs_today === undefined ? '?' : d.deployed_prs_today), 'last deploy', 'ok', deployLastLine, null, (noDeploy ? 'no deploy workflow on ' + (d.repo_name || d.repo_full || 'this repo') : HELP.lastdep + shipOldestWords('last deploy', 'minutes since the last deploy, counted only while main has commits newer than it') + deployWords), deployStateCls, 'last-deploy', (d.deployed_prs_today_list || []).map(n => ({number:n,title:'deployed'})), 'deployed', shipHistorySpark(sp.deploy, 'deploy'), null, null, d.last_deploy_at);
+            // queue, and green-waiting's own count/age live as ci run's sub-line above.
+            shipStage(d.approved ?? null, 'approved', '', '', null, HELP.approved, '', 'approved', [], null, null, null, null, d.approved_last_at) + shipArrow('approved', '✅', arrowByKey['green-inline'], 'Approved PRs not yet merged', null, wFor('green-inline'), isB('green-inline'), null, null, 'left', true) +
+            shipStage(queueNum, 'in line', queueCls, queueSub, null, queueHelp, queueOld.cls, 'in-line', d.queue_prs, 'in queue', shipHistorySpark(sp.queue, 'queue'), null, null, null) + shipArrow('in line', '⚡', arrowByKey['inline-merged'], 'Merge queue entries', d.queue_depth, wFor('inline-merged'), isB('inline-merged'), null, null, 'left', true) +
+            shipStage(d.merged_today, 'merged today', 'ok', mergedSub, d.merged_spark, HELP.merged + shipOldestWords('merged today', 'minutes since the last merge'), mergedStage, 'merged-today', d.merged_today_prs, null, shipHistorySpark(sp.merged, 'merged'), null, null, d.last_merge_at) + shipArrow('merged today', '⚡', arrowByKey['merged-deploy'], 'Production deploy workflows in flight, or merge awaiting deploy', shipDeployCount(d), wFor('merged-deploy'), isB('merged-deploy'), null, null, 'left', true) +
+            // 'folded' is row 2's 7th and its own end - the turn down to
+            // 'deployed' (row 3's lone stage for now; Ben expects more steps
+            // to land here) is the second tall row-end belt, carrying item
+            // #14 (Rocket).
+            shipStage(d.folded ?? null, 'folded', '', '', null, HELP.folded, '', 'folded', [], null, null, null, null, d.folded_last_at)
+            + shipArrow('folded', '🚀', null, 'Deploy workflows folded into this run', null, null, false, String(d.folded ?? '?'), null, 'left', true, 'ship-elbow-2');
 
-        // Round 2 (Elrond review, PR #35, defect 3): the elbows used to be
-        // full-width flow divs, text-aligned - which read as floating in
-        // whitespace whenever the row's shortest column left a gap below it.
-        // They are now position:absolute (ids below), synced by JS
-        // (positionShipElbows) to sit tucked directly against the actual
-        // corner of the square they turn from - see shipYard's identical
-        // pattern for the same reason.
+        // Row 3: deployed, alone for now (Ben: "it's ok if the bottom row
+        // only has 1 or two" - more steps are expected to land here).
+        const row3 =
+            shipStage(noDeploy ? 'n/a' : (d.deployed_prs_today === null || d.deployed_prs_today === undefined ? '?' : d.deployed_prs_today), 'last deploy', 'ok', deployLastLine, null, (noDeploy ? 'no deploy workflow on ' + (d.repo_name || d.repo_full || 'this repo') : HELP.lastdep + shipOldestWords('last deploy', 'minutes since the last deploy, counted only while main has commits newer than it') + deployWords), deployStateCls, 'last-deploy', (d.deployed_prs_today_list || []).map(n => ({number:n,title:'deployed'})), 'deployed', shipHistorySpark(sp.deploy, 'deploy'), null, null, d.last_deploy_at)
+            + shipClosedIssuesHtml(d.closed_issue_timings);
+
+        // Round 2 (Elrond review, PR #35, defect 3): the turns used to be a
+        // bare glyph in a full-width flow div, text-aligned - which read as
+        // floating in whitespace whenever the row's shortest column left a
+        // gap below it. LORE order 17 #3: each turn is now a real vertical
+        // belt (#ship-elbow-1/2, embedded in row1/row2's own strings above)
+        // - still position:absolute + JS-synced (positionShipElbows), same
+        // pattern, just richer content.
         return shipLegendHtml()
              + '<div class="ship-flow ship-row-1">' + row1 + '</div>'
-             + '<div class="ship-elbow ship-elbow-right" id="ship-elbow-1">⤵</div>'
              + '<div class="ship-flow ship-row-2">' + row2 + '</div>'
-             + '<div class="ship-elbow ship-elbow-left" id="ship-elbow-2">⤵</div>'
              + '<div class="ship-flow ship-row-3">' + row3 + '</div>';
 }
 
@@ -9637,7 +10179,7 @@ const HELP = {
     routesum:  'LOADED ROUTES - how many of your local model routes have their model actually sitting in memory right now, out of the total number of local routes. Grey dots are idle, not broken: models unload after sitting unused, and the next request loads them again. Only red is a real fault.',
     issues:    'ISSUES OPEN - open tickets on this repository.',
     prs:       'PULL REQUESTS OPEN - finished work waiting to be reviewed and merged.',
-    ciqr:      'CI QUEUED / RUNNING - automated test runs waiting to start, and runs happening now. A growing queued number means you are short on runners.',
+    ciqr:      'CI RUN - automated test runs happening right now. Queued runs waiting to start show as items packed on the belt to the left (PRS OPEN -> CI RUN); a backed-up belt there means you are short on runners.',
     merged:    'MERGED TODAY - pull requests that landed in the main branch today. The little bars are the last seven days, so you can see whether today is normal.',
     inLine: 'IN LINE - pull requests the merge queue is testing right now. Two is full and good. Zero means nothing is being merged.',
     greenWaiting: 'GREEN WAITING - approved pull requests with every required test passing and no open review gate that are not in the merge line yet. Zero is good. If this grows, the line is not being fed.',
