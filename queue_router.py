@@ -5518,8 +5518,66 @@ def _build_ship_arrows(result, rates):
 REVIEW_ROUTED_LABEL_SUFFIX = "-review"
 GATE_VERDICT_CHECK_NAME = "gate-verdict-check-review"
 
+# STAGE-HOVER: this list is no longer a 100-row sample - it is the COMPLETE set
+# of open PRs, because prs_open and its hover breakdown are both derived from it
+# (see _pr_open_breakdown). `gh pr list` pages internally at 100 rows per
+# GraphQL page, so on a repo with 63 open PRs this is still ONE page and the
+# same single call it always was; a repo would need >100 open PRs before it
+# costs a second page. The ceiling is high enough to be effectively complete
+# while still bounding a runaway repo, and the caller treats a result AT the
+# ceiling as truncated rather than pretending it is the true total.
+OPEN_PR_LIST_LIMIT = 1000
+
+# Ben's hover breakdown for the PRS OPEN tile, 2026-09-12: "63 PRs / 24 drafts /
+# 14 human-gated / 17 unreviewed / 7 approved-but-UNSTABLE". Each open PR lands in
+# the FIRST bucket it matches, in this order, so the buckets always sum to the
+# total - no PR is counted twice and none is dropped.
+#
+# NOTE the deliberate difference from the `held` set inside _get_shipping_readiness
+# (do-not-merge, needs-repair, hold, blocked-on-ben, gate-review, galadriel-review):
+# that set answers "may this PR merge right now", this one answers "is a HUMAN the
+# thing it is waiting on". Ben specified these four labels for the breakdown, so a
+# PR labelled needs-repair / gate-review / galadriel-review is NOT human-gated here
+# and falls through to a later bucket. The two sets are answering different
+# questions and are intentionally not unified.
+PR_OPEN_HUMAN_GATE_LABELS = {"blocked-on-ben", "hold", "needs-human", "do-not-merge"}
+PR_OPEN_BUCKET_ORDER = ("drafts", "human-gated", "conflicted", "unreviewed",
+                        "approved, checks failing", "ready to merge")
+
+
+def _pr_open_breakdown(prs):
+    """What is actually INSIDE the PRS OPEN tile, bucketed for its hover tooltip.
+
+    Derived entirely from the open-PR list _get_shipping_readiness already
+    fetches - zero additional GitHub calls, and it REPLACES the search_count
+    that used to compute prs_open, so this feature costs one search call LESS
+    per repo refresh than the code it replaces.
+
+    Buckets are first-match in PR_OPEN_BUCKET_ORDER, which is what makes them
+    sum to the total. Returns every bucket including the zeroes; the client
+    renders only the non-zero ones."""
+    counts = {name: 0 for name in PR_OPEN_BUCKET_ORDER}
+    for pr in prs:
+        labels = {(label.get("name") or "").lower() for label in (pr.get("labels") or [])}
+        if pr.get("isDraft"):
+            name = "drafts"
+        elif labels & PR_OPEN_HUMAN_GATE_LABELS:
+            name = "human-gated"
+        elif pr.get("mergeable") == "CONFLICTING":
+            name = "conflicted"
+        elif pr.get("reviewDecision") != "APPROVED":
+            name = "unreviewed"
+        elif pr.get("mergeStateStatus") in ("UNSTABLE", "BLOCKED"):
+            name = "approved, checks failing"
+        else:
+            name = "ready to merge"
+        counts[name] += 1
+    return {"noun": "PRs", "total": len(prs),
+            "buckets": [{"label": name, "count": counts[name]} for name in PR_OPEN_BUCKET_ORDER]}
+
+
 def _get_shipping_readiness(token, repo=None, default_branch="main"):
-    """Read the oldest 100 open PRs and the repo's merge queue together.
+    """Read every open PR (up to OPEN_PR_LIST_LIMIT) and the repo's merge queue together.
     SHIP-SPARK-3 item 4: mergeQueue(branch: default_branch) legitimately returns
     null on a repo with no merge queue configured - that is "n/a", not a failed
     read, so it no longer raises. A TRUNCATED queue (hasNextPage) still raises:
@@ -5548,7 +5606,7 @@ def _get_shipping_readiness(token, repo=None, default_branch="main"):
         return value
 
     prs = gh_json(["pr", "list", "--repo", repo, "--state", "open",
-                   "--limit", "100", "--search", "sort:created-asc", "--json",
+                   "--limit", str(OPEN_PR_LIST_LIMIT), "--search", "sort:created-asc", "--json",
                    "number,title,isDraft,reviewDecision,mergeable,mergeStateStatus,labels,updatedAt,"
                    "createdAt,reviews"])
     owner, name = repo.split("/")
@@ -6069,8 +6127,21 @@ def get_pipeline_status(repo=None, default_branch=None, force_refresh=False):
 
                 # ── 15-stage strip: stages 4,6,7,8,9,11 derive from the single PR-list
                 # call above - zero added GitHub calls for six of the nine new squares.
-                # prs_open itself keeps its own search_count below: that count is exact,
-                # where len(all_open_prs) would cap at the 100-PR page fetched above.
+                # STAGE-HOVER: prs_open now derives from that SAME list too, instead of
+                # spending its own search_count. That was safe to change only because the
+                # list is no longer a 100-row sample (see OPEN_PR_LIST_LIMIT) - so
+                # len(all_open_prs) IS the exact open-PR count, and it is the one number
+                # the hover buckets are guaranteed to sum to. A list sitting exactly AT the
+                # ceiling is the one case we cannot call exact: that falls through to the
+                # search_count below and publishes no breakdown, rather than under-reporting.
+                if len(all_open_prs) < OPEN_PR_LIST_LIMIT:
+                    result["prs_open"] = len(all_open_prs)
+                    result["prs_open_breakdown"] = _pr_open_breakdown(all_open_prs)
+                else:
+                    result["prs_open_breakdown"] = None
+                    result["prs_open_breakdown_na_reason"] = (
+                        f"open-PR list hit its {OPEN_PR_LIST_LIMIT}-row ceiling, so neither the "
+                        "total nor the buckets can be established from it")
                 opened_ats = [p["createdAt"] for p in all_open_prs if p.get("createdAt")]
                 result["prs_open_last_at"] = max(opened_ats) if opened_ats else None
 
@@ -6123,7 +6194,8 @@ def get_pipeline_status(repo=None, default_branch=None, force_refresh=False):
                     ("green_waiting", None), ("oldest_awaiting_min", None),
                     ("queue_oldest_min", None), ("green_oldest_min", None),
                     ("has_merge_queue", None), ("prs_oldest_min", None),
-                    ("prs_open_last_at", None), ("review_routed", None),
+                    ("prs_open_last_at", None), ("prs_open_breakdown", None),
+                    ("review_routed", None),
                     ("review_routed_last_at", None), ("in_review", None),
                     ("in_review_last_at", None), ("gate_verdicts", None),
                     ("gate_verdicts_last_at", None), ("conflicted", None),
@@ -6154,7 +6226,12 @@ def get_pipeline_status(repo=None, default_branch=None, force_refresh=False):
                     return None
                 return r.json().get("total_count", 0)
             result["issues_open"] = search_count(f"repo:{repo} type:issue state:open")
-            result["prs_open"] = search_count(f"repo:{repo} type:pr state:open")
+            # STAGE-HOVER: normally already set from the open-PR list above at zero
+            # search cost. This stays as the fallback for the two cases that leave it
+            # unset - the PR-list/merge-queue read failed, or that list hit its ceiling -
+            # so a failure degrades to exactly the old behaviour instead of losing the tile.
+            if result.get("prs_open") is None:
+                result["prs_open"] = search_count(f"repo:{repo} type:pr state:open")
             # 15-stage strip: a 24h created-count for "bugs found" plus a
             # sorted-desc probe for its timestamp. Both are repo-scoped so the
             # dropdown never serves armbrain's numbers for another repo.
@@ -7556,6 +7633,26 @@ border-radius:6px;padding:6px 10px;box-shadow:var(--glow-cyan),0 10px 30px rgba(
 font-family:'Rajdhani',sans-serif;color:#e0e0e0;font-size:13px;white-space:nowrap;
 pointer-events:none;opacity:0;display:none;transition:opacity 0.1s ease-in-out}
 .ship-spark-tooltip.visible{display:block;opacity:1}
+/* STAGE-HOVER (Ben, 2026-09-12): hovering a stage shows what is INSIDE it -
+   "63 PRs / 24 drafts / 14 human-gated / ...". Same custom-div reasoning as
+   .ship-spark-tooltip above and for the same reason: Ben reads this dashboard
+   largely through headless screenshots, and a native title= tooltip is painted
+   by the OS compositor, so it is invisible in every PNG an agent captures. This
+   bubble is real DOM, so the screenshot harness can see it.
+   Two zones: the counts, pre-line so one bucket reads per line and the numbers
+   column up; then the stage's help sentence, wrapped and dimmer, because this
+   tooltip REPLACES the native title= on any stage that has a breakdown and must
+   not lose the help text that attribute used to carry. */
+.ship-breakdown-tooltip{position:fixed;z-index:10000;background:var(--bg-card);border:1px solid var(--neon-cyan);
+border-radius:6px;padding:7px 11px;box-shadow:var(--glow-cyan),0 10px 30px rgba(0,0,0,0.8);
+font-family:'Rajdhani',sans-serif;color:#e0e0e0;font-size:13px;max-width:430px;
+pointer-events:none;opacity:0;display:none;transition:opacity 0.1s ease-in-out}
+.ship-breakdown-tooltip.visible{display:block;opacity:1}
+.ship-bd-lines{white-space:pre-line;font-variant-numeric:tabular-nums;line-height:1.45}
+.ship-bd-lines .ship-bd-total{display:block;font-family:'Orbitron',monospace;font-size:0.92em;
+font-weight:700;letter-spacing:1px;color:var(--neon-cyan);margin-bottom:3px}
+.ship-bd-help{border-top:1px solid #1a2332;margin-top:7px;padding-top:6px;
+font-size:0.85em;color:#aab2c4;white-space:normal;line-height:1.35}
 
 .monitor-glance-band{display:grid;grid-template-columns:minmax(720px,1.25fr) minmax(500px,.75fr);
 gap:10px;align-items:start;margin:10px 0}
@@ -8405,6 +8502,94 @@ function hideShipSparkTooltip() {
     if (shipSparkTooltipEl) shipSparkTooltipEl.classList.remove('visible');
 }
 
+// STAGE-HOVER (Ben, 2026-09-12): "hovering a stage should show a breakdown of
+// what is inside it." Same lazy-init / event-delegation / one-shared-div pattern
+// as initShipSparkTooltip above, deliberately a SEPARATE element rather than a
+// mode of that one: the spark tooltip is a single nowrap line set via
+// textContent, this one is a multi-line block plus a help paragraph, and
+// widening the spark tooltip to cover both would change what every existing
+// sparkline hover renders.
+//
+// The server owns the bucket definitions and their order (_pr_open_breakdown);
+// this registry just holds the latest payload's breakdowns by stage caption, so
+// shipStage can find one without another positional parameter on its already
+// 14-argument signature - and so a second tile only needs one more line here.
+let shipBreakdowns = {};
+function shipSetBreakdowns(d) {
+    shipBreakdowns = { 'prs open': d.prs_open_breakdown || null };
+}
+function shipBreakdownText(cap, num) {
+    const b = shipBreakdowns[cap];
+    if (!b || !Array.isArray(b.buckets)) return '';
+    // Header is the total the buckets sum to. Prefer the server's own total over
+    // the rendered number so the header can never disagree with the buckets under
+    // it; fall back to the tile's number only if the payload omitted it.
+    const total = (b.total === null || b.total === undefined) ? num : b.total;
+    if (total === null || total === undefined || total === '' || total === '?') return '';
+    const lines = [String(total) + ' ' + (b.noun || cap)];
+    // Only non-zero buckets, in the server's order - Ben's example omits
+    // conflicted and ready-to-merge precisely because they were 1 and 0.
+    b.buckets.forEach(bucket => {
+        if (Number(bucket.count) > 0) lines.push(bucket.count + ' ' + bucket.label);
+    });
+    if (lines.length === 1) return '';  // a total with nothing inside it explains nothing
+    return lines.join('\\n');
+}
+let shipBreakdownTooltipEl = null;
+function initShipBreakdownTooltip() {
+    if (document.getElementById('ship-breakdown-tooltip')) return;
+    shipBreakdownTooltipEl = document.createElement('div');
+    shipBreakdownTooltipEl.id = 'ship-breakdown-tooltip';
+    shipBreakdownTooltipEl.className = 'ship-breakdown-tooltip';
+    document.body.appendChild(shipBreakdownTooltipEl);
+
+    document.addEventListener('mouseover', function(e) {
+        const el = e.target.closest('[data-ship-breakdown]');
+        if (el) showShipBreakdownTooltip(el, e);
+    });
+    document.addEventListener('mousemove', function(e) {
+        const el = e.target.closest('[data-ship-breakdown]');
+        if (el && shipBreakdownTooltipEl && shipBreakdownTooltipEl.classList.contains('visible')) {
+            positionShipBreakdownTooltip(e);
+        }
+    });
+    document.addEventListener('mouseout', function(e) {
+        const el = e.target.closest('[data-ship-breakdown]');
+        if (el) {
+            const related = e.relatedTarget ? e.relatedTarget.closest('[data-ship-breakdown]') : null;
+            if (related !== el) hideShipBreakdownTooltip();
+        }
+    });
+}
+function positionShipBreakdownTooltip(e) {
+    if (!shipBreakdownTooltipEl) return;
+    const padding = 14;
+    let left = e.clientX + padding, top = e.clientY + padding;
+    const rect = shipBreakdownTooltipEl.getBoundingClientRect();
+    if (left + rect.width > window.innerWidth - 10) left = e.clientX - rect.width - padding;
+    if (top + rect.height > window.innerHeight - 10) top = e.clientY - rect.height - padding;
+    shipBreakdownTooltipEl.style.left = Math.max(10, left) + 'px';
+    shipBreakdownTooltipEl.style.top = Math.max(10, top) + 'px';
+}
+function showShipBreakdownTooltip(el, e) {
+    if (!shipBreakdownTooltipEl) initShipBreakdownTooltip();
+    const text = el.getAttribute('data-ship-breakdown') || '';
+    if (!text) return;
+    // getAttribute returns text the HTML parser already decoded, so it has to be
+    // re-escaped before it goes back through innerHTML.
+    const lines = text.split('\\n');
+    const help = el.getAttribute('data-ship-breakdown-help') || '';
+    shipBreakdownTooltipEl.innerHTML =
+        '<div class="ship-bd-lines"><span class="ship-bd-total">' + shipEscape(lines[0]) + '</span>'
+        + shipEscape(lines.slice(1).join('\\n')) + '</div>'
+        + (help ? '<div class="ship-bd-help">' + shipEscape(help) + '</div>' : '');
+    positionShipBreakdownTooltip(e);
+    shipBreakdownTooltipEl.classList.add('visible');
+}
+function hideShipBreakdownTooltip() {
+    if (shipBreakdownTooltipEl) shipBreakdownTooltipEl.classList.remove('visible');
+}
+
 let openShipDropdown = null;
 let shipAgents = null;
 function shipEscape(value) {
@@ -8711,10 +8896,18 @@ function shipStage(num, cap, cls, sub, spark, help, stageCls, dropdownKey, prs, 
     // so a second click anywhere in the (now-open) box closes it, and the
     // document click-listener above closes it on a click outside the box.
     const open = openShipDropdown === key;
+    const bdText = shipBreakdownText(cap, num);
     return '<div class="ship-stage' + shapeCls + ' ' + (stageCls || '') + '" data-square="' + cap + '" data-dropdown="' + key + '"'
          + ' role="button" tabindex="0" aria-haspopup="true" aria-expanded="' + open + '" aria-controls="ship-list-' + key + '"'
          + ' onclick="toggleShipDropdown(this.dataset.dropdown)" onkeydown="shipStageKeydown(event,this.dataset.dropdown)"'
-         + (help ? ' title="' + help.replace(/"/g, '') + '"' : '') + '>' + (hist || '')
+         // STAGE-HOVER: a stage WITH a breakdown swaps its native title= for the
+         // screenshot-able .ship-breakdown-tooltip and carries the help sentence
+         // into that bubble's footer, so nothing the attribute used to say is
+         // lost. Stages without a breakdown keep the native title exactly as
+         // before - this tile's change must not alter the other fourteen.
+         + (bdText ? ' data-ship-breakdown="' + shipEscape(bdText) + '"'
+                     + (help ? ' data-ship-breakdown-help="' + shipEscape(help) + '"' : '')
+                   : (help ? ' title="' + help.replace(/"/g, '') + '"' : '')) + '>' + (hist || '')
          + '<div class="ship-sprite-wrap">' + shipSpriteHtml(cap, unknown, num)
          // An unknown count renders NOTHING here (no plate, no '?' glyph) -
          // it must never read as a measured 0, and must never look like a
@@ -9642,7 +9835,7 @@ function shipCtStamp(iso, opts) {
 const SHIP_BLANK_PIPELINE = {
     bugs_found_24h: null, last_issue_created_at: null, issues_open: null,
     dispatched: null, dispatched_last_at: null,
-    prs_open: null, prs_open_last_at: null, prs_oldest_min: null,
+    prs_open: null, prs_open_last_at: null, prs_oldest_min: null, prs_open_breakdown: null,
     ci_queued: null, ci_running: null, ci_oldest_min: null, ci_last_run_started_at: null,
     green_waiting: null, green_waiting_prs: [], green_oldest_min: null,
     green_wait_avg_min: null, green_wait_n: null, green_wait_excluded: null, green_wait_prs: [],
@@ -9662,6 +9855,9 @@ const SHIP_BLANK_PIPELINE = {
     spark12h: {}, arrows: [], folded: null, folded_last_at: null,
 };
 function shipFlowHtml(d) {
+        // STAGE-HOVER: load this payload's stage breakdowns before any shipStage
+        // call below reads them (shipBreakdownText is called from inside shipStage).
+        shipSetBreakdowns(d);
         // Ben: "CI Q/RUN" -> "CI RUN" - the queue count now lives on the belt
         // to this stage's left (prs open -> ci run), driven by the same
         // ci_queued backlog via arrowByKey['prs-ci'] - this box shows only
@@ -11577,6 +11773,7 @@ startPolling();   // arm the timers before anything that can throw
 if (document.hidden) startSlowPolling();   // loaded in a background tab: still beat
 safeCall('initVramTooltip', initVramTooltip);
 safeCall('initShipSparkTooltip', initShipSparkTooltip);
+safeCall('initShipBreakdownTooltip', initShipBreakdownTooltip);
 safeCall('initShipRepoSelector', initShipRepoSelector);
 safeCall('refresh', refresh);
 safeCall('refreshHistory', refreshHistory);
