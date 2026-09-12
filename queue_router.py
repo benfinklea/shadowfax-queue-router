@@ -7401,8 +7401,12 @@ image-rendering:pixelated;opacity:.85;filter:var(--ground-shadow)}
    is 20x46 (sprite aspect kept, longer like the reference - about 1.5x the
    tripod's width) and pivots at its own bottom edge, placed on the hub. */
 .ship-inserter{z-index:2}
-.ship-inserter .inserter-arm{position:absolute;left:5px;top:-29px;width:20px;height:46px;
-background-repeat:no-repeat;background-size:20px 46px;image-rendering:pixelated;
+/* Ben: "you've stretched out the blue arms - make them their normal size."
+   A fast inserter reaches one tile: in his close-up the extended arm is
+   about the tripod's own width, not 1.5x it. 13x30 (sprite aspect kept),
+   still pivoting at its bottom edge on the hub at (14.6, 17.4). */
+.ship-inserter .inserter-arm{position:absolute;left:8px;top:-13px;width:13px;height:30px;
+background-repeat:no-repeat;background-size:13px 30px;image-rendering:pixelated;
 transform-origin:50% 100%;transform:rotate(var(--arm-rest,90deg));transition:transform .4s ease,opacity .4s ease}
 .ship-inserter.idle .inserter-arm{opacity:.4}
 /* LORE order 14 "the inserters must swing": a real Factorio inserter's arm
