@@ -6,3 +6,4 @@ __pycache__/
 ._.DS_Store
 *.bak-*
 queue_router.py.bak*
+state/

@@ -4698,6 +4698,52 @@ pipeline_cache = {}  # repo -> {"data":..., "ts":...}
 pipeline_cache_lock = threading.Lock()
 pipeline_gh_failing_since = {}  # repo -> iso string or None
 pipeline_last_good = {}  # repo -> last good result dict
+# Ben (2026-09-12, twice in one night): "the CI/CD pipeline has disappeared" -
+# every service restart wiped the in-memory snapshot, so the strip showed its
+# placeholder for the ~60s the first GitHub snapshot takes. The last good
+# snapshot per repo is persisted to disk on every good refresh and restored
+# at boot, served stale-while-revalidating (its own generated_at keeps the
+# ages honest) until the fresh one lands.
+PIPELINE_LAST_GOOD_PATH = os.environ.get(
+    "PIPELINE_LAST_GOOD_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "state", "pipeline-last-good.json"))
+
+
+def _persist_last_good(store, path=None):
+    """Atomically write the last-good snapshots (all repos) to disk."""
+    path = path or PIPELINE_LAST_GOOD_PATH
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(store, f)
+        os.replace(tmp, path)
+        return True
+    except Exception as e:
+        logger.warning("pipeline last-good persist failed (%s): %s", path, e)
+        return False
+
+
+def _load_last_good(path=None):
+    """Read the persisted snapshots; {} when absent or unreadable - never raise."""
+    path = path or PIPELINE_LAST_GOOD_PATH
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {}
+        for v in data.values():
+            if isinstance(v, dict):
+                v["restored_from_disk"] = True
+        return data
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        logger.warning("pipeline last-good load failed (%s): %s", path, e)
+        return {}
+
+
+pipeline_last_good.update(_load_last_good())
 
 # SHIP-PIPES (council dispatch 20260905): per-arrow throughput for the shipping
 # row. Rates move slowly hour to hour, so this gets its own 300s+ cache rather
@@ -6325,6 +6371,7 @@ def get_pipeline_status(repo=None, default_branch=None, force_refresh=False):
         result["generated_at"] = datetime.now(timezone.utc).isoformat()
         with pipeline_cache_lock:
             pipeline_last_good[repo] = dict(result)
+            _persist_last_good(pipeline_last_good)
     else:
         with pipeline_cache_lock:
             if repo not in pipeline_gh_failing_since:
