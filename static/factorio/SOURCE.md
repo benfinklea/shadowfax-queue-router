@@ -41,7 +41,12 @@ URL, so this is ordinary personal use of assets he already paid for.
   is solved at the text now - see `--text-outline` and `.ship-num` in
   `queue_router.py` - so the ground stays close to its real tone). The
   source sheet itself was never committed or copied into this repo - only
-  the small derived tile is.
+  the small derived tile is. `ground-grass.jpg` (Ben, 10:50 AM 2026-09-12:
+  "more of a grassland backdrop") — two 1024x256 runs of `grass-1.png`'s
+  big blended variants (the dirt-patch-and-tuft ones his rig sits on)
+  stacked into 1024x512, saved as JPEG (opaque texture; the PNG was 1.5MB).
+  The 3.5MB source sheet was staged in the session scratchpad only, never
+  committed. Same licensing boundary — internal LAN dashboard only.
 - `items/` (order 17, 2026-09-11) — the real Factorio item chain carried
   across the 14 arrows between the 15 stages: `lab.png`, `copper-ore.png`,
   `copper-plate.png`, `copper-cable.png`, `electronic-circuit.png`,

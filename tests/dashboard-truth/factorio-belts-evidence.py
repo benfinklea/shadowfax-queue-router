@@ -480,6 +480,25 @@ with sync_playwright() as p:
     kf = page.evaluate('''() => { for (const ss of document.styleSheets) { let rules; try { rules = ss.cssRules; } catch (e) { continue; }
         for (const r of rules) { if (r.type === CSSRule.KEYFRAMES_RULE && r.name === 'inserter-swing') return Array.from(r.cssRules).map(k => k.keyText + ' ' + k.style.transform); } } return null; }''')
     assert kf and any('- 180deg' in k for k in kf) and any('50% rotate(var(--arm-rest' in k for k in kf), kf
+    # Ben (10:45 AM 2026-09-12): the work product rides in the hand. A moving
+    # inserter's arm carries the arrow's own item, on the SAME swing (same
+    # duration and delay as the arm), shown for the carrying half and gone
+    # at the drop; an idle inserter carries nothing.
+    for square, item in (('issues open', 'items/lab.png'), ('prs open', 'items/copper-plate.png')):
+        for which in (0, 1):
+            arm = page.locator('.ship-arrow[data-square-left="' + square + '"] > .ship-inserter').nth(which).locator('.inserter-arm')
+            held = arm.locator('.inserter-item')
+            assert held.count() == 1, (square, which, 'moving inserter carries no item')
+            st = held.evaluate("el => ({img: getComputedStyle(el).backgroundImage, name: getComputedStyle(el).animationName, duration: getComputedStyle(el).animationDuration, delay: getComputedStyle(el).animationDelay})")
+            armst = arm.evaluate("el => ({duration: getComputedStyle(el).animationDuration, delay: getComputedStyle(el).animationDelay})")
+            assert item in st['img'], (square, which, st)
+            assert st['name'] == 'inserter-carry' and st['duration'] == armst['duration'] and st['delay'] == armst['delay'], (square, which, 'item not on the arm\'s own swing', st, armst)
+    assert page.locator('.ship-inserter.idle .inserter-item').count() == 0, 'an idle inserter must hold nothing'
+    assert page.locator('.ship-arrow-feeder .inserter-item').count() == 0, 'resolved feeder is idle in this fixture (no rate) - holds nothing'
+    carry = page.evaluate('''() => { for (const ss of document.styleSheets) { let rules; try { rules = ss.cssRules; } catch (e) { continue; }
+        for (const r of rules) { if (r.type === CSSRule.KEYFRAMES_RULE && r.name === 'inserter-carry') return Array.from(r.cssRules).map(k => k.keyText + ' ' + k.style.opacity); } } return null; }''')
+    assert carry and any(k.startswith('0%') and k.endswith(' 1') for k in carry) and any('100%' in k and k.endswith(' 0') for k in carry), ('item must be held through the carry and dropped at the far end', carry)
+
     # ci-green is the fixture's bottleneck (rate 0, backlog 5) - BOTH its
     # inserters (loading and unloading) must freeze at the pickup end, not
     # swing, even though the arrow IS measured. A single frozen arm on a
@@ -650,6 +669,9 @@ with sync_playwright() as p:
     for i in range(moving_arms.count()):
         name = moving_arms.nth(i).evaluate("el => getComputedStyle(el).animationName")
         assert name == 'none', name
+    for i in range(page.locator('.ship-inserter.moving .inserter-item').count()):
+        name = page.locator('.ship-inserter.moving .inserter-item').nth(i).evaluate("el => getComputedStyle(el).animationName")
+        assert name == 'none', ('held item still animates under reduced motion', name)
     page.locator('#ship-flow').screenshot(path=str(OUT / 'strip-1440-reduced-motion.png'))
     browser.close()
 

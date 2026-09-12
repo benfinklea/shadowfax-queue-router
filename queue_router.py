@@ -7403,8 +7403,16 @@ box-shadow:0 0 7px rgba(255,0,68,0.3)}
    edge-stage caption to overflow into, independent of exactly how wide the
    belts get tuned to be. */
 .ship-flow-wrap{display:flex;flex-direction:column;gap:0;padding:0 64px;
-background-image:url('/static/factorio/ground/ground-tile.png');
-background-repeat:repeat;background-size:128px 128px;border-radius:6px}
+/* Ben (10:50 AM, 2026-09-12): "give it more of a grassland backdrop - look
+   in the art folder." ground-grass.jpg is two 1024x256 runs of the game's
+   own grass-1 terrain sheet (the big blended variants with the dirt
+   patches and tufts his rig sits on), stacked, shown at half scale so a
+   patch is about a machine and a half wide - the same proportion as his
+   screenshot. JPEG because it is an opaque photo-like texture (the PNG
+   was 1.5MB for a background). The sand tile stays on disk as the
+   fallback the tests' greyscale pass was tuned on. */
+background-image:url('/static/factorio/ground/ground-grass.jpg');
+background-repeat:repeat;background-size:512px 256px;border-radius:6px}
 /* LORE order 17 #3: row1 and row2 (not row3, nothing follows it) get a much
    bigger bottom margin than before - room for the vertical belt (2
    inserters + belt, ~144px tall) that now sits in the turn between rows,
@@ -7558,6 +7566,21 @@ animation-duration:var(--swing-duration,1.6s);animation-delay:var(--swing-delay,
    base, drop on the opposite side. --arm-rest is the DROP side (the belt
    for a loading inserter, the stage for an unloading one); pickup is the
    far side, 180 degrees away; the arm sweeps over the top between them. */
+/* Ben (10:45 AM, 2026-09-12): "when the inserters pass on a work product,
+   have it move with the inserter's grasping arm and drop onto the start of
+   the belt ... the work object should move with the grasping hand into
+   the next stage." The item rides at the hand's tip (a child of the arm,
+   so it rotates with it) for the carrying half of the swing - pickup side
+   to drop side, hand closed - and vanishes at the drop (50%), where the
+   hand opens for the empty return. Same duration/delay as the arm (the
+   custom props are inherited), so it is the same swing, not a second one. */
+.inserter-item{position:absolute;left:50%;top:-5px;width:12px;height:12px;margin-left:-6px;
+background-repeat:no-repeat;image-rendering:pixelated;opacity:0;pointer-events:none;
+filter:drop-shadow(0 1px 1px rgba(0,0,0,.6))}
+.ship-inserter.moving .inserter-item{animation-name:inserter-carry;animation-timing-function:ease-in-out;
+animation-iteration-count:infinite;animation-duration:var(--swing-duration,1.6s);animation-delay:var(--swing-delay,0s)}
+@keyframes inserter-carry{0%,50%{opacity:1}50.01%,100%{opacity:0}}
+@media(prefers-reduced-motion:reduce){.ship-inserter.moving .inserter-item{animation:none;opacity:1}}
 @keyframes inserter-swing{
 0%{transform:rotate(calc(var(--arm-rest,90deg) - 180deg));background-image:url('/static/factorio/inserter/fast-inserter-hand-closed.png')}
 50%{transform:rotate(var(--arm-rest,90deg));background-image:url('/static/factorio/inserter/fast-inserter-hand-closed.png')}
@@ -9073,7 +9096,9 @@ function shipStagePhase(square) {
 // right-to-left, 180 for a vertical (top-to-bottom) belt - both the loading
 // and unloading inserter on a vertical belt reach straight down, since both
 // sit beside a belt whose flow is always downward.
-function shipInserterHtml(count, armRest, unknown, phaseSeed, backedUp, swingDuration, alignCls) {
+// `itemPath` (Ben, 10:45 AM 2026-09-12): the work product this inserter
+// carries - rendered in the hand for the carrying half of each swing.
+function shipInserterHtml(count, armRest, unknown, phaseSeed, backedUp, swingDuration, alignCls, itemPath) {
     const moving = count > 0;
     const hand = moving ? 'fast-inserter-hand-closed.png' : 'fast-inserter-hand-open.png';
     // Ben's remnants amendment: an arrow with NO measured rate (unknown, not
@@ -9098,8 +9123,9 @@ function shipInserterHtml(count, armRest, unknown, phaseSeed, backedUp, swingDur
         : '');
     return '<span class="ship-inserter ' + (moving ? 'moving' : 'idle') + remnantCls + backedUpCls + alignClsStr + '">'
         + '<span class="inserter-platform"' + platformStyle + '></span>'
-        + '<span class="inserter-arm" style="' + swingVars + 'background-image:url(/static/factorio/inserter/' + hand + ')"></span>'
-        + '</span>';
+        + '<span class="inserter-arm" style="' + swingVars + 'background-image:url(/static/factorio/inserter/' + hand + ')">'
+        + ((moving && itemPath) ? '<span class="inserter-item" style="background-image:url(/static/factorio/' + itemPath + ');background-size:' + Math.round(12 * 120 / 64) + 'px 12px;background-position:0 0"></span>' : '')
+        + '</span></span>';
 }
 
 // Pipe thickness: sqrt scale so a 4x rate difference doesn't read as a 4x-wider
@@ -9371,7 +9397,7 @@ function shipArrow(square, glyph, arrow, description, legacyCount, width, isBott
     // The feeder: resolved's loading inserter only - it places onto the
     // shared belt it is nested in, so it has no belt and no unloader.
     if (opts.feeder) {
-        return open + shipInserterHtml(inserterRate, armRest, noData, square + '-load', isBottleneck, duration, null) + '</' + tag + '>';
+        return open + shipInserterHtml(inserterRate, armRest, noData, square + '-load', isBottleneck, duration, null, SHIP_ARROW_ITEM[square]) + '</' + tag + '>';
     }
     let extra = null, feederHtml = '';
     if (opts.shared) {
@@ -9386,10 +9412,10 @@ function shipArrow(square, glyph, arrow, description, legacyCount, width, isBott
         // (upstream, places items on) then unloading (downstream, takes them
         // off) - same rate/backedUp/unknown state on both, but each gets its
         // own phase seed so they are never mirror-synced.
-        + shipInserterHtml(inserterRate, armRest, noData, square + '-load', isBottleneck, duration, loadAlign)
+        + shipInserterHtml(inserterRate, armRest, noData, square + '-load', isBottleneck, duration, loadAlign, SHIP_ARROW_ITEM[square])
         + shipBeltHtml(square, hasRate, rateForSpeed, isBottleneck, knownCount, dir, vertical, vDown, backlog,
             opts.shared ? SHIP_BELT_CAPACITY * 2 : null, extra)
-        + shipInserterHtml(inserterRate, armRest, noData, square + '-unload', isBottleneck, duration, unloadAlign)
+        + shipInserterHtml(inserterRate, armRest, noData, square + '-unload', isBottleneck, duration, unloadAlign, SHIP_ARROW_ITEM[square])
         + feederHtml
         + '</' + tag + '>';
 }
