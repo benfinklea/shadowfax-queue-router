@@ -7587,6 +7587,16 @@ font-size:0.85em;letter-spacing:0.5px;vertical-align:middle}
    (legibility beats fidelity applies to the count, not the label). */
 .ship-cap{font-size:.6em;letter-spacing:.5px;white-space:normal;line-height:1.15;max-width:96px}
 .ship-sub{font-size:.72em;white-space:normal;max-width:110px}
+/* Ben: "give the stage text more contrast - I can't read them. Same for
+   the time stamps." Light-grey text with an outline still sank into the
+   tan sand; the fix is the same one order 11 already permits for the
+   count - a dark plate behind the text, white on it. Warn/hot ages keep
+   their yellow/red on the same plate. */
+.ship-cap,.ship-sub,.ship-age,.ship-stage-drain{color:#fff;background:rgba(0,0,0,.66);
+padding:1px 5px;border-radius:3px;display:inline-block;text-shadow:0 1px 1px #000}
+.ship-cap{margin-top:2px}
+.ship-age{margin-top:2px;color:#f2f4f8}
+.ship-sub{color:#f2f4f8}
 .ship-num.stamp{font-size:.85em}
 /* LORE order 11 #2 / order 1: a real belt segment (>=48px), not a glyph with
    a number beside it. Round 2 (Elrond review, PR #35, defect 4): the first
