@@ -105,7 +105,12 @@ FLEET_IPS = {
                                       # ("No route to host"). This was the
                                       # one-line revert the block was built for.
     "frodo":         "192.168.1.11",  # verified ssh->frodo
-    "shadowfax":     "192.168.1.12",  # verified ssh->shadowfax
+    "shadowfax":     "192.168.1.49",  # verified 2026-09-12: ssh .49 -> "shadowfax",
+                                      # `ip -4 addr` on the box lists .49, and tailscale
+                                      # reports `direct 192.168.1.49:41641`. The old .12
+                                      # is a Nest device (OUI 18:b4:30) that pings but
+                                      # refuses SSH - a permanent false OFFLINE
+                                      # (benfinklea/shadowfax-queue-router#38).
     "pippen":        "192.168.1.13",  # verified ssh->pippen.local
     "sam":           "192.168.1.14",  # verified ssh->sam  (mDNS still says .135: stale)
     "aragorn":       "192.168.1.15",  # verified ssh->aragorn  (reserved, did not move)
