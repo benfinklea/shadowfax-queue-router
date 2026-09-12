@@ -9529,6 +9529,9 @@ function positionShipYard() {
 // below the row (row1/row2 now carry the extra margin-bottom for exactly
 // this) instead of overlapping its bottom edge by a few px.
 window.addEventListener('resize', () => positionShipElbows());
+// The bare-ground gap between the two right-column belts beside gate
+// verdicts (Ben's rig: about a tile - the belt's own width - between them).
+const SHIP_COLUMN_SPLIT_PX = 24;
 function positionShipElbows() {
     const wrap = document.getElementById('ship-flow') && document.getElementById('ship-flow').parentElement;
     if (!wrap) return;
@@ -9570,12 +9573,18 @@ function positionShipElbows() {
         elbow.style.height = (bottom - top) + 'px';
         elbow.style.left = (left - wrapRect.left) + 'px';
     };
+    // Ben (10:35 AM): "the long belt on the right should actually have a
+    // split in it - easy to miss." In his rig the two belts are separate
+    // pieces with about a tile of bare ground between them beside gate
+    // verdicts: the upper one ENDS at the unloader into the gate, the lower
+    // one STARTS at the loader out of it. So: a real gap, centred on the
+    // gate's machine, roughly the belt's own width.
     const inReview = sprite('in review'), gate = sprite('gate verdicts'), conflicted = sprite('conflicted');
     if (inReview && gate && conflicted) {
         const x = Math.max(inReview.right, gate.right, conflicted.right) + 4;
         const gateMid = gate.top + gate.height / 2;
-        column('ship-elbow-1', inReview.top, gateMid, x);
-        column('ship-elbow-3', gateMid, conflicted.bottom, x);
+        column('ship-elbow-1', inReview.top, gateMid - SHIP_COLUMN_SPLIT_PX / 2, x);
+        column('ship-elbow-3', gateMid + SHIP_COLUMN_SPLIT_PX / 2, conflicted.bottom, x);
     }
     // The shared up-belt: from beside RESOLVED (row 3, its start) up past
     // APPROVED to IN LINE (row 2, its end), in the column both rows reserve
@@ -9595,7 +9604,11 @@ function positionShipElbows() {
         // higher is where the belt begins.
         const top = Math.min(inLine.top, approved.bottom - insH);
         const slotRect = slot.getBoundingClientRect();
-        column('ship-elbow-4', top, resolved.bottom, slotRect.left + (slotRect.width - shared.offsetWidth) / 2);
+        // Ben (10:35 AM): "move the resolved feeder up so it's level with
+        // resolved" - the feeder sits at the belt's very start (bottom), so
+        // the belt ends where the feeder, centred on resolved's chest, ends.
+        const bottom = resolved.top + resolved.height / 2 + insH / 2;
+        column('ship-elbow-4', top, bottom, slotRect.left + (slotRect.width - shared.offsetWidth) / 2);
         shared.style.setProperty('--load-top', (approved.bottom - insH - top) + 'px');
         shared.style.setProperty('--unload-top', (inLine.top - top) + 'px');
     }

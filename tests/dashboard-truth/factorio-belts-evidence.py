@@ -353,18 +353,21 @@ with sync_playwright() as p:
     # last stage that runs all the way down to beside the next row's first
     # stage - its top is at the from-stage's top and its bottom reaches the
     # to-stage's bottom, not a short stub floating in the gap between rows.
-    # Ben's 10:08 AM rig: the right-hand column is ONE continuous belt from
-    # IN REVIEW down past GATE VERDICTS to CONFLICTED, with four inserters
-    # on it - two stacked beside gate verdicts (the unloader into it above
-    # the loader out of it). Built as two belts (#ship-elbow-1 ends at gate
-    # verdicts' middle, #ship-elbow-3 starts there) at the SAME x.
+    # Ben's 10:08 AM rig: the right-hand column runs from IN REVIEW down
+    # past GATE VERDICTS to CONFLICTED as TWO belts at the same x with a
+    # visible split beside the gate (Ben, 10:35 AM: "should actually have a
+    # split in it - easy to miss"): #ship-elbow-1 ends at the unloader into
+    # the gate, a tile of bare ground, then #ship-elbow-3 starts at the
+    # loader out of it. Gap centred on the gate's machine.
     def sprite_box(sq):
         return page.locator('[data-square="' + sq + '"] .ship-sprite-wrap').bounding_box()
     gate_box = sprite_box('gate verdicts')
     gate_mid = gate_box['y'] + gate_box['height'] / 2
+    split = page.evaluate('SHIP_COLUMN_SPLIT_PX')
+    assert 16 <= split <= 32, ('the column split must be a visible gap about one belt-width wide', split)
     for elbow_id, from_sq, to_sq, top_at, bottom_at in (
-            ('ship-elbow-1', 'in review', 'gate verdicts', sprite_box('in review')['y'], gate_mid),
-            ('ship-elbow-3', 'gate verdicts', 'conflicted', gate_mid, sprite_box('conflicted')['y'] + sprite_box('conflicted')['height'])):
+            ('ship-elbow-1', 'in review', 'gate verdicts', sprite_box('in review')['y'], gate_mid - split / 2),
+            ('ship-elbow-3', 'gate verdicts', 'conflicted', gate_mid + split / 2, sprite_box('conflicted')['y'] + sprite_box('conflicted')['height'])):
         elbow_box = page.locator('#' + elbow_id).bounding_box()
         # Ben: the top/bottom inserters must sit level with the two MACHINES
         # (sprites), not the stage boxes' outer edges - captions and
@@ -386,14 +389,23 @@ with sync_playwright() as p:
         assert belt_box['x'] >= flow_left and belt_box['x'] + belt_box['width'] <= flow_right, (elbow_id, 'row-end belt column clipped', belt_box, flow_left, flow_right)
     e1 = page.locator('#ship-elbow-1').bounding_box(); e3 = page.locator('#ship-elbow-3').bounding_box()
     assert abs(e1['x'] - e3['x']) < 1, ('the two column belts must share one x - one straight column', e1, e3)
-    assert abs((e1['y'] + e1['height']) - e3['y']) < 1, ('the two column belts must butt end to end', e1, e3)
+    gap = e3['y'] - (e1['y'] + e1['height'])
+    assert 16 <= gap <= 32, ('the two column belts must show a visible split beside the gate, not butt end to end', gap, e1, e3)
+    # ...and the gap is bare ground: the belts themselves (not just the
+    # arrow boxes) stop short of each other by the same amount.
+    b1 = page.locator('#ship-elbow-1 .ship-belt').bounding_box(); b3 = page.locator('#ship-elbow-3 .ship-belt').bounding_box()
+    assert b3['y'] - (b1['y'] + b1['height']) >= 16, ('belt tracks must not bridge the split', b1, b3)
 
     # The shared up-belt (#ship-elbow-4): top level with IN LINE's machine
     # (its unloader), bottom at RESOLVED's machine bottom (the feeder, at the
     # belt's start), approved's loader level with APPROVED's machine.
     e4 = page.locator('#ship-elbow-4').bounding_box()
     inline_box, approved_box, resolved_box = sprite_box('in line'), sprite_box('approved'), sprite_box('resolved')
-    assert abs((e4['y'] + e4['height']) - (resolved_box['y'] + resolved_box['height'])) < 6, ('shared belt bottom not at resolved sprite bottom', e4, resolved_box)
+    # Ben (10:35 AM): the resolved feeder is CENTRED on resolved's chest,
+    # and the belt starts right there (it ends where the feeder ends).
+    feeder_ins0 = page.locator('#ship-elbow-4 .ship-arrow-feeder .ship-inserter').bounding_box()
+    assert abs((feeder_ins0['y'] + feeder_ins0['height'] / 2) - (resolved_box['y'] + resolved_box['height'] / 2)) < 3, ('resolved feeder not centred on resolved', feeder_ins0, resolved_box)
+    assert abs((e4['y'] + e4['height']) - (feeder_ins0['y'] + feeder_ins0['height'])) < 3, ('shared belt does not end at the feeder', e4, feeder_ins0)
     load_ins = page.locator('#ship-elbow-4 > .ship-inserter').nth(0).bounding_box()
     unload_ins = page.locator('#ship-elbow-4 > .ship-inserter').nth(1).bounding_box()
     feeder_ins = page.locator('#ship-elbow-4 .ship-arrow-feeder .ship-inserter').bounding_box()
