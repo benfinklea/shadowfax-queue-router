@@ -69,6 +69,14 @@ agents_fixture = [
 # "we structurally never have this number", and both need their own proof.
 pipeline_fixture_no_data = dict(pipeline_fixture, prs_open=None, prs_open_last_at=None)
 
+# Order 17 #1: gate_verdicts/resolved are permanently null in the main
+# fixture (Round 3's n/a proof) - correctly, their belts render as 'unknown'
+# state with ZERO item slots (never inventing a count), so the main fixture
+# can't show every one of the 14 belts carrying an item at once. This
+# fixture gives both a real, small count so the full item chain - and the
+# "readable bug to rocket" evidence screenshot - can be proven end to end.
+pipeline_fixture_full_chain = dict(pipeline_fixture, gate_verdicts=3, resolved=2)
+
 # Order 15: the three biter states, keyed off the SAME thresholds bugsCls
 # already uses for the number's own colour (0 neutral, 1-4 warn, >=5 hot) -
 # not an independently-picked number. The main fixture above (bugs_found_24h=3)
@@ -76,6 +84,27 @@ pipeline_fixture_no_data = dict(pipeline_fixture, prs_open=None, prs_open_last_a
 pipeline_fixture_bugs_corpse = dict(pipeline_fixture, bugs_found_24h=0)
 pipeline_fixture_bugs_medium = dict(pipeline_fixture, bugs_found_24h=6)
 pipeline_fixture_bugs_unknown = dict(pipeline_fixture, bugs_found_24h=None, last_issue_created_at=None)
+
+# Order 17 "THE REAL ITEM CHAIN": Ben's own list, one item per arrow across
+# the 14 sequential handoffs between the 15 stages - bug first, rocket last.
+# Kept here (not just read from queue_router.py) so the test is an
+# independent check of the mapping, not a copy that could drift silently.
+EXPECTED_CHAIN = [
+    ('bugs found', 'biter/small-biter.png'),
+    ('issues open', 'items/lab.png'),
+    ('dispatched', 'items/copper-ore.png'),
+    ('prs open', 'items/copper-plate.png'),
+    ('ci q/run', 'items/copper-cable.png'),
+    ('review routed', 'items/electronic-circuit.png'),
+    ('in review', 'items/advanced-circuit.png'),
+    ('gate verdicts', 'items/speed-module.png'),
+    ('conflicted', 'items/speed-module-2.png'),
+    ('resolved', 'items/speed-module-3.png'),
+    ('approved', 'items/processing-unit.png'),
+    ('in line', 'items/car.png'),
+    ('merged today', 'items/tank.png'),
+    ('folded', 'items/rocket.png'),
+]
 
 def stub_routes(page, fixture=None):
     # Network-level route interception, registered BEFORE navigation, so it
@@ -129,18 +158,57 @@ with sync_playwright() as p:
     assert page.locator('.ship-stage').count() == 15
     # Card removal (order 11 #1): no visible border/background left on the box.
     assert page.eval_on_selector('.ship-stage', "el => getComputedStyle(el).borderStyle") == 'none'
-    # Belts + items (order 11 #2, order 10): every non-row-end arrow carries a
-    # real belt with at least one item; the deliberately-stalled ci-green
-    # arrow's belt is packed/backed-up.
-    assert page.locator('.ship-belt').count() == 12
+    # Belts + items (order 11 #2, order 10/17): every one of the 14 sequential
+    # handoffs carries a real belt with at least one item; the deliberately-
+    # stalled ci-green arrow's belt is packed/backed-up.
+    assert page.locator('.ship-belt').count() == 14
     assert page.locator('.ship-belt-item').count() > 0
     assert page.locator('.ship-belt-backed-up').count() == 1
     # Round 2 defect 4: belts must read as belts, not connector widgets - the
     # brief's >=48px floor, with real margin above it.
-    belt_width = page.eval_on_selector('.ship-belt', 'el => el.getBoundingClientRect().width')
+    belt_width = page.eval_on_selector('.ship-belt:not(.ship-belt-vertical)', 'el => el.getBoundingClientRect().width')
     assert belt_width >= 64, belt_width
     # Round 2 defect 5: row 3 is no longer a lone square.
     assert page.locator('.ship-row-3 .ship-stage').count() == 5
+
+    # Order 17 #1 "THE REAL ITEM CHAIN": the underlying mapping (not the
+    # rendered DOM, since gate_verdicts/resolved legitimately render zero
+    # item slots in THIS fixture - see pipeline_fixture_full_chain below for
+    # the full-render proof) covers all 14 arrows, in Ben's own flow order,
+    # each with its own named item - not a second arrow silently reusing a
+    # neighbour's icon.
+    live_chain = json.loads(page.evaluate('JSON.stringify(SHIP_ARROW_ITEM)'))
+    assert list(live_chain.items()) == EXPECTED_CHAIN, (list(live_chain.items()), EXPECTED_CHAIN)
+
+    # Order 17 #2 "no boxes around the belts": neither border nor outline on
+    # any belt, including the backed-up (jam) one, which still reads red via
+    # a glow only.
+    for i in range(page.locator('.ship-belt').count()):
+        b = page.locator('.ship-belt').nth(i)
+        border = b.evaluate("el => getComputedStyle(el).borderStyle")
+        outline = b.evaluate("el => getComputedStyle(el).outlineStyle")
+        assert border == 'none', ('belt has a border', i, border)
+        assert outline == 'none', ('belt has an outline', i, outline)
+
+    # Order 17 #4 "an inserter on BOTH sides of every belt": exactly two
+    # `.ship-inserter` children per arrow - loading and unloading - never one,
+    # never a stray third.
+    for square, _ in EXPECTED_CHAIN:
+        n = page.locator('.ship-arrow[data-square-left="' + square + '"] > .ship-inserter').count()
+        assert n == 2, (square, 'expected 2 inserters, found', n)
+
+    # Order 17 #3 "belts run vertically": the two row-turn handoffs are
+    # taller than they are wide; every other belt stays horizontal (wider
+    # than tall).
+    assert page.locator('.ship-arrow-vertical').count() == 2
+    for square in ('review routed', 'resolved'):
+        b = page.locator('.ship-arrow[data-square-left="' + square + '"] .ship-belt').bounding_box()
+        assert b['height'] > b['width'], (square, b)
+    for square, _ in EXPECTED_CHAIN:
+        if square in ('review routed', 'resolved'):
+            continue
+        b = page.locator('.ship-arrow[data-square-left="' + square + '"] .ship-belt').bounding_box()
+        assert b['width'] > b['height'], (square, b)
 
     # Round 2 (Elrond review, PR #35, defect 1): no stage may ever render a
     # bare '?' - it reads as indistinguishable from the no-data wreckage state
@@ -163,6 +231,21 @@ with sync_playwright() as p:
         num_text = stage.locator('.ship-num').inner_text() if stage.locator('.ship-num').count() else ''
         assert num_text.strip() != '', 'stage "' + square + '" rendered no number and no n/a'
 
+    # Round 2 on PR #36 (Elrond review): BUGS FOUND clipped to "UGS FOUND"
+    # again in round 2's own screenshots, a regression from the order-16 belt
+    # widening squeezing row 1's stages narrower than their own captions.
+    # Checked every stage this time, not just bugs found - a caption's own
+    # bounding box must stay fully inside #ship-flow's captured area (which
+    # is exactly what a Locator screenshot crops to), on both edges.
+    flow_box = strip.bounding_box()
+    flow_left, flow_right = flow_box['x'], flow_box['x'] + flow_box['width']
+    for i in range(stages.count()):
+        stage = stages.nth(i)
+        square = stage.get_attribute('data-square')
+        cap_box = stage.locator('.ship-cap').bounding_box()
+        assert cap_box['x'] >= flow_left, (square, 'clipped at left edge', cap_box, flow_left)
+        assert cap_box['x'] + cap_box['width'] <= flow_right, (square, 'clipped at right edge', cap_box, flow_right)
+
     # Round 2 defect 3: the row-turn elbows must sit tucked against their
     # anchor square, not floating - within ~40px of it in both axes.
     for elbow_id, anchor_square in (('ship-elbow-1', 'review routed'), ('ship-elbow-2', 'resolved')):
@@ -176,25 +259,49 @@ with sync_playwright() as p:
     # different real rates -> two different durations, not a constant), and
     # its delay is staggered (two moving inserters -> two different delays,
     # never lockstep). An unmeasured arrow's arm never animates at all.
-    def arm_style(square):
-        return page.locator('[data-square-left="' + square + '"] .inserter-arm').evaluate(
+    # Order 17 #4 put TWO `.ship-inserter` elements on every arrow (loading
+    # then unloading), so a bare `.inserter-arm` locator now matches two
+    # elements and `.evaluate()` throws. `which` picks one by its DOM
+    # position (0 = loading, upstream; 1 = unloading, downstream).
+    def arm_style(square, which='load'):
+        idx = 0 if which == 'load' else 1
+        return page.locator(
+            '.ship-arrow[data-square-left="' + square + '"] > .ship-inserter'
+        ).nth(idx).locator('.inserter-arm').evaluate(
             "el => ({name: getComputedStyle(el).animationName, "
             "duration: getComputedStyle(el).animationDuration, "
             "delay: getComputedStyle(el).animationDelay})")
-    issues_arm = arm_style('issues open')   # rate 6/h
-    prsci_arm = arm_style('prs open')       # rate 3/h
+    issues_arm = arm_style('issues open')   # rate 6/h, loading inserter
+    prsci_arm = arm_style('prs open')       # rate 3/h, loading inserter
     dispatched_arm = arm_style('dispatched')  # no formal rate instrument
     assert issues_arm['name'] == 'inserter-swing', issues_arm
     assert prsci_arm['name'] == 'inserter-swing', prsci_arm
     assert issues_arm['duration'] != prsci_arm['duration'], (issues_arm, prsci_arm)
     assert issues_arm['delay'] != prsci_arm['delay'], (issues_arm, prsci_arm)
     assert dispatched_arm['name'] == 'none', dispatched_arm
-    # ci-green is the fixture's bottleneck (rate 0, backlog 5) - its inserter
-    # must freeze at the pickup end, not swing, even though it IS measured.
-    ci_arm = page.locator('[data-square-left="ci q/run"] .ship-inserter').evaluate("el => el.className")
-    assert 'backed-up' in ci_arm, ci_arm
-    ci_arm_anim = arm_style('ci q/run')
-    assert ci_arm_anim['name'] == 'none', ci_arm_anim
+    # ci-green is the fixture's bottleneck (rate 0, backlog 5) - BOTH its
+    # inserters (loading and unloading) must freeze at the pickup end, not
+    # swing, even though the arrow IS measured. A single frozen arm on a
+    # jammed belt is a weaker signal than two.
+    for which in ('load', 'unload'):
+        ci_arm = page.locator(
+            '.ship-arrow[data-square-left="ci q/run"] > .ship-inserter'
+        ).nth(0 if which == 'load' else 1).evaluate("el => el.className")
+        assert 'backed-up' in ci_arm, (which, ci_arm)
+        ci_arm_anim = arm_style('ci q/run', which=which)
+        assert ci_arm_anim['name'] == 'none', (which, ci_arm_anim)
+
+    # Order 17 #4 "staggered ... not mirror images of each other": the
+    # loading and unloading inserters on the SAME belt both swing, but on
+    # different phases - never lockstep, which is what a mirror-image pair
+    # moving identically would look like frame to frame.
+    for square in ('issues open', 'prs open'):
+        load = arm_style(square, which='load')
+        unload = arm_style(square, which='unload')
+        assert load['name'] == 'inserter-swing', (square, load)
+        assert unload['name'] == 'inserter-swing', (square, unload)
+        assert load['delay'] != unload['delay'], (
+            square, 'loading/unloading inserters are lockstep (mirror-synced)', load, unload)
 
     # Order 15 "BUGS FOUND is a biter": the main fixture's count (3) is the
     # "small" state - never the corpse (measured zero) or the remnant/dim
@@ -218,6 +325,21 @@ with sync_playwright() as p:
         num = page.locator('[data-square="' + square + '"] .ship-num').inner_text()
         assert num.strip() != '', square
 
+    browser.close()
+
+# Order 17 evidence: "a frame showing the full item chain readable across the
+# strip - bug at the first handoff, rocket at the last." Uses
+# pipeline_fixture_full_chain (gate_verdicts/resolved given a small real
+# count) so every one of the 14 belts actually places a rendered item -
+# the main fixture's two permanently-null arrows legitimately render empty
+# belts there, which would leave two gaps in this proof.
+with sync_playwright() as p:
+    browser, page = render(p, pipeline_fixture_full_chain)
+    for square, expected_item in EXPECTED_CHAIN:
+        belt = page.locator('.ship-arrow[data-square-left="' + square + '"] .ship-belt-item-img').first
+        url = belt.evaluate("el => getComputedStyle(el).backgroundImage")
+        assert expected_item in url, (square, expected_item, url)
+    page.locator('#ship-flow').screenshot(path=str(OUT / 'strip-1440-item-chain.png'))
     browser.close()
 
 # Separate pass for the no-data/remnant-wreckage state: prs_open unavailable
@@ -270,11 +392,18 @@ with sync_playwright() as p:
 with sync_playwright() as p:
     browser, page = render(p, pipeline_fixture)
 
+    # Order 17 #4 put two `.ship-inserter` per arrow (loading=0, unloading=1).
+    # `which` lets this proof track a specific one across frames.
+    def arm_transform(sq, which=0):
+        return page.locator(
+            '.ship-arrow[data-square-left="' + sq + '"] > .ship-inserter'
+        ).nth(which).locator('.inserter-arm').evaluate("el => getComputedStyle(el).transform")
+
     def transforms():
         return {
-            sq: page.locator('[data-square-left="' + sq + '"] .inserter-arm').evaluate(
-                "el => getComputedStyle(el).transform")
+            (sq, which): arm_transform(sq, which)
             for sq in ('issues open', 'prs open', 'approved')
+            for which in (0, 1)
         }
 
     frames = []
@@ -285,13 +414,21 @@ with sync_playwright() as p:
             page.wait_for_timeout(650)
 
     # Each moving inserter's own transform changed across the three frames -
-    # it swung, this was not a static screenshot repeated three times.
+    # it swung, this was not a static screenshot repeated three times. This
+    # now covers BOTH inserters (loading and unloading) on each belt.
     for sq in ('issues open', 'prs open', 'approved'):
-        values = {f[sq] for f in frames}
-        assert len(values) > 1, (sq, frames)
+        for which in (0, 1):
+            values = {f[(sq, which)] for f in frames}
+            assert len(values) > 1, (sq, which, frames)
     # At any single frame, two inserters with different measured rates are at
     # DIFFERENT points of the arc - staggered, not lockstep.
-    assert frames[0]['issues open'] != frames[0]['prs open'], frames[0]
+    assert frames[0][('issues open', 0)] != frames[0][('prs open', 0)], frames[0]
+    # Order 17 #4 "not mirror images of each other": on the SAME belt, the
+    # loading and unloading inserters must ALSO be at different arc positions
+    # at a given instant - two arms moving in lockstep would read as one
+    # mirrored motion, not two independent handoffs.
+    for sq in ('issues open', 'prs open', 'approved'):
+        assert frames[0][(sq, 0)] != frames[0][(sq, 1)], (sq, frames[0])
     browser.close()
 
 # Reduced-motion pass, in a fresh context (emulate_media must be set before

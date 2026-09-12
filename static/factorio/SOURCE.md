@@ -28,7 +28,19 @@ URL, so this is ordinary personal use of assets he already paid for.
 - `ground/` (order 16, 2026-09-11) — `ground-tile.png`: a 128x128 tile
   cropped from `sand-1.png` (a terrain sheet staged at `/tmp/factorio-raw/`
   on frodo, NOT committed here per order 16 - 8.5MB is too heavy for a
-  repeating background tile), grayscaled and re-tinted into the dashboard's
-  own dark palette so it reads as textured ground without fighting the
-  Orbitron numerals. The source sheet itself was never committed or copied
-  into this repo - only the small derived tile is.
+  repeating background tile), at its own real colour - no grayscale, no
+  re-tint (round 2 on PR #36: a first pass darkened it to protect the
+  numerals, which stopped it looking like Factorio's own sand; legibility
+  is solved at the text now - see `--text-outline` and `.ship-num` in
+  `queue_router.py` - so the ground stays close to its real tone). The
+  source sheet itself was never committed or copied into this repo - only
+  the small derived tile is.
+- `items/` (order 17, 2026-09-11) — the real Factorio item chain carried
+  across the 14 arrows between the 15 stages: `lab.png`, `copper-ore.png`,
+  `copper-plate.png`, `copper-cable.png`, `electronic-circuit.png`,
+  `advanced-circuit.png` (also stands in for "red circuit" - same item in
+  Factorio, deduped rather than drawn twice), `speed-module.png`,
+  `speed-module-2.png`, `speed-module-3.png`, `processing-unit.png`,
+  `car.png`, `tank.png`, `rocket.png`. The 14th item (the bug at the first
+  handoff) reuses `biter/` above rather than a new asset. Same licensing
+  boundary as everything else here — internal LAN dashboard only.
