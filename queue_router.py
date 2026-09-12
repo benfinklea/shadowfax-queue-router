@@ -7276,7 +7276,11 @@ filter:var(--ground-shadow)}
 /* long-handed-inserter-platform.png is a 4-frame rotation strip, 105x79 per
    frame; scaled to a 30x23 slot and cropped to frame 1 (east-facing) via
    background-position - never stretched, so it never distorts. */
-.ship-inserter{position:relative;width:38px;height:32px;flex:0 0 38px;display:flex;align-items:center;justify-content:center}
+/* flex:0 0 auto (not a fixed basis) - same reasoning as .ship-belt-vertical
+   below: this sits in both a row-direction parent (plain/vbelt arrows) and
+   a column-direction one (the row-turn arrows), and a fixed flex-basis
+   would hijack whichever axis is "main" in each. */
+.ship-inserter{position:relative;width:38px;height:32px;flex:0 0 auto;display:flex;align-items:center;justify-content:center}
 .ship-inserter .inserter-platform{position:absolute;left:0;bottom:0;width:30px;height:23px;
 background-image:url('/static/factorio/inserter/long-handed-inserter-platform.png');
 background-size:120px 23px;background-position:-30px 0;background-repeat:no-repeat;
@@ -7564,7 +7568,13 @@ vertical-align:middle}
 .ship-repo-refreshing{margin-left:8px;color:var(--neon-yellow);font-family:'Rajdhani',sans-serif;
 font-size:0.85em;letter-spacing:0.5px;vertical-align:middle}
 .ship-flow{flex-wrap:nowrap;align-items:stretch}
-.ship-stage{flex:1 1 0;min-width:0;padding:8px 6px}
+/* Ben: rows 2/3 (4 and 5 stages) read too spread-out next to row 1's 6 -
+   flex:1 1 0 stretched every stage to fill the row's full width equally,
+   so a row with fewer stages gave each one a bigger share and pushed them
+   apart. flex:0 0 auto sizes every stage the same across all three rows
+   regardless of how many share the row - the leftover width now collects
+   at the row's own far edge instead of between every stage. */
+.ship-stage{flex:0 1 auto;min-width:0;padding:8px 6px}
 .ship-cap{font-size:.65em;letter-spacing:1px}
 .ship-num.stamp{font-size:.85em}
 /* LORE order 11 #2 / order 1: a real belt segment (>=48px), not a glyph with
@@ -7591,13 +7601,17 @@ gap:1px;padding:0 2px;border:0;background:transparent;color:var(--arrow-color);c
 .ship-arrow-vertical{position:absolute;flex-direction:column;flex:0 0 auto;height:auto;
 width:38px;gap:2px;padding:2px 0;z-index:4}
 /* Ben's own built reference (a vertical belt bridging two side-by-side
-   buildings, both inserters bending toward it) showed the row layout never
-   had to change for this - only the belt segment WITHIN each arrow slot
-   does. Same column stack as .ship-arrow-vertical above, but stays in the
-   row's normal flex flow (not absolute) since it connects two stages that
-   are still side by side, not two different rows. */
-.ship-arrow-vbelt{flex-direction:column;flex:0 0 auto;height:auto;
-width:38px;gap:2px;padding:2px 0;align-self:center}
+   buildings) - correction after the first pass stacked the inserters
+   above/below the belt: "the inserters go to the left and right of the
+   belt, not above and below - they have to reach both the block before and
+   the block after." Two side-by-side stages are reached sideways, so the
+   inserters stay in a horizontal row (like plain .ship-arrow) - only the
+   belt element between them is the tall vertical one. The two row-turn
+   arrows (.ship-arrow-vertical above) are the opposite case: the blocks
+   they connect really are stacked above/below on screen, so those stay a
+   column stack. */
+.ship-arrow-vbelt{flex-direction:row;flex:0 0 auto;width:auto;height:auto;
+gap:2px;padding:2px 4px;align-self:center}
 /* The belt itself: a scrolling texture tile carrying the order-17 item
    chain. State is rendered, never captioned - order 9's "hover is where the
    numbers live" (native title attr on the arrow, unchanged). LORE order 17
@@ -7621,7 +7635,11 @@ animation:ship-belt-flow linear infinite;animation-duration:var(--belt-duration,
    the long axis and scrolls top-to-bottom (never bottom-to-top - a vertical
    belt is always downstream-is-down here, so there is no "vertical-left"
    mirror to carry). */
-.ship-belt-vertical{width:26px;height:72px;flex:0 0 72px}
+/* flex:0 0 auto (not a fixed flex-basis) so width/height below aren't
+   hijacked by whichever axis happens to be the parent's main axis - this
+   belt sits inside a column-direction parent (.ship-arrow-vertical, the
+   row-turn) AND a row-direction one (.ship-arrow-vbelt, in-row) now. */
+.ship-belt-vertical{width:26px;height:72px;flex:0 0 auto}
 .ship-belt-vertical .ship-belt-track{background-size:18px 18px;background-repeat:repeat;animation-name:ship-belt-flow-vertical}
 @keyframes ship-belt-flow-vertical{to{background-position-y:18px}}
 .ship-belt-items{position:absolute;inset:0}
@@ -8735,7 +8753,12 @@ function shipArrow(square, glyph, arrow, description, legacyCount, width, isBott
     // items on their outbound belt rather than always reading starved.
     const knownCount = (!hasRate && arrowLabel !== undefined && arrowLabel !== null && arrowLabel !== '' && !Number.isNaN(Number(arrowLabel)))
         ? Number(arrowLabel) : null;
-    const armRest = vertical ? 180 : (dir === 'left' ? -90 : 90);
+    // Only the row-turn belts (elbowId set) genuinely sit between a stage
+    // ABOVE and a stage BELOW, so only those sweep on the vertical (180deg)
+    // arc. The in-row vertical belts (vbelt) sit BESIDE two side-by-side
+    // stages - Ben's correction - so their inserters swing horizontally,
+    // same as a plain (non-vertical) arrow.
+    const armRest = (vertical && elbowId) ? 180 : (dir === 'left' ? -90 : 90);
     return '<' + tag + (agentLane ? ' type="button"' : ' role="img"') + ' class="ship-arrow' + (isBottleneck ? ' bottleneck' : '') + dirCls + '"'
         + (elbowId ? ' id="' + elbowId + '"' : '') + ' style="' + style
         + '" data-square-left="' + square + '" title="' + label + '" aria-label="' + label + '"'
