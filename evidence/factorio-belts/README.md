@@ -316,7 +316,51 @@ delays identical at `-2.471s`).
 continuous vertical belt spanning all 14 arrows was not attempted beyond the
 two transitions above - it would require restructuring the row layout that
 every prior round explicitly protected, which this order also explicitly
-protects in the same breath it asks for vertical belts. The reference-frame
-side-by-side this order also asks for could not be produced - this session
-has no access to Ben's actual reference frame images, only his written
-description of them (same gap noted in round 2 and order 16's evidence).
+protects in the same breath it asks for vertical belts.
+
+## Reference-frame comparison (Ben supplied three screenshots after this
+## session first shipped, correcting the earlier "no access" note)
+
+`reference-comparison.png` stacks one of Ben's real-gameplay reference frames
+over `strip-1440-item-chain.png`. Pulled from `Bens-Mac.local` over SSH (the
+paths he pasted are local to his Mac, unreachable from this worktree's own
+box - `rsync`/`scp` both choke on the filename's spaces even quoted, so the
+working path was `ssh ... 'for f in *pattern*; do base64 -i "$f"; done'` on
+the remote side, piped back and decoded locally).
+
+What the comparison actually found, most significant first:
+
+1. **Belts weren't reading as belts at all - fixed.** `static/factorio/belt/
+   belt-tile.png` was a 64x64 tile whose real belt-tread art only filled a
+   40x40 box in the middle (`Image.getbbox()` confirmed the transparent
+   margin) - tiled at 18px, most of what rendered was transparent, so items
+   floated on bare sand between faint arrow specks instead of a visible
+   moving surface. Re-cropped from the raw `transport-belt.png` sheet
+   (already staged, never referenced by the previous crop) to a tight 68x68
+   tile with almost no dead margin. Same fix also exposed and corrected a
+   real bug on the two vertical belts: `.ship-belt-vertical .ship-belt-track`
+   inherited `background-repeat:repeat-x` from the base rule, so a vertical
+   belt only ever painted ONE 18px band of texture and left the rest of its
+   72px height as bare sand - added `background-repeat:repeat` so the tread
+   now fills the whole vertical run.
+2. **Ground tone** - close now (both a warm light tan), though the reference
+   is slightly more desaturated/grey with visible tire-track wear; not
+   changed further, since chasing an exact match risks re-fighting the
+   legibility problem round 2 already solved at the text.
+3. **Inserter color** - the reference's basic inserters are yellow; this
+   dashboard uses the long-handed-inserter sprite (authentically
+   orange/copper in Factorio, just a different tier), established in order
+   14 and left as-is since neither order asked for a tier change.
+4. **Density/scale** - the reference is one tightly-packed factory block; this
+   strip is 15 discrete, widely-spaced stages by design (order 16 already
+   disagreed with "edge to edge" density for the same structural reason as
+   the vertical-belt compromise above).
+5. **Not shipped, unchanged from order 16's deferred list**: power poles and
+   wire, foundation pads, ground clutter (grass tufts, loose rock) - the
+   reference frames confirm all three are visible in real play and still
+   absent here.
+
+Chevron direction is one known remaining nit from the belt-tile fix: the
+tile's arrows point sideways (rightward) even on the two vertical belts,
+since rotating just the background pattern (not the whole element) isn't a
+plain CSS operation - flagged rather than left silent, not blocking.

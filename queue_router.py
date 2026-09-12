@@ -7614,7 +7614,7 @@ animation:ship-belt-flow linear infinite;animation-duration:var(--belt-duration,
    belt is always downstream-is-down here, so there is no "vertical-left"
    mirror to carry). */
 .ship-belt-vertical{width:26px;height:72px;flex:0 0 72px}
-.ship-belt-vertical .ship-belt-track{background-size:18px 18px;animation-name:ship-belt-flow-vertical}
+.ship-belt-vertical .ship-belt-track{background-size:18px 18px;background-repeat:repeat;animation-name:ship-belt-flow-vertical}
 @keyframes ship-belt-flow-vertical{to{background-position-y:18px}}
 .ship-belt-items{position:absolute;inset:0}
 .ship-belt-item{position:absolute;top:50%;left:50%;width:16px;height:16px;transform:translate(-50%,-50%);
