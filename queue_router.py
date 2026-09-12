@@ -7412,7 +7412,7 @@ box-shadow:0 0 7px rgba(255,0,68,0.3)}
    was 1.5MB for a background). The sand tile stays on disk as the
    fallback the tests' greyscale pass was tuned on. */
 background-image:url('/static/factorio/ground/ground-grass.jpg');
-background-repeat:repeat;background-size:512px 256px;border-radius:6px}
+background-repeat:repeat;background-size:1536px 768px;border-radius:6px}
 /* LORE order 17 #3: row1 and row2 (not row3, nothing follows it) get a much
    bigger bottom margin than before - room for the vertical belt (2
    inserters + belt, ~144px tall) that now sits in the turn between rows,
@@ -7432,7 +7432,7 @@ background-repeat:repeat;background-size:512px 256px;border-radius:6px}
 /* Reserves the column the shared resolved+approved up-belt (#ship-elbow-4,
    position:absolute) runs in, so rows 2 and 3 leave a real gap for it
    instead of the belt painting over 'in line' / the closed-issues list. */
-.ship-elbow-slot{flex:0 0 96px;align-self:stretch}
+.ship-elbow-slot{flex:0 0 102px;align-self:stretch}
 .ship-age{font-size:0.66em;color:#7d8798;white-space:nowrap;margin-top:1px;text-shadow:var(--text-outline)}
 .ship-age.warn{color:var(--neon-yellow)}
 .ship-age.hot{color:var(--neon-red)}
@@ -7444,9 +7444,14 @@ padding-right:12px;white-space:nowrap}
 /* LORE order 11 "the sprite is the square": no card. The machine sprite
    sitting directly on the dark background IS the stage - no border, no
    panel background, no rounded rectangle. */
+/* Real scale: every machine in a row stands on the same ground line - a
+   stage with no sparkline reserves the sparkline's slot (.ship-hist-spacer)
+   so its sprite is not higher than a neighbour's that has one, which is
+   what had the shared belt's unloader 32px off IN QUEUE's chest. */
 .ship-stage{background:none;border:0;border-radius:0;
 padding:7px 6px;min-width:92px;text-align:center;display:flex;flex-direction:column;
-align-items:center;justify-content:center;gap:2px;cursor:pointer}
+align-items:center;justify-content:flex-start;gap:2px;cursor:pointer}
+.ship-hist-spacer{height:26px;margin:0 auto 3px auto}
 .ship-stage{position:relative}
 /* SHIP-GAME item 0: the whole box is the click target now (no caret button) -
    a visible focus ring is the keyboard-reachability signal the caret used to
@@ -7485,8 +7490,23 @@ align-items:center;justify-content:center;gap:2px;cursor:pointer}
 /* Order 11: the sprite rendered LARGE (64px at 1440px, not the old 24px
    corner icon) sitting in its own wrap so the count numeral can overlay it
    directly instead of living in a caption below a card. */
-.ship-sprite-wrap{position:relative;width:64px;height:64px;margin:0 auto;flex:0 0 auto}
-.ship-sprite{position:absolute;inset:0;width:64px;height:64px;
+/* REAL SCALE (Ben, 2:30 PM CDT 2026-09-12: "use the real inserter rotation
+   speed and positions from the lua. for the rest of the sprites, too. Let's
+   make this look as real as we can"). One Factorio tile = 24 CSS px on this
+   floor. Every sprite is the game's own hi-res sheet drawn at 0.375 (its
+   Lua scale 0.5 x 24/32), so an assembling machine is 3x3 tiles (72px), a
+   steel chest 1x1 (24px), a fast inserter 1x1, a belt one tile wide, and
+   the rocket silo its full 9x9 (216px). The wrap is the entity's collision
+   footprint; the sprite overhangs it exactly as the sheet overhangs the
+   footprint in game. */
+.ship-sprite-wrap{position:relative;width:72px;height:72px;margin:0 auto;flex:0 0 auto}
+.ship-sprite-wrap.kind-chest{width:24px;height:24px;margin-top:22px}
+.ship-sprite-wrap.kind-robot{width:30px;height:30px;margin-top:22px}
+.ship-sprite-wrap.kind-silo{width:216px;height:216px}
+/* A 1-tile entity is too small to carry its number on top - it sits just
+   above, alt-mode style. */
+.ship-sprite-wrap.kind-chest .ship-num,.ship-sprite-wrap.kind-robot .ship-num{bottom:auto;top:-24px}
+.ship-sprite{position:absolute;left:0;top:0;width:100%;height:100%;
 background-repeat:no-repeat;image-rendering:pixelated;pointer-events:none;opacity:.95;
 filter:var(--ground-shadow)}
 .ship-sprite.dim{opacity:.4}
@@ -7500,9 +7520,25 @@ filter:var(--ground-shadow)}
 .ship-inserter.remnant .inserter-arm{opacity:.15!important;animation:none!important}
 /* Standard icon sheets are Factorio mip chains: 64+32+16+8=120 wide, 64 tall -
    the first (64x64) mip scaled to the 24x24 slot. */
-.ship-sprite.ico{background-size:120px 64px;background-position:0 0}
-.ship-sprite.chest-ico{background-size:64px 80px;background-position:center top}
+.ship-sprite.ico{background-size:56px 30px;background-position:0 0}
+/* steel-chest.png 64x80 @0.5, shift by_pixel(-0.25,-0.5): 24x30 on a 24px footprint. */
+.ship-sprite.chest-ico{width:24px;height:30px;top:-3px;background-size:24px 30px;background-position:0 0;image-rendering:auto}
+/* The rocket silo composite (shadow, hole, doors, base, front - each at its
+   Lua shift) is 261px over the 216px 9x9 footprint. */
+.ship-sprite.silo-ico{width:261px;height:261px;left:-22px;top:-22px;background-size:261px 261px;image-rendering:auto}
 .ship-sprite.asm{width:64px;height:64px;background-size:512px 256px;image-rendering:pixelated}
+/* assembling-machine-3.png: 32 frames of 214x237 @0.5, 8 per line, shift
+   by_pixel(0,-0.75) -> 80x89 frames on a 640x356 sheet over the 72px
+   footprint. Ben: "make the gears on the assemblers rotate when they are
+   working" - the game's animation_speed is 0.5 frames/tick = 30 fps, so the
+   32-frame loop takes 1.0667s: x steps through the 8 columns every 0.2667s
+   and y through the 4 rows over the full loop. .working = the stage has a
+   job in it (its count > 0). */
+.ship-sprite.asm3{width:80px;height:89px;left:-4px;top:-9px;background-size:640px 356px;background-position:0 0;image-rendering:auto}
+.ship-sprite.asm3.working{animation:asm3-x .2667s steps(8) infinite,asm3-y 1.0667s steps(4) infinite}
+@keyframes asm3-x{to{background-position-x:-640px}}
+@keyframes asm3-y{to{background-position-y:-356px}}
+@media(prefers-reduced-motion:reduce){.ship-sprite.asm3.working{animation:none}}
 .ship-legend{display:flex;gap:18px;align-items:center;margin:6px 0 4px;font-size:.72em;color:#c7cee0;text-shadow:var(--text-outline)}
 .ship-legend-chip{display:flex;align-items:center;gap:6px}
 .ship-legend-swatch{width:16px;height:16px;flex:0 0 auto}
@@ -7518,11 +7554,13 @@ filter:var(--ground-shadow)}
    below: this sits in both a row-direction parent (plain/vbelt arrows) and
    a column-direction one (the row-turn arrows), and a fixed flex-basis
    would hijack whichever axis is "main" in each. */
-.ship-inserter{position:relative;width:34px;height:32px;flex:0 0 auto;display:flex;align-items:center;justify-content:center}
-.ship-inserter .inserter-platform{position:absolute;left:0;bottom:0;width:30px;height:23px;
-background-image:url('/static/factorio/inserter/fast-inserter-platform.png');
-background-size:120px 23px;background-position:-30px 0;background-repeat:no-repeat;
-image-rendering:pixelated;opacity:.85;filter:var(--ground-shadow)}
+/* Real scale: platform_picture 105x79 @0.5 -> 39x30 (one tile), frame 1.
+   The bearing (hub) sits at (51,29) of the frame -> (19,11) here. */
+.ship-inserter{position:relative;width:39px;height:30px;flex:0 0 auto;display:flex;align-items:center;justify-content:center}
+.ship-inserter .inserter-platform{position:absolute;left:0;bottom:0;width:39px;height:30px;
+background-image:url('/static/factorio/inserter/fast-inserter-platform-24.png');
+background-size:156px 30px;background-position:-39px 0;background-repeat:no-repeat;
+image-rendering:auto;opacity:.95;filter:var(--ground-shadow)}
 /* Hand images are a tall 72x164 single frame - scaled with width/height in the
    SAME ratio as the source (no stretch). LORE order 17: --arm-rest replaces
    the old fixed rotate(90deg)/rotate(-90deg) pair with a per-instance angle
@@ -7545,9 +7583,15 @@ image-rendering:pixelated;opacity:.85;filter:var(--ground-shadow)}
    A fast inserter reaches one tile: in his close-up the extended arm is
    about the tripod's own width, not 1.5x it. 13x30 (sprite aspect kept),
    still pivoting at its bottom edge on the hub at (14.6, 17.4). */
-.ship-inserter .inserter-arm{position:absolute;left:8px;top:-13px;width:13px;height:30px;
-background-repeat:no-repeat;background-size:13px 30px;image-rendering:pixelated;
-transform-origin:50% 100%;transform:rotate(var(--arm-rest,90deg));transition:transform .4s ease,opacity .4s ease}
+/* hand_closed/open_picture 72x164 @0.25 -> 14x31 (hi-res 0.25 x 24/32 =
+   0.1875), pivoting at its base on the hub at (19,11). Its swing is driven
+   by shipAnimateInserters (Web Animations) at the game's own numbers:
+   rotation_speed 0.04 turns/tick (180deg in 12.5 ticks = 0.2083s each
+   way), reaching pickup_position 1.0 tile and insert_position 1.2 tiles
+   (scaleY .77 -> .93 of the 31px hand). */
+.ship-inserter .inserter-arm{position:absolute;left:12px;top:-20px;width:14px;height:31px;
+background-repeat:no-repeat;background-size:14px 31px;image-rendering:auto;
+transform-origin:50% 100%;transform:rotate(var(--arm-rest,90deg)) scaleY(.77);transition:opacity .4s ease}
 .ship-inserter.idle .inserter-arm{opacity:.4}
 /* LORE order 14 "the inserters must swing": a real Factorio inserter's arm
    rotates through roughly 180 degrees between the pickup and drop side - the
@@ -7559,30 +7603,12 @@ transform-origin:50% 100%;transform:rotate(var(--arm-rest,90deg));transition:tra
    or a whole row of them - swing staggered, never in lockstep. The arc is
    always +-75deg around --arm-rest, so the same keyframes serve every
    orientation. */
-.ship-inserter.moving .inserter-arm{opacity:1;animation-name:inserter-swing;
-animation-timing-function:ease-in-out;animation-iteration-count:infinite;
-animation-duration:var(--swing-duration,1.6s);animation-delay:var(--swing-delay,0s)}
-/* Ben: a real inserter swings the full 180 - pickup on one side of its
-   base, drop on the opposite side. --arm-rest is the DROP side (the belt
-   for a loading inserter, the stage for an unloading one); pickup is the
-   far side, 180 degrees away; the arm sweeps over the top between them. */
-/* Ben (10:45 AM, 2026-09-12): "when the inserters pass on a work product,
-   have it move with the inserter's grasping arm and drop onto the start of
-   the belt ... the work object should move with the grasping hand into
-   the next stage." The item rides at the hand's tip (a child of the arm,
-   so it rotates with it) for the carrying half of the swing - pickup side
-   to drop side, hand closed - and vanishes at the drop (50%), where the
-   hand opens for the empty return. Same duration/delay as the arm (the
-   custom props are inherited), so it is the same swing, not a second one. */
-.inserter-item{position:absolute;left:50%;top:-5px;width:12px;height:12px;margin-left:-6px;
-background-repeat:no-repeat;image-rendering:pixelated;opacity:0;pointer-events:none;
-filter:drop-shadow(0 1px 1px rgba(0,0,0,.6))}
-.ship-inserter.moving .inserter-item{animation-name:inserter-carry;animation-timing-function:ease-in-out;
-animation-iteration-count:infinite;animation-duration:var(--swing-duration,1.6s);animation-delay:var(--swing-delay,0s)}
-@keyframes inserter-carry{0%,50%{opacity:1}50.01%,100%{opacity:0}}
-@media(prefers-reduced-motion:reduce){.ship-inserter.moving .inserter-item{animation:none;opacity:1}}
-@keyframes inserter-swing{
-0%{transform:rotate(calc(var(--arm-rest,90deg) - 180deg));background-image:url('/static/factorio/inserter/fast-inserter-hand-closed.png')}
+.ship-inserter.moving .inserter-arm{opacity:1}
+/* (The swing itself is a Web Animation built per inserter from the real
+   Lua numbers - shipAnimateInserters - so a slow handoff swings at full
+   speed and then WAITS at the pickup side for its next item, the way a real
+   inserter idles, instead of one slow-motion sweep stretched over the
+   whole period.) */
 50%{transform:rotate(var(--arm-rest,90deg));background-image:url('/static/factorio/inserter/fast-inserter-hand-closed.png')}
 50.01%{background-image:url('/static/factorio/inserter/fast-inserter-hand-open.png')}
 100%{transform:rotate(calc(var(--arm-rest,90deg) - 180deg));background-image:url('/static/factorio/inserter/fast-inserter-hand-open.png')}
@@ -7594,8 +7620,8 @@ animation-iteration-count:infinite;animation-duration:var(--swing-duration,1.6s)
    after it so a bottleneck arrow that also happens to have rate>0 still
    freezes rather than swings. */
 .ship-inserter.backed-up .inserter-arm{animation:none!important;opacity:1;
-transform:rotate(calc(var(--arm-rest,90deg) - 180deg))}
-@media(prefers-reduced-motion:reduce){.ship-inserter.moving .inserter-arm{animation:none;transform:rotate(var(--arm-rest,90deg))}}
+transform:rotate(calc(var(--arm-rest,90deg) - 180deg)) scaleY(.77)}
+@media(prefers-reduced-motion:reduce){.ship-inserter.moving .inserter-arm{animation:none;transform:rotate(var(--arm-rest,90deg)) scaleY(.93)}}
 /* No card border left to color for deploy state (order 11) - the state
    becomes a glow on the sprite itself instead. */
 .ship-stage.merge-green .ship-sprite{filter:drop-shadow(0 0 8px rgba(57,255,20,.9)) var(--ground-shadow)}
@@ -7921,16 +7947,16 @@ gap:1px;padding:0 2px;border:0;background:transparent;color:var(--arrow-color);c
    bottom (unloading into the stage below). Height is set by
    positionShipElbows to span exactly from the top of the from-stage to
    the bottom of the to-stage. */
-.ship-arrow-vertical{position:absolute;display:block;flex:0 0 auto;width:64px;height:200px;
+.ship-arrow-vertical{position:absolute;display:block;flex:0 0 auto;width:63px;height:200px;
 padding:0;z-index:4}
-.ship-arrow-vertical .ship-belt-vertical{position:absolute;top:0;bottom:0;height:auto;left:36px}
+.ship-arrow-vertical .ship-belt-vertical{position:absolute;top:0;bottom:0;height:auto;left:39px}
 .ship-arrow-vertical .ship-inserter{position:absolute;left:0}
 .ship-arrow-vertical .ship-inserter:first-child{top:0}
 .ship-arrow-vertical .ship-inserter:last-child{bottom:0}
 /* Row 2 ends on the LEFT (row-reverse), so its row-end belt sits on the
    left of the stage with the inserters on the belt's right. */
 .ship-arrow-vertical.ship-arrow-left .ship-belt-vertical{left:0}
-.ship-arrow-vertical.ship-arrow-left .ship-inserter{left:30px}
+.ship-arrow-vertical.ship-arrow-left .ship-inserter{left:24px}
 /* Ben's 10:08 AM rig: ONE tall belt runs up from beside RESOLVED (row 3)
    past APPROVED to IN LINE (row 2) - "when things are resolved, they get
    passed back up to approved". Three inserters on it: approved loads from
@@ -7939,11 +7965,11 @@ padding:0;z-index:4}
    top-left into IN LINE. DOM order stays load / belt / unload so every
    "first inserter is the loader" reader still holds; the resolved feeder
    is its own nested .ship-arrow (no belt of its own - it shares this one). */
-.ship-arrow-vertical.ship-arrow-shared{width:96px}
-.ship-arrow-vertical.ship-arrow-shared .ship-belt-vertical{left:32px}
-.ship-arrow-vertical.ship-arrow-shared > .ship-inserter:first-child{left:62px;top:var(--load-top,0);bottom:auto}
+.ship-arrow-vertical.ship-arrow-shared{width:102px}
+.ship-arrow-vertical.ship-arrow-shared .ship-belt-vertical{left:39px}
+.ship-arrow-vertical.ship-arrow-shared > .ship-inserter:first-child{left:63px;top:var(--load-top,0);bottom:auto}
 .ship-arrow-vertical.ship-arrow-shared > .ship-inserter:nth-child(3){left:0;top:var(--unload-top,0);bottom:auto}
-.ship-arrow-feeder{position:absolute;left:62px;bottom:0;width:34px;height:32px;padding:0;margin:0;
+.ship-arrow-feeder{position:absolute;left:63px;bottom:0;width:39px;height:30px;padding:0;margin:0;
 display:block;flex:none;background:transparent;border:0;z-index:4}
 .ship-arrow-shared .ship-arrow-feeder .ship-inserter{left:0;top:0;bottom:auto}
 /* Ben's own built reference (a vertical belt bridging two side-by-side
@@ -8013,7 +8039,10 @@ animation:ship-belt-flow linear infinite;animation-duration:var(--belt-duration,
    will show more items on the belt so I can see when they're backed up" -
    taller than the original 72px so a jam visibly piles up along real belt
    length, not just a couple of dots. */
-.ship-belt-vertical{width:28px;height:140px;flex:0 0 auto}
+/* Real scale: transport-belt.png frames are 128x128 @0.5 with the belt's
+   own tile in the centre 64x64 - one tile wide (24px), one tile of tread
+   per 24px. */
+.ship-belt-vertical{width:24px;height:140px;flex:0 0 auto}
 /* Ben's built reference: each belt segment's own chevron faces the actual
    direction of travel (down), not sideways - the base tile's chevron is
    baked in pointing right (it's a horizontal-belt asset), so a vertical
@@ -8026,18 +8055,23 @@ animation:ship-belt-flow linear infinite;animation-duration:var(--belt-duration,
    rail and tiled with seams. These are the sheet's own north/south frames
    (both side rails, one 64px tread period), pre-scaled to exactly the
    belt's width so repeat-y gives one seamless column. */
-.ship-belt-vertical .ship-belt-track{background-image:url('/static/factorio/belt/belt-tile-vertical.png');
-background-size:28px 25px;background-repeat:repeat-y;animation-name:ship-belt-flow-vertical}
-@keyframes ship-belt-flow-vertical{to{background-position-y:25px}}
+/* Real speed: transport-belt speed = 0.03125 tiles/tick = 1.875 tiles/s,
+   so one 24px tile of tread passes in 0.5333s (--belt-duration is that
+   constant now - a belt runs at belt speed whether or not anything is on
+   it, like the real thing; the rate lives in the inserters' cadence). */
+.ship-belt-vertical .ship-belt-track{background-image:url('/static/factorio/belt/belt-tile-south-24.png');
+background-size:24px 24px;background-repeat:repeat-y;animation-name:ship-belt-flow-vertical;animation-timing-function:linear}
+@keyframes ship-belt-flow-vertical{to{background-position-y:24px}}
 /* Ben's built reference: consecutive in-row belts alternate their own flow
    direction (down, up, down, up...), each with its own pre-rotated chevron
    tile facing the direction it actually travels - never a downward tile on
    a belt that flows up. */
-.ship-belt-vertical-up .ship-belt-track{background-image:url('/static/factorio/belt/belt-tile-vertical-up.png');
+.ship-belt-vertical-up .ship-belt-track{background-image:url('/static/factorio/belt/belt-tile-north-24.png');
 animation-name:ship-belt-flow-vertical-up}
-@keyframes ship-belt-flow-vertical-up{to{background-position-y:-25px}}
+@keyframes ship-belt-flow-vertical-up{to{background-position-y:-24px}}
 .ship-belt-items{position:absolute;inset:0}
-.ship-belt-item{position:absolute;top:50%;left:50%;width:16px;height:16px;transform:translate(-50%,-50%);
+/* Items on a belt draw at icon scale 0.5 = half a tile = 12px. */
+.ship-belt-item{position:absolute;top:50%;left:50%;width:12px;height:12px;transform:translate(-50%,-50%);
 filter:drop-shadow(0 1px 1px rgba(0,0,0,.6))}
 .ship-belt-vertical .ship-belt-item{left:50%}
 .ship-belt-item-img{width:100%;height:100%;background-repeat:no-repeat;image-rendering:pixelated}
@@ -8047,16 +8081,19 @@ filter:drop-shadow(0 1px 1px rgba(0,0,0,.6))}
    bottleneck flag rather than adding a second signal. Glow only (order 17
    #2 removed the belt's border/outline) - a halo, not a box. */
 .ship-belt-backed-up{box-shadow:0 0 8px var(--neon-red)}
-.ship-belt-backed-up .ship-belt-track{animation:none;filter:saturate(1.4)}
+.ship-belt-backed-up .ship-belt-track{filter:saturate(1.4)}
 /* starved: a MEASURED zero rate - the belt is real, just not moving. */
-.ship-belt-starved .ship-belt-track{animation:none;opacity:.3}
+.ship-belt-starved .ship-belt-track{opacity:.3}
 /* known: a plain count with no rate instrument behind it - items sit still
    because the flow speed isn't measured, not because it's known to be zero. */
-.ship-belt-known .ship-belt-track{animation:none;opacity:.55}
+/* Real belts never stop: the tread runs at belt speed under a jam, an
+   empty run, or an un-instrumented count alike (Ben, 2:30 PM: "as real as
+   we can"); the state cue is the tint, never a frozen belt. */
+.ship-belt-known .ship-belt-track{opacity:.55}
 /* unknown: no data at all - the same "nobody knows" language as the
    unpowered inserter (.ship-inserter.remnant) sitting right next to it. */
 .ship-belt-unknown{opacity:.35}
-.ship-belt-unknown .ship-belt-track{animation:none;filter:grayscale(.7)}
+.ship-belt-unknown .ship-belt-track{filter:grayscale(.7)}
 @media(prefers-reduced-motion:reduce){.ship-belt-track{animation:none!important}}
 /* SHIP-GAME-2: issues-closed/hour history replaces the open-issue count
    sparkline. It mirrors the runners read: graph left, current value right. */
@@ -8830,26 +8867,26 @@ const SHIP_STAGE_META = {
     // wherever work is just WAITING (issues open, prs open, review routed,
     // conflicted, resolved, approved, in queue). Bugs found (biter) and
     // deployed (silo) stay as they were.
-    'issues open':    {kind: 'chest',   sprite: 'chest/steel-chest.png'},
-    'dispatched':     {kind: 'machine', sprite: 'assembling-machine-3.png'},
-    'prs open':       {kind: 'chest',   sprite: 'chest/steel-chest.png'},
-    'ci q/run':       {kind: 'machine', sprite: 'assembling-machine-3.png'},
-    'review routed':  {kind: 'chest',   sprite: 'chest/steel-chest.png'},
-    'in review':      {kind: 'machine', sprite: 'assembling-machine-3.png'},
-    'gate verdicts':  {kind: 'machine', sprite: 'assembling-machine-3.png'},
-    'conflicted':     {kind: 'chest',   sprite: 'chest/steel-chest.png'},
-    'resolved':       {kind: 'chest',   sprite: 'chest/steel-chest.png'},
-    'approved':       {kind: 'chest',   sprite: 'chest/steel-chest.png'},
-    'in line':        {kind: 'chest',   sprite: 'chest/steel-chest.png'},
-    'merged today':   {kind: 'machine', sprite: 'assembling-machine-3.png'},
-    'folded':         {kind: 'machine', sprite: 'assembling-machine-3.png'},
-    'deployed':       {kind: 'machine', sprite: 'rocket-silo.png'},
+    'issues open':    {kind: 'chest',   sprite: 'chest/steel-chest-24.png'},
+    'dispatched':     {kind: 'machine', sprite: 'asm3'},
+    'prs open':       {kind: 'chest',   sprite: 'chest/steel-chest-24.png'},
+    'ci q/run':       {kind: 'machine', sprite: 'asm3'},
+    'review routed':  {kind: 'chest',   sprite: 'chest/steel-chest-24.png'},
+    'in review':      {kind: 'machine', sprite: 'asm3'},
+    'gate verdicts':  {kind: 'machine', sprite: 'asm3'},
+    'conflicted':     {kind: 'chest',   sprite: 'chest/steel-chest-24.png'},
+    'resolved':       {kind: 'chest',   sprite: 'chest/steel-chest-24.png'},
+    'approved':       {kind: 'chest',   sprite: 'chest/steel-chest-24.png'},
+    'in line':        {kind: 'chest',   sprite: 'chest/steel-chest-24.png'},
+    'merged today':   {kind: 'machine', sprite: 'asm3'},
+    'folded':         {kind: 'machine', sprite: 'asm3'},
+    'deployed':       {kind: 'silo',    sprite: 'silo/rocket-silo-24.png'},
     // Row 3's shipStage() call uses 'last deploy' as its own cap/data-square
     // (the box's caption text is the separate `label` param, 'deployed') -
     // same meta, so the silo sprite actually renders on stage 15 instead of
     // silently rendering nothing (found while verifying every square carries
     // a sprite for order 11).
-    'last deploy':    {kind: 'machine', sprite: 'rocket-silo.png'},
+    'last deploy':    {kind: 'silo',    sprite: 'silo/rocket-silo-24.png'},
 };
 
 // Ben, 4:40 PM CDT amendment: a square with NO DATA (unknown) shows Factorio
@@ -8870,7 +8907,10 @@ const REMNANT_SPRITE = {
     'assembler': { url: '/static/factorio/remnants/assembling-machine-1-remnants.png', size: '75px 192px', pos: '0 0' },
     'lab.png': { url: '/static/factorio/remnants/lab-remnants.png', size: '88px 128px', pos: '0 0' },
     'radar.png': { url: '/static/factorio/remnants/radar-remnants.png', size: '85px 64px', pos: 'center' },
-    'chest/steel-chest.png': { url: '/static/factorio/remnants/steel-chest-remnants.png', size: '136px 80px', pos: '0 0' },
+    'chest/steel-chest-24.png': { url: '/static/factorio/remnants/steel-chest-remnants.png', size: '51px 30px', pos: '0 0' },
+    // assembling-machine-3 wreckage: the AM1 remnant sheet stands in (same
+    // footprint), scaled to the AM3 frame box.
+    'asm3': { url: '/static/factorio/remnants/assembling-machine-1-remnants.png', size: '94px 240px', pos: '0 0' },
 };
 // LORE order 15: BUGS FOUND is a biter, not a fixed sprite - bugs are the
 // thing attacking the line, not a machine in it. Which biter depends on the
@@ -8912,7 +8952,14 @@ function shipSpriteHtml(cap, unknown, num) {
             + (remnant ? remnant.url : '/static/factorio/assembler/assembling-machine-1.png') + ')'
             + (remnant ? remnantStyle : ';background-position:0 0') + '"></div>';
     }
-    const spriteCls = meta.kind === 'chest' ? 'chest-ico' : 'ico';
+    if (meta.sprite === 'asm3') {
+        // Ben: "make the gears on the assemblers rotate when they are working"
+        // - working = the machine has a job in it right now (its count > 0).
+        const working = !unknown && Number(num) > 0;
+        return '<div class="ship-sprite asm3' + (working ? ' working' : '') + dimCls + remnantCls + '" style="background-image:url('
+            + (remnant ? remnant.url : '/static/factorio/assembler/assembling-machine-3-sheet.png') + ')' + remnantStyle + '"></div>';
+    }
+    const spriteCls = meta.kind === 'chest' ? 'chest-ico' : (meta.kind === 'silo' ? 'silo-ico' : 'ico');
     return '<div class="ship-sprite ' + spriteCls + dimCls + remnantCls + '" style="background-image:url('
         + (remnant ? remnant.url : ('/static/factorio/' + meta.sprite)) + ')' + remnantStyle + '"></div>';
 }
@@ -8956,8 +9003,8 @@ function shipStage(num, cap, cls, sub, spark, help, stageCls, dropdownKey, prs, 
          // before - this tile's change must not alter the other fourteen.
          + (bdText ? ' data-ship-breakdown="' + shipEscape(bdText) + '"'
                      + (help ? ' data-ship-breakdown-help="' + shipEscape(help) + '"' : '')
-                   : (help ? ' title="' + help.replace(/"/g, '') + '"' : '')) + '>' + (hist || '')
-         + '<div class="ship-sprite-wrap">' + shipSpriteHtml(cap, unknown, num)
+                   : (help ? ' title="' + help.replace(/"/g, '') + '"' : '')) + '>' + (hist || '<div class="ship-hist-spacer"></div>')
+         + '<div class="ship-sprite-wrap kind-' + ((SHIP_STAGE_META[cap] || {}).kind || 'machine') + '">' + shipSpriteHtml(cap, unknown, num)
          // An unknown count renders NOTHING here (no plate, no '?' glyph) -
          // it must never read as a measured 0, and must never look like a
          // second, competing "no data" signal next to the sprite/remnant.
@@ -9096,6 +9143,64 @@ function shipStagePhase(square) {
 // right-to-left, 180 for a vertical (top-to-bottom) belt - both the loading
 // and unloading inserter on a vertical belt reach straight down, since both
 // sit beside a belt whose flow is always downward.
+// Real numbers from the game's own prototypes (base/prototypes/entity/
+// entities.lua, transport-belts.lua - Ben: "use the real inserter rotation
+// speed and positions from the lua"):
+//   fast-inserter  rotation_speed = 0.04 turns/tick, extension_speed = 0.1,
+//                  pickup_position = {0,-1}, insert_position = {0,1.2}
+//   transport-belt speed = 0.03125 tiles/tick, 60 ticks/s
+const SHIP_INSERTER_SWING_S = 0.5 / 0.04 / 60;      // 180deg = 12.5 ticks = 0.2083s
+const SHIP_INSERTER_CYCLE_S = 2 * SHIP_INSERTER_SWING_S;
+const SHIP_INSERTER_PICK_SCALE = 24 / 31;           // hand reaching 1.0 tile (24px) with a 31px hand sprite
+const SHIP_INSERTER_DROP_SCALE = 1.2 * 24 / 31;     // ...and 1.2 tiles at the drop
+const SHIP_BELT_TILE_SECONDS = 1 / (0.03125 * 60);  // 1.875 tiles/s -> 0.5333s per tile of tread
+// Build each moving inserter's swing as a Web Animation: out to the drop at
+// full speed (hand closed, item in hand), open, back at full speed, then
+// WAIT at the pickup side for the rest of the period. CSS keyframes cannot
+// express "swing for 0.42s then hold for the rest of a variable period",
+// which is why this is script and not a stylesheet rule.
+function shipAnimateInserters() {
+    const reduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const closed = 'url("/static/factorio/inserter/fast-inserter-hand-closed.png")';
+    const open = 'url("/static/factorio/inserter/fast-inserter-hand-open.png")';
+    document.querySelectorAll('.ship-inserter').forEach(ins => {
+        const arm = ins.querySelector('.inserter-arm');
+        const item = ins.querySelector('.inserter-item');
+        if (!arm) return;
+        arm.getAnimations().forEach(a => a.cancel());
+        if (item) item.getAnimations().forEach(a => a.cancel());
+        if (reduced || !ins.classList.contains('moving') || ins.classList.contains('backed-up') || ins.classList.contains('remnant')) return;
+        const cs = getComputedStyle(arm);
+        const period = parseFloat(cs.getPropertyValue('--swing-duration')) || SHIP_INSERTER_CYCLE_S;
+        const delay = parseFloat(cs.getPropertyValue('--swing-delay')) || 0;
+        const rest = parseFloat(cs.getPropertyValue('--arm-rest')) || 90;
+        const s = Math.min(0.5, SHIP_INSERTER_SWING_S / period);
+        const pick = 'rotate(' + (rest - 180) + 'deg) scaleY(' + SHIP_INSERTER_PICK_SCALE.toFixed(3) + ')';
+        const drop = 'rotate(' + rest + 'deg) scaleY(' + SHIP_INSERTER_DROP_SCALE.toFixed(3) + ')';
+        // The per-inserter phase offset (--swing-delay, negative) is applied
+        // by starting each animation part-way through its cycle rather than
+        // as a negative delay, so an animation's own clock is always >= 0
+        // (seekable by tests and readable as a plain phase).
+        const t = {duration: period * 1000, iterations: Infinity, easing: 'linear'};
+        const start = Math.max(0, -delay) * 1000;
+        arm.dataset.swingStart = start.toFixed(0);
+        const swing = arm.animate([
+            {offset: 0, transform: pick, backgroundImage: closed},
+            {offset: s, transform: drop, backgroundImage: closed},
+            {offset: Math.min(1, s + 0.0001), transform: drop, backgroundImage: open},
+            {offset: Math.min(1, 2 * s), transform: pick, backgroundImage: open},
+            {offset: 1, transform: pick, backgroundImage: open},
+        ], Object.assign({id: 'inserter-swing'}, t));
+        swing.currentTime = start;
+        if (item) {
+            const carry = item.animate([
+                {offset: 0, opacity: 1}, {offset: s, opacity: 1},
+                {offset: Math.min(1, s + 0.0001), opacity: 0}, {offset: 1, opacity: 0},
+            ], Object.assign({id: 'inserter-carry'}, t));
+            carry.currentTime = start;
+        }
+    });
+}
 // `itemPath` (Ben, 10:45 AM 2026-09-12): the work product this inserter
 // carries - rendered in the hand for the carrying half of each swing.
 function shipInserterHtml(count, armRest, unknown, phaseSeed, backedUp, swingDuration, alignCls, itemPath) {
@@ -9256,7 +9361,7 @@ function shipBeltHtml(square, hasRate, rate, backedUp, knownCount, dir, vertical
     }
     const extraSlots = (extra && extra.count !== null && extra.count !== undefined)
         ? Math.min(cap - slots, Math.max(0, Math.round(Number(extra.count)))) : 0;
-    const itemSize = vertical ? 15 : 16;
+    const itemSize = 12;   // icon scale 0.5 = half a tile
     const step = 84 / (cap - 1);
     let itemsHtml = '';
     for (let i = 0; i < slots + extraSlots; i++) {
@@ -9333,10 +9438,14 @@ function shipArrow(square, glyph, arrow, description, legacyCount, width, isBott
     const rateForSpeed = hasRate ? Number(rate) : 0;
     // SHIP-PIPES-2 (Ben, 8:53 AM), now the belt's scroll speed (order 9: "rate
     // is speed") - clamp lives in shipBeltHtml's slot-count mapping too.
-    const duration = rateForSpeed > 0 ? Math.max(0.8, 24 / rateForSpeed) : 0;
+    // The inserter's cadence: one swing per (24 / rate) seconds - compressed
+    // time, so a 6/h handoff swings every 4s - floored at the real cycle
+    // (0.4167s: 180deg out and back at rotation_speed 0.04), at which point
+    // it is swinging continuously like a saturated real inserter.
+    const duration = rateForSpeed > 0 ? Math.max(SHIP_INSERTER_CYCLE_S, 24 / rateForSpeed) : 0;
     const style = '--arrow-color:' + colour + ';--arrow-outline:' + outline
         + ';--arrow-glow:' + (isBottleneck ? 'drop-shadow(0 0 6px var(--neon-red))' : (hasRate && rate >= 8 ? 'drop-shadow(0 0 5px ' + colour + ')' : 'none'))
-        + ';--belt-duration:' + (duration ? duration + 's' : '0s')
+        + ';--belt-duration:' + SHIP_BELT_TILE_SECONDS.toFixed(4) + 's'
         + (agentLane ? '' : ';cursor:default');
     const key = square.replaceAll(' ', '-').replaceAll('/', '-');
     const rateText = hasRate ? (rate + '/h') : 'rate unknown';
@@ -9628,14 +9737,15 @@ function positionShipElbows() {
         // approved's sprite bottom (it flows up, so approved loads mid-belt
         // and resolved loads at the very start) - whichever of those two is
         // higher is where the belt begins.
-        const top = Math.min(inLine.top, approved.bottom - insH);
+        const loadTop = approved.top + approved.height / 2 - insH / 2;   // loader centred on approved's chest
+        const top = Math.min(inLine.top, loadTop);
         const slotRect = slot.getBoundingClientRect();
         // Ben (10:35 AM): "move the resolved feeder up so it's level with
         // resolved" - the feeder sits at the belt's very start (bottom), so
         // the belt ends where the feeder, centred on resolved's chest, ends.
         const bottom = resolved.top + resolved.height / 2 + insH / 2;
         column('ship-elbow-4', top, bottom, slotRect.left + (slotRect.width - shared.offsetWidth) / 2);
-        shared.style.setProperty('--load-top', (approved.bottom - insH - top) + 'px');
+        shared.style.setProperty('--load-top', (loadTop - top) + 'px');
         shared.style.setProperty('--unload-top', (inLine.top - top) + 'px');
     }
 }
@@ -9935,6 +10045,8 @@ function refreshShipFlow() {
         positionShipElbows();
         if (document.fonts && document.fonts.ready) document.fonts.ready.then(positionShipElbows);
         setTimeout(positionShipElbows, 400);
+        // Real-timing inserter swings (Web Animations) on the fresh DOM.
+        shipAnimateInserters();
     }).catch(() => {
         const el = document.getElementById('ship-flow');
         if (el && !el.querySelector('.ship-stage')) el.innerHTML = '<span class="gdim">shipping pipeline failed to load.</span>';

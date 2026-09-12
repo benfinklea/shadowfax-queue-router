@@ -443,16 +443,17 @@ with sync_playwright() as p:
         return page.locator(
             '.ship-arrow[data-square-left="' + square + '"] > .ship-inserter'
         ).nth(idx).locator('.inserter-arm').evaluate(
-            "el => ({name: getComputedStyle(el).animationName, "
-            "duration: getComputedStyle(el).animationDuration, "
-            "delay: getComputedStyle(el).animationDelay})")
+            "el => { const a = el.getAnimations()[0]; if (!a) return {name: 'none', duration: '0s', phase: null};"
+            " const t = a.effect.getTiming(); return {name: a.id, duration: (t.duration / 1000) + 's', phase: Math.round(((a.currentTime % t.duration) / t.duration) * 100) / 100, start: Number(el.dataset.swingStart)}; }")
     issues_arm = arm_style('issues open')   # rate 6/h, loading inserter
     prsci_arm = arm_style('prs open')       # rate 3/h, loading inserter
     dispatched_arm = arm_style('dispatched')  # no formal rate instrument
     assert issues_arm['name'] == 'inserter-swing', issues_arm
     assert prsci_arm['name'] == 'inserter-swing', prsci_arm
     assert issues_arm['duration'] != prsci_arm['duration'], (issues_arm, prsci_arm)
-    assert issues_arm['delay'] != prsci_arm['delay'], (issues_arm, prsci_arm)
+    # Two belts with different periods (4s, 8s) drift in and out of step by
+    # nature, so their stagger is the seeded start offset, not a live phase.
+    assert issues_arm['start'] != prsci_arm['start'], ('two belts seeded in lockstep', issues_arm, prsci_arm)
     assert dispatched_arm['name'] == 'none', dispatched_arm
     # Ben: an inserter only swings when there is a job on its belt to move.
     # merged-deploy has a measured rate (1/h) but an empty queue (backlog 0)
@@ -477,9 +478,22 @@ with sync_playwright() as p:
     # Ben: the swing is the full 180 - pickup one side of the base, drop on
     # the other. Read the keyframe rule itself: its two extremes are 180deg
     # apart.
-    kf = page.evaluate('''() => { for (const ss of document.styleSheets) { let rules; try { rules = ss.cssRules; } catch (e) { continue; }
-        for (const r of rules) { if (r.type === CSSRule.KEYFRAMES_RULE && r.name === 'inserter-swing') return Array.from(r.cssRules).map(k => k.keyText + ' ' + k.style.transform); } } return null; }''')
-    assert kf and any('- 180deg' in k for k in kf) and any('50% rotate(var(--arm-rest' in k for k in kf), kf
+    # Real numbers (Ben, 2:30 PM): the swing is a Web Animation built from
+    # the game's fast-inserter prototype - 180deg each way at rotation_speed
+    # 0.04 turns/tick (0.2083s), reaching 1.0 tile at pickup and 1.2 at the
+    # drop, then WAITING at the pickup side for the rest of the period.
+    kf = page.locator('.ship-arrow[data-square-left="issues open"] > .ship-inserter').nth(0).locator('.inserter-arm').evaluate(
+        "el => { const a = el.getAnimations()[0]; return {frames: a.effect.getKeyframes().map(k => [k.offset, k.transform]), duration: a.effect.getTiming().duration}; }")
+    import re
+    angles = [float(re.search(r'rotate\((-?[\d.]+)deg\)', f[1]).group(1)) for f in kf['frames']]
+    scales = [float(re.search(r'scaleY\(([\d.]+)\)', f[1]).group(1)) for f in kf['frames']]
+    assert abs(angles[1] - angles[0]) == 180, ('full 180 swing', kf)
+    assert abs(scales[0] - 24 / 31) < 0.01 and abs(scales[1] - 1.2 * 24 / 31) < 0.01, ('hand must reach 1.0 tile at pickup and 1.2 at the drop', scales)
+    swing_s = 0.5 / 0.04 / 60
+    assert abs(kf['frames'][1][0] * kf['duration'] / 1000 - swing_s) < 0.002, ('drop must land 0.2083s into the period (rotation_speed 0.04)', kf)
+    assert abs(kf['frames'][3][0] * kf['duration'] / 1000 - 2 * swing_s) < 0.004, ('back at pickup after a second 0.2083s, then hold', kf)
+    assert kf['frames'][-1][0] == 1 and abs(angles[-1] - angles[0]) < 0.01, ('arm must wait at the pickup side for the rest of the period', kf)
+    assert kf['duration'] == 4000, ('issues open at 6/h swings once every 4s', kf['duration'])
     # Ben (10:45 AM 2026-09-12): the work product rides in the hand. A moving
     # inserter's arm carries the arrow's own item, on the SAME swing (same
     # duration and delay as the arm), shown for the carrying half and gone
@@ -489,15 +503,15 @@ with sync_playwright() as p:
             arm = page.locator('.ship-arrow[data-square-left="' + square + '"] > .ship-inserter').nth(which).locator('.inserter-arm')
             held = arm.locator('.inserter-item')
             assert held.count() == 1, (square, which, 'moving inserter carries no item')
-            st = held.evaluate("el => ({img: getComputedStyle(el).backgroundImage, name: getComputedStyle(el).animationName, duration: getComputedStyle(el).animationDuration, delay: getComputedStyle(el).animationDelay})")
-            armst = arm.evaluate("el => ({duration: getComputedStyle(el).animationDuration, delay: getComputedStyle(el).animationDelay})")
+            st = held.evaluate("el => { const a = el.getAnimations()[0]; return a ? {img: getComputedStyle(el).backgroundImage, name: a.id, duration: a.effect.getTiming().duration, now: a.currentTime} : {img: getComputedStyle(el).backgroundImage, name: 'none', duration: 0, now: null}; }")
+            armst = arm.evaluate("el => { const a = el.getAnimations()[0]; return {duration: a.effect.getTiming().duration, now: a.currentTime}; }")
             assert item in st['img'], (square, which, st)
-            assert st['name'] == 'inserter-carry' and st['duration'] == armst['duration'] and st['delay'] == armst['delay'], (square, which, 'item not on the arm\'s own swing', st, armst)
+            assert st['name'] == 'inserter-carry' and st['duration'] == armst['duration'] and abs(st['now'] - armst['now']) < 40, (square, which, 'item not on the arm\'s own swing', st, armst)
     assert page.locator('.ship-inserter.idle .inserter-item').count() == 0, 'an idle inserter must hold nothing'
     assert page.locator('.ship-arrow-feeder .inserter-item').count() == 0, 'resolved feeder is idle in this fixture (no rate) - holds nothing'
-    carry = page.evaluate('''() => { for (const ss of document.styleSheets) { let rules; try { rules = ss.cssRules; } catch (e) { continue; }
-        for (const r of rules) { if (r.type === CSSRule.KEYFRAMES_RULE && r.name === 'inserter-carry') return Array.from(r.cssRules).map(k => k.keyText + ' ' + k.style.opacity); } } return null; }''')
-    assert carry and any(k.startswith('0%') and k.endswith(' 1') for k in carry) and any('100%' in k and k.endswith(' 0') for k in carry), ('item must be held through the carry and dropped at the far end', carry)
+    carry = page.locator('.ship-arrow[data-square-left="issues open"] > .ship-inserter').nth(0).locator('.inserter-item').evaluate(
+        "el => el.getAnimations()[0].effect.getKeyframes().map(k => [k.offset, k.opacity])")
+    assert carry[0] == [0, '1'] and carry[-1] == [1, '0'] and abs(carry[1][0] - swing_s / 4) < 0.002, ('item must be held to the drop (0.2083s in) and gone after', carry)
 
     # ci-green is the fixture's bottleneck (rate 0, backlog 5) - BOTH its
     # inserters (loading and unloading) must freeze at the pickup end, not
@@ -520,7 +534,7 @@ with sync_playwright() as p:
         unload = arm_style(square, which='unload')
         assert load['name'] == 'inserter-swing', (square, load)
         assert unload['name'] == 'inserter-swing', (square, unload)
-        assert load['delay'] != unload['delay'], (
+        assert abs(load['phase'] - unload['phase']) > 0.02, (
             square, 'loading/unloading inserters are lockstep (mirror-synced)', load, unload)
 
     # Order 15 "BUGS FOUND is a biter": the main fixture's count (3) is the
@@ -609,6 +623,57 @@ with sync_playwright() as p:
     page.locator('[data-square="bugs found"]').screenshot(path=str(OUT / 'biter-unknown.png'))
     browser.close()
 
+# REAL SCALE (Ben, 2:30 PM CDT 2026-09-12) - one tile = 24px, every sprite
+# at its Lua size: assembling machine 3x3 (72px footprint, 80x89 frame),
+# steel chest 1x1 (24px), fast inserter 1x1 (39x30 platform, 14x31 hand),
+# belt one tile wide, rocket silo 9x9 (216px); belts at 1.875 tiles/s;
+# assembler gears at the game's 30 fps when working.
+with sync_playwright() as p:
+    browser, page = render(p, pipeline_fixture)
+    def wrap_box(sq):
+        return page.locator('[data-square="' + sq + '"] .ship-sprite-wrap').bounding_box()
+    assert wrap_box('dispatched')['width'] == 72 and wrap_box('dispatched')['height'] == 72, wrap_box('dispatched')
+    assert wrap_box('issues open')['width'] == 24 and wrap_box('issues open')['height'] == 24, wrap_box('issues open')
+    assert wrap_box('last deploy')['width'] == 216 and wrap_box('last deploy')['height'] == 216, wrap_box('last deploy')
+    assert abs(wrap_box('dispatched')['width'] / wrap_box('issues open')['width'] - 3) < 0.01, 'an assembler is 3 chests wide'
+    assert abs(wrap_box('last deploy')['width'] / wrap_box('issues open')['width'] - 9) < 0.01, 'the silo is 9 chests wide'
+    plat = page.locator('.ship-inserter .inserter-platform').first.bounding_box()
+    assert plat['width'] == 39 and plat['height'] == 30, plat
+    hand = page.locator('.ship-inserter .inserter-arm').first.evaluate("el => [el.offsetWidth, el.offsetHeight]")
+    assert hand == [14, 31], hand
+    belt = page.locator('.ship-belt-vertical').first.bounding_box()
+    assert belt['width'] == 24, belt
+    # Belt tread: the game's own south/north frames, one tile per 24px, at belt speed.
+    track = page.locator('.ship-arrow[data-square-left="bugs found"] .ship-belt-track').evaluate(
+        "el => ({img: getComputedStyle(el).backgroundImage, size: getComputedStyle(el).backgroundSize, dur: getComputedStyle(el).animationDuration, name: getComputedStyle(el).animationName})")
+    assert 'belt-tile-south-24' in track['img'] and track['size'] == '24px 24px', track
+    assert abs(float(track['dur'].rstrip('s')) - 1 / (0.03125 * 60)) < 0.002 and track['name'] != 'none', ('belt must run at 0.03125 tiles/tick', track)
+    up = page.locator('.ship-arrow[data-square-left="issues open"] .ship-belt-track').evaluate("el => getComputedStyle(el).backgroundImage")
+    assert 'belt-tile-north-24' in up, up
+    # Assembler gears: every machine with a job in it animates through the
+    # 32-frame sheet at 30 fps (0.2667s across 8 columns, 1.0667s down 4 rows);
+    # gate verdicts (n/a) and a machine at 0 stay still.
+    working = page.locator('.ship-sprite.asm3.working')
+    working_sq = [e.evaluate("el => el.closest('.ship-stage').dataset.square") for e in working.all()]
+    assert sorted(working_sq) == sorted(['dispatched', 'ci q/run', 'in review', 'merged today', 'folded']), working_sq
+    gv = page.locator('[data-square="gate verdicts"] .ship-sprite.asm3')
+    assert gv.count() == 1 and 'working' not in gv.get_attribute('class'), 'a machine with no job must not spin'
+    anim = working.first.evaluate("el => ({names: getComputedStyle(el).animationName, durs: getComputedStyle(el).animationDuration, size: getComputedStyle(el).backgroundSize, tf: getComputedStyle(el).animationTimingFunction})")
+    assert anim['names'] == 'asm3-x, asm3-y' and anim['size'] == '640px 356px', anim
+    d = [float(x.strip().rstrip('s')) for x in anim['durs'].split(',')]
+    assert abs(d[0] - 8 / 30) < 0.002 and abs(d[1] - 32 / 30) < 0.002, ('32 frames at animation_speed 0.5 = 30 fps', d)
+    assert 'steps(8' in anim['tf'] and 'steps(4' in anim['tf'], anim['tf']
+    # ...and the frame actually advances: background-position changes over time.
+    pos0 = working.first.evaluate("el => getComputedStyle(el).backgroundPosition")
+    page.wait_for_timeout(120)
+    pos1 = working.first.evaluate("el => getComputedStyle(el).backgroundPosition")
+    assert pos0 != pos1, ('gears did not turn', pos0, pos1)
+    # Grass: the rendered field, not a couple of tiles - a period of at least
+    # 1536x768 (Ben: "looks like you just used a few").
+    bg = page.evaluate("getComputedStyle(document.querySelector('.ship-flow-wrap')).backgroundSize")
+    assert bg == '1536px 768px', bg
+    browser.close()
+
 # Order 14 evidence: at least three frames at different points in the swing,
 # proving arms actually moved (not a single still) AND that two different
 # inserters are staggered (not swinging in lockstep). Real wall-clock waits
@@ -618,43 +683,47 @@ with sync_playwright() as p:
 with sync_playwright() as p:
     browser, page = render(p, pipeline_fixture)
 
-    # Order 17 #4 put two `.ship-inserter` per arrow (loading=0, unloading=1).
-    # `which` lets this proof track a specific one across frames.
+    # Real timing (Ben, 2:30 PM): the swing is 0.2083s out and 0.2083s back,
+    # then the arm WAITS at the pickup side for the rest of its period (4s at
+    # 6/h) - so three wall-clock frames would mostly catch it waiting. The
+    # frames are taken by seeking every swing/carry animation to the same
+    # point of its own active time (0 = pickup, 104ms = mid-swing, 208ms =
+    # the drop) and pausing there, so each screenshot is a real rendered
+    # frame of the real animation at a known instant.
+    def seek_all(ms):
+        page.evaluate("ms => document.getAnimations().forEach(a => { if (a.id === 'inserter-swing' || a.id === 'inserter-carry') { a.pause(); a.currentTime = ms; } })", ms)
     def arm_transform(sq, which=0):
         return page.locator(
             '.ship-arrow[data-square-left="' + sq + '"] > .ship-inserter'
         ).nth(which).locator('.inserter-arm').evaluate("el => getComputedStyle(el).transform")
-
+    def item_opacity(sq, which=0):
+        return page.locator(
+            '.ship-arrow[data-square-left="' + sq + '"] > .ship-inserter'
+        ).nth(which).locator('.inserter-item').evaluate("el => getComputedStyle(el).opacity")
     def transforms():
         return {
             (sq, which): arm_transform(sq, which)
             for sq in ('issues open', 'prs open', 'approved')
             for which in (0, 1)
         }
-
     frames = []
-    for i in range(3):
+    for i, ms in enumerate((0, 104, 208)):
+        seek_all(ms)
+        page.wait_for_timeout(60)
         page.locator('#ship-flow').screenshot(path=str(OUT / ('swing-frame-' + str(i + 1) + '.png')))
         frames.append(transforms())
-        if i < 2:
-            page.wait_for_timeout(650)
-
-    # Each moving inserter's own transform changed across the three frames -
-    # it swung, this was not a static screenshot repeated three times. This
-    # now covers BOTH inserters (loading and unloading) on each belt.
+    # Each moving inserter's arm is at three different positions at pickup,
+    # mid-swing and drop - both inserters on every belt.
     for sq in ('issues open', 'prs open', 'approved'):
         for which in (0, 1):
-            values = {f[(sq, which)] for f in frames}
-            assert len(values) > 1, (sq, which, frames)
-    # At any single frame, two inserters with different measured rates are at
-    # DIFFERENT points of the arc - staggered, not lockstep.
-    assert frames[0][('issues open', 0)] != frames[0][('prs open', 0)], frames[0]
-    # Order 17 #4 "not mirror images of each other": on the SAME belt, the
-    # loading and unloading inserters must ALSO be at different arc positions
-    # at a given instant - two arms moving in lockstep would read as one
-    # mirrored motion, not two independent handoffs.
-    for sq in ('issues open', 'prs open', 'approved'):
-        assert frames[0][(sq, 0)] != frames[0][(sq, 1)], (sq, frames[0])
+            values = [f[(sq, which)] for f in frames]
+            assert len(set(values)) == 3, (sq, which, values)
+    # The item is in the closed hand through the swing and gone right after the drop.
+    seek_all(104); assert item_opacity('issues open') == '1', 'item must be in hand mid-swing'
+    seek_all(220); assert item_opacity('issues open') == '0', 'item must be dropped after 0.2083s'
+    # (Stagger - loading vs unloading, belt vs belt - is proven above via
+    # arm_style()'s phase, on the live clocks; seeking here put every arm on
+    # one clock on purpose, so it is not re-checked after this pass.)
     browser.close()
 
 # Reduced-motion pass, in a fresh context (emulate_media must be set before
@@ -667,11 +736,14 @@ with sync_playwright() as p:
     moving_arms = page.locator('.ship-inserter.moving .inserter-arm')
     assert moving_arms.count() > 0
     for i in range(moving_arms.count()):
-        name = moving_arms.nth(i).evaluate("el => getComputedStyle(el).animationName")
-        assert name == 'none', name
+        n = moving_arms.nth(i).evaluate("el => getComputedStyle(el).animationName + '/' + el.getAnimations().length")
+        assert n == 'none/0', n
     for i in range(page.locator('.ship-inserter.moving .inserter-item').count()):
-        name = page.locator('.ship-inserter.moving .inserter-item').nth(i).evaluate("el => getComputedStyle(el).animationName")
-        assert name == 'none', ('held item still animates under reduced motion', name)
+        n = page.locator('.ship-inserter.moving .inserter-item').nth(i).evaluate("el => getComputedStyle(el).animationName + '/' + el.getAnimations().length")
+        assert n == 'none/0', ('held item still animates under reduced motion', n)
+    # ...and the assembler gears stop too.
+    assert page.locator('.ship-sprite.asm3.working').count() > 0
+    assert page.eval_on_selector('.ship-sprite.asm3.working', "el => getComputedStyle(el).animationName") == 'none'
     page.locator('#ship-flow').screenshot(path=str(OUT / 'strip-1440-reduced-motion.png'))
     browser.close()
 

@@ -16,6 +16,12 @@ URL, so this is ordinary personal use of assets he already paid for.
 - Do not copy these files into any other project without re-checking this
   note applies there too.
 
+## Real scale (2026-09-12, Ben: "use the real inserter rotation speed and positions from the lua. for the rest of the sprites, too")
+
+One Factorio tile = 24 CSS px on the strip. Every `*-24.png` / `*-sheet.png` below is the game's own hi-res sheet resampled at 0.375 (its Lua `scale = 0.5` x 24/32), so entity footprints are exact: assembling machine 3x3, steel chest 1x1, fast inserter 1x1, belt one tile wide, rocket silo 9x9. Numbers come straight from `base/prototypes/entity/entities.lua` and `transport-belts.lua`: fast-inserter `rotation_speed = 0.04`, `pickup_position = {0,-1}`, `insert_position = {0,1.2}`, platform 105x79 @0.5, hands 72x164 @0.25; assembling-machine-3 32 frames 214x237 @0.5 (8 per line, `animation_speed 0.5`); steel-chest 64x80 @0.5; transport-belt `speed = 0.03125`, frames 128x128 @0.5; rocket-silo layers (shadow, hole, door back/front, base, front) at their `util.by_pixel` shifts.
+
+- `assembler/assembling-machine-3-sheet.png` (640x356, 32 frames of 80x89), `chest/steel-chest-24.png`, `inserter/fast-inserter-platform-24.png` (4 frames of 39x30), `belt/belt-tile-south-24.png` / `belt-tile-north-24.png` (the frame's own 64x64 tile centre), `silo/rocket-silo-24.png` (261x261 composite of the six static layers over the 216px footprint), `ground/ground-grass.jpg` (see below). Source sheets were staged in the session scratchpad only, never committed.
+
 ## Directories (keep this list matching what's actually on disk)
 
 - `assembler/`, `belt/`, `chest/`, `inserter/`, `lab/`, `radar/`, `signal/`,
@@ -23,10 +29,10 @@ URL, so this is ordinary personal use of assets he already paid for.
   `inserter/` holds the FAST inserter sheets (platform, hand-base, hand-open,
   hand-closed - 2026-09-12, Ben: "swap out all the long handled inserters
   with fast inserters"); the long-handed sheets they replaced were deleted,
-  not kept alongside. `belt/` also carries `belt-tile-vertical.png` /
-  `belt-tile-vertical-up.png`: the sheet's own south/north straight-belt
-  frames cropped to one 64px tread period and pre-scaled to the strip's
-  28px belt width.
+  not kept alongside. `belt/` carries `belt-tile-south-24.png` /
+  `belt-tile-north-24.png` (see Real scale above; the earlier 28px
+  `belt-tile-vertical*.png` pair was deleted when the strip went to the
+  24px tile).
 - `remnants/` — wreckage art shown for a stage/arrow with no measured data.
 - `biter/` (order 15, 2026-09-11) — `small-biter.png`, `medium-biter.png`,
   `small-biter-corpse.png`. Used for the `BUGS FOUND` stage: corpse at a
@@ -42,9 +48,12 @@ URL, so this is ordinary personal use of assets he already paid for.
   `queue_router.py` - so the ground stays close to its real tone). The
   source sheet itself was never committed or copied into this repo - only
   the small derived tile is. `ground-grass.jpg` (Ben, 10:50 AM 2026-09-12:
-  "more of a grassland backdrop") — two 1024x256 runs of `grass-1.png`'s
-  big blended variants (the dirt-patch-and-tuft ones his rig sits on)
-  stacked into 1024x512, saved as JPEG (opaque texture; the PNG was 1.5MB).
+  "more of a grassland backdrop", then "make the grass better - looks like
+  you just used a few instead of rendering a nice background") — a rendered
+  4096x2048 field laid the way the game's autoplace does: `grass-1.png`'s
+  sixteen 256px variants at random, over-stamped with its 128px (18%) and
+  64px (10%) variants, then resampled to 1536x768 at the strip's 0.375
+  scale. JPEG (opaque texture).
   The 3.5MB source sheet was staged in the session scratchpad only, never
   committed. Same licensing boundary — internal LAN dashboard only.
 - `items/` (order 17, 2026-09-11) — the real Factorio item chain carried
