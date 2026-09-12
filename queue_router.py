@@ -5469,6 +5469,43 @@ def _build_ship_arrows(result, rates):
 REVIEW_ROUTED_LABEL_SUFFIX = "-review"
 GATE_VERDICT_CHECK_NAME = "gate-verdict-check-review"
 
+# Labels that deliberately park a PR - nobody but a human pulled it off the
+# belt. Deliberately excludes any "*-review" label (gate-review,
+# galadriel-review): those ROUTE a PR to a reviewer, they don't park it.
+# green_waiting still needs to treat "*-review" as blocking (a PR mid-gate-review
+# isn't green yet), so it ORs this set with the review-routed ones below; the
+# in_review/changes_requested classification must NOT, because there a routed
+# review label is the signal a reviewer owns the item, not a hold (council
+# brief, monitor-in-review-truth-20260911).
+HOLD_LABELS = {"do-not-merge", "needs-repair", "hold", "blocked-on-ben"}
+
+
+def _classify_review_prs(all_open_prs):
+    """Split open PRs into the four physically distinct belt states so one
+    square never hides four different things again (monitor-in-review-truth-
+    20260911). A PR lands in exactly one bucket, checked in this priority:
+    draft (not offered for review yet) > held (deliberately parked) > its
+    reviewDecision. Returns (in_review, changes_requested, drafts, held) -
+    four lists of PR dicts, not counts, so callers can derive counts and
+    last-activity timestamps from the same classification.
+    """
+    in_review, changes_requested, drafts, held = [], [], [], []
+    for pr in all_open_prs:
+        if pr["isDraft"]:
+            drafts.append(pr)
+            continue
+        labels = {l["name"].lower() for l in pr.get("labels", [])}
+        if HOLD_LABELS & labels:
+            held.append(pr)
+            continue
+        decision = pr.get("reviewDecision")
+        if decision == "REVIEW_REQUIRED":
+            in_review.append(pr)
+        elif decision == "CHANGES_REQUESTED":
+            changes_requested.append(pr)
+    return in_review, changes_requested, drafts, held
+
+
 def _get_shipping_readiness(token, repo=None, default_branch="main"):
     """Read the oldest 100 open PRs and the repo's merge queue together.
     SHIP-SPARK-3 item 4: mergeQueue(branch: default_branch) legitimately returns
@@ -5530,10 +5567,11 @@ def _get_shipping_readiness(token, repo=None, default_branch="main"):
     # (including UNKNOWN) PRs have not established merge readiness.
     # Only CLEAN establishes green checks; BLOCKED and UNSTABLE are not green.
     # Queued PRs are already being fed into the line, so are not waiting.
-    # do-not-merge explicitly forbids merging; needs-repair needs fixes;
-    # hold intentionally pauses work; blocked-on-ben awaits Ben's decision.
-    # gate-review and galadriel-review await an open review gate.
-    held = {"do-not-merge", "needs-repair", "hold", "blocked-on-ben", "gate-review", "galadriel-review"}
+    # HOLD_LABELS (do-not-merge/needs-repair/hold/blocked-on-ben) explicitly park
+    # a PR; gate-review and galadriel-review additionally block green-waiting
+    # because they mean an open review gate, even though for in_review/
+    # changes_requested those same two labels mean the opposite - see HOLD_LABELS.
+    held = HOLD_LABELS | {"gate-review", "galadriel-review"}
     waiting = [{"number": pr["number"], "title": pr["title"]} for pr in prs
             if not pr["isDraft"] and pr["reviewDecision"] == "APPROVED"
             and pr["mergeable"] == "MERGEABLE" and pr["mergeStateStatus"] == "CLEAN"
@@ -5954,10 +5992,37 @@ def get_pipeline_status(repo=None, default_branch=None, force_refresh=False):
                 routed_ats = [p["updatedAt"] for p in routed if p.get("updatedAt")]
                 result["review_routed_last_at"] = max(routed_ats) if routed_ats else None
 
-                in_rev = [p for p in all_open_prs if p.get("reviewDecision") in ("REVIEW_REQUIRED", "CHANGES_REQUESTED")]
+                # monitor-in-review-truth-20260911: "in review" is a factory-belt square
+                # with ONE owner - a reviewer holding the item right now. The old bucket
+                # (REVIEW_REQUIRED or CHANGES_REQUESTED, no draft/hold exclusion) mixed
+                # four states behind one number: reviewer-blocked, author-blocked
+                # (changes requested), not-yet-offered (draft), and deliberately parked
+                # (held). _classify_review_prs splits those into the four buckets a PR
+                # can actually be in; each bucket below gets its own honest count.
+                in_rev, changes_requested, off_belt_drafts, off_belt_held = _classify_review_prs(all_open_prs)
+
                 result["in_review"] = len(in_rev)
                 rev_subs = [rv.get("submittedAt") for p in in_rev for rv in (p.get("reviews") or []) if rv.get("submittedAt")]
                 result["in_review_last_at"] = max(rev_subs) if rev_subs else None
+
+                # CHANGES_REQUESTED is not review - on the belt it is the item travelling
+                # BACKWARD for rework. That is the AUTHOR's ball, not a reviewer's, so it
+                # gets its own count rather than being folded back into "in review".
+                result["changes_requested"] = len(changes_requested)
+                cr_subs = [rv.get("submittedAt") for p in changes_requested for rv in (p.get("reviews") or [])
+                           if rv.get("state") == "CHANGES_REQUESTED" and rv.get("submittedAt")]
+                result["changes_requested_last_at"] = max(cr_subs) if cr_subs else None
+
+                # Drafts and held PRs are not on the belt at all - they must not inflate
+                # in_review or changes_requested, but they also must not silently vanish,
+                # so they get their own "not on belt" readout (an abandoned draft would
+                # otherwise inflate a stage forever, since nothing on the belt can act on
+                # it).
+                result["not_on_belt_drafts"] = len(off_belt_drafts)
+                result["not_on_belt_held"] = len(off_belt_held)
+                result["not_on_belt"] = result["not_on_belt_drafts"] + result["not_on_belt_held"]
+                off_belt_ats = [p["updatedAt"] for p in off_belt_drafts + off_belt_held if p.get("updatedAt")]
+                result["not_on_belt_last_at"] = max(off_belt_ats) if off_belt_ats else None
 
                 # statusCheckRollup was dropped from the bulk PR-list query (it, not the
                 # row count, was the 504 cause on this repo's 48 open PRs - see
@@ -5999,7 +6064,10 @@ def get_pipeline_status(repo=None, default_branch=None, force_refresh=False):
                     ("has_merge_queue", None), ("prs_oldest_min", None),
                     ("prs_open_last_at", None), ("review_routed", None),
                     ("review_routed_last_at", None), ("in_review", None),
-                    ("in_review_last_at", None), ("gate_verdicts", None),
+                    ("in_review_last_at", None), ("changes_requested", None),
+                    ("changes_requested_last_at", None), ("not_on_belt_drafts", None),
+                    ("not_on_belt_held", None), ("not_on_belt", None),
+                    ("not_on_belt_last_at", None), ("gate_verdicts", None),
                     ("gate_verdicts_last_at", None), ("conflicted", None),
                     ("conflicted_last_at", None), ("resolved", None),
                     ("resolved_last_at", None), ("approved", None), ("approved_last_at", None),
@@ -9057,6 +9125,8 @@ const SHIP_BLANK_PIPELINE = {
     green_wait_avg_min: null, green_wait_n: null, green_wait_excluded: null, green_wait_prs: [],
     review_routed: null, review_routed_last_at: null,
     in_review: null, in_review_last_at: null,
+    changes_requested: null, changes_requested_last_at: null,
+    not_on_belt_drafts: null, not_on_belt_held: null, not_on_belt: null, not_on_belt_last_at: null,
     gate_verdicts: null, gate_verdicts_last_at: null,
     conflicted: null, conflicted_last_at: null,
     resolved: null, approved: null, approved_last_at: null,
@@ -9243,7 +9313,18 @@ function shipFlowHtml(d) {
             // NEW decorative arrow (no formal rate instrument existed for this
             // transition either before or after the rebalance): in review was
             // previously row 1's own dead end and never needed one.
-            shipStage(d.in_review ?? null, 'in review', '', '', null, HELP.inReview, '', 'in-review', [], null, null, null, null, d.in_review_last_at) + shipArrow('in review', '👁', null, 'PRs currently under human/AI review', null, null, false, String(d.in_review ?? '?'), null, 'left') +
+            // monitor-in-review-truth-20260911: 'in review' no longer counts drafts,
+            // held PRs, or changes-requested rework - those are real signal Ben could
+            // not previously see, so they ride along as this stage's two sub-lines
+            // rather than silently vanishing when the miscount was fixed.
+            shipStage(d.in_review ?? null, 'in review',
+                '',
+                (d.changes_requested === null || d.changes_requested === undefined) ? '' :
+                    'rework: ' + d.changes_requested,
+                null, HELP.inReview, '', 'in-review', [], null, null,
+                (d.not_on_belt === null || d.not_on_belt === undefined) ? '' :
+                    'not on belt: ' + d.not_on_belt,
+                null, d.in_review_last_at) + shipArrow('in review', '👁', null, 'PRs currently under human/AI review', null, null, false, String(d.in_review ?? '?'), null, 'left') +
             // Round 3 (Elrond review, PR #35): gate_verdicts has been null
             // since PR #34 dropped statusCheckRollup - the same "I cannot
             // know this" status as 'resolved', so it renders 'n/a' the same
@@ -9646,7 +9727,7 @@ const HELP = {
     bugsFound:     'BUGS FOUND - issues opened in the last 24 hours on the selected repository.',
     dispatched:    'DISPATCHED - live automated worker lanes currently spawned to work the backlog.',
     reviewRouted:  'REVIEW ROUTED - open pull requests carrying a reviewer label, meaning they have been handed to a specific reviewer.',
-    inReview:      'IN REVIEW - open pull requests awaiting a review verdict (review required or changes requested).',
+    inReview:      'IN REVIEW - open, non-draft, non-held pull requests waiting on a reviewer for a first verdict. A reviewer is the one blocked here, not the author. "rework" (below) counts pull requests sent back with changes requested - that is the author’s ball, not a reviewer’s. "not on belt" counts drafts (never offered for review) and pull requests someone deliberately parked with a hold label - neither is stuck waiting on anyone right now.',
     gateVerdicts:  'GATE VERDICTS - open pull requests whose automated gate-verdict check has not passed.',
     conflicted:    'CONFLICTED - open pull requests GitHub reports as having a merge conflict.',
     resolved:      'RESOLVED - merge conflicts cleared in the last 24 hours. Shown as n/a when there is no history store to detect the clearing event cheaply.',
