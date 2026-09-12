@@ -230,6 +230,20 @@ with sync_playwright() as p:
     row2 = ['gate verdicts', 'conflicted', 'resolved', 'approved', 'in line', 'merged today']
     assert [flows_up(sq) for sq in row1] == [False, True, False, True, False, True], [(sq, flows_up(sq)) for sq in row1]
     assert [flows_up(sq) for sq in row2] == [True, False, True, False, True, False], [(sq, flows_up(sq)) for sq in row2]
+    # Ben: "the inserters are placing on the start and removing at the end"
+    # - the loading inserter (DOM-first) sits on the upstream stage's side of
+    # the belt: left of it in row 1 (flows left-to-right), RIGHT of it in the
+    # row-reversed row 2.
+    def load_side(square):
+        arrow = page.locator('.ship-arrow[data-square-left="' + square + '"]')
+        load = arrow.locator('> .ship-inserter').nth(0).bounding_box()
+        belt = arrow.locator('.ship-belt').bounding_box()
+        return 'right' if load['x'] > belt['x'] else 'left'
+    for sq in row1:
+        assert load_side(sq) == 'left', (sq, 'row 1 loading inserter must be left of the belt')
+    for sq in row2:
+        assert load_side(sq) == 'right', (sq, 'row 2 loading inserter must be right of the belt')
+
     # Row-end belts always carry work DOWN to the next row.
     for sq in ('in review', 'folded'):
         assert not flows_up(sq), (sq, 'row-end belt must flow down')

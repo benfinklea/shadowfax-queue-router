@@ -7665,6 +7665,11 @@ gap:0;padding:2px 0;align-self:center;align-items:center}
    rather than floating at the belt's midpoint. */
 .ship-inserter.align-top{align-self:flex-start}
 .ship-inserter.align-bottom{align-self:flex-end}
+/* Ben: row 2 flows right-to-left, so its loading inserter (DOM-first) must
+   sit on the RIGHT of the belt, beside the stage it loads from, and the
+   unloading one on the left - mirror the arrow's own row to match the
+   row-reversed row it sits in. */
+.ship-row-2 .ship-arrow-vbelt{flex-direction:row-reverse}
 /* The belt itself: a scrolling texture tile carrying the order-17 item
    chain. State is rendered, never captioned - order 9's "hover is where the
    numbers live" (native title attr on the arrow, unchanged). LORE order 17
