@@ -7632,7 +7632,7 @@ gap:1px;padding:0 2px;border:0;background:transparent;color:var(--arrow-color);c
    bottom (unloading into the stage below). Height is set by
    positionShipElbows to span exactly from the top of the from-stage to
    the bottom of the to-stage. */
-.ship-arrow-vertical{position:absolute;display:block;flex:0 0 auto;width:58px;height:200px;
+.ship-arrow-vertical{position:absolute;display:block;flex:0 0 auto;width:64px;height:200px;
 padding:0;z-index:4}
 .ship-arrow-vertical .ship-belt-vertical{position:absolute;top:0;bottom:0;height:auto;left:36px}
 .ship-arrow-vertical .ship-inserter{position:absolute;left:0}
@@ -7641,7 +7641,7 @@ padding:0;z-index:4}
 /* Row 2 ends on the LEFT (row-reverse), so its row-end belt sits on the
    left of the stage with the inserters on the belt's right. */
 .ship-arrow-vertical.ship-arrow-left .ship-belt-vertical{left:0}
-.ship-arrow-vertical.ship-arrow-left .ship-inserter{left:24px}
+.ship-arrow-vertical.ship-arrow-left .ship-inserter{left:30px}
 /* Ben's own built reference (a vertical belt bridging two side-by-side
    buildings) - correction after the first pass stacked the inserters
    above/below the belt: "the inserters go to the left and right of the
@@ -7691,7 +7691,7 @@ animation:ship-belt-flow linear infinite;animation-duration:var(--belt-duration,
    will show more items on the belt so I can see when they're backed up" -
    taller than the original 72px so a jam visibly piles up along real belt
    length, not just a couple of dots. */
-.ship-belt-vertical{width:22px;height:140px;flex:0 0 auto}
+.ship-belt-vertical{width:28px;height:140px;flex:0 0 auto}
 /* Ben's built reference: each belt segment's own chevron faces the actual
    direction of travel (down), not sideways - the base tile's chevron is
    baked in pointing right (it's a horizontal-belt asset), so a vertical
@@ -7699,16 +7699,21 @@ animation:ship-belt-flow linear infinite;animation-duration:var(--belt-duration,
    rotated -90deg/clockwise from the same source so a rightward chevron
    becomes a downward one) rather than trying to CSS-rotate the live
    non-square element, which would fight its own width/height. */
+/* Ben: "you've not assembled the transport belts correctly" - the first
+   vertical tile was the HORIZONTAL frame rotated, which only carries one
+   rail and tiled with seams. These are the sheet's own north/south frames
+   (both side rails, one 64px tread period), pre-scaled to exactly the
+   belt's width so repeat-y gives one seamless column. */
 .ship-belt-vertical .ship-belt-track{background-image:url('/static/factorio/belt/belt-tile-vertical.png');
-background-size:18px 18px;background-repeat:repeat;animation-name:ship-belt-flow-vertical}
-@keyframes ship-belt-flow-vertical{to{background-position-y:18px}}
+background-size:28px 25px;background-repeat:repeat-y;animation-name:ship-belt-flow-vertical}
+@keyframes ship-belt-flow-vertical{to{background-position-y:25px}}
 /* Ben's built reference: consecutive in-row belts alternate their own flow
    direction (down, up, down, up...), each with its own pre-rotated chevron
    tile facing the direction it actually travels - never a downward tile on
    a belt that flows up. */
 .ship-belt-vertical-up .ship-belt-track{background-image:url('/static/factorio/belt/belt-tile-vertical-up.png');
 animation-name:ship-belt-flow-vertical-up}
-@keyframes ship-belt-flow-vertical-up{to{background-position-y:-18px}}
+@keyframes ship-belt-flow-vertical-up{to{background-position-y:-25px}}
 .ship-belt-items{position:absolute;inset:0}
 .ship-belt-item{position:absolute;top:50%;left:50%;width:16px;height:16px;transform:translate(-50%,-50%);
 filter:drop-shadow(0 1px 1px rgba(0,0,0,.6))}
