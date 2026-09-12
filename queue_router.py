@@ -7300,9 +7300,14 @@ image-rendering:pixelated;opacity:.85;filter:var(--ground-shadow)}
    left-to-right (90deg), horizontal right-to-left (-90deg), and vertical,
    always reaching downward for a top-to-bottom belt (180deg) - instead of a
    separate hardcoded keyframe/override pair per direction. */
-.ship-inserter .inserter-arm{position:absolute;left:10px;top:0;width:14px;height:32px;
+/* Ben: "the base of the swinging arm should be midpoint on the tripod".
+   The platform frame's hub sits at ~(15.7, 20.6) of the 34x32 slot (105x79
+   native frame drawn at 30x23, bottom-left); the arm sprite's mounting
+   base is its very bottom edge, so the pivot is 50% 100% of the arm and
+   the arm is placed so that point lands on the hub. */
+.ship-inserter .inserter-arm{position:absolute;left:9px;top:-11px;width:14px;height:32px;
 background-repeat:no-repeat;background-size:14px 32px;image-rendering:pixelated;
-transform-origin:50% 85%;transform:rotate(var(--arm-rest,90deg));transition:transform .4s ease,opacity .4s ease}
+transform-origin:50% 100%;transform:rotate(var(--arm-rest,90deg));transition:transform .4s ease,opacity .4s ease}
 .ship-inserter.idle .inserter-arm{opacity:.4}
 /* LORE order 14 "the inserters must swing": a real Factorio inserter's arm
    rotates through roughly 180 degrees between the pickup and drop side - the
@@ -8717,9 +8722,13 @@ const SHIP_VBELT_ROW_ORDER = [
     ['gate verdicts', 'conflicted', 'resolved', 'approved', 'in line', 'merged today'],
 ];
 function shipVbeltFlowsDown(square) {
-    for (const row of SHIP_VBELT_ROW_ORDER) {
-        const idx = row.indexOf(square);
-        if (idx !== -1) return idx % 2 === 0;
+    for (let r = 0; r < SHIP_VBELT_ROW_ORDER.length; r++) {
+        const idx = SHIP_VBELT_ROW_ORDER[r].indexOf(square);
+        // Ben: the row-end belt into row 2 "comes down on the right, so the
+        // next ones should be up, then down, then up" - row 1 has nothing
+        // feeding it so it starts down; every later row starts UP because
+        // the row-end belt that just fed it came down.
+        if (idx !== -1) return r === 0 ? idx % 2 === 0 : idx % 2 === 1;
     }
     return true;
 }
@@ -9057,7 +9066,12 @@ function positionShipElbows() {
         const bottom = Math.max(f.bottom, t.bottom);
         elbow.style.top = (top - wrapRect.top) + 'px';
         elbow.style.height = (bottom - top) + 'px';
-        const edge = side === 'right' ? Math.max(fb.right, tb.right) + 4 : Math.min(fb.left, tb.left) - 4 - elbow.offsetWidth;
+        // Sit just outside the two machines (sprites), then clamp inside the
+        // strip - row 3's box being wider than row 2's last had pushed the
+        // whole row-2 -> row-3 belt off the left edge of the frame.
+        let edge = side === 'right' ? Math.max(f.right, t.right) + 4 : Math.min(f.left, t.left) - 4 - elbow.offsetWidth;
+        const flowRect = document.getElementById('ship-flow').getBoundingClientRect();
+        edge = Math.max(flowRect.left + 2, Math.min(edge, flowRect.right - 2 - elbow.offsetWidth));
         elbow.style.left = (edge - wrapRect.left) + 'px';
     };
     // Row 1 ends on the right at 'in review'; row 2 (row-reverse) starts on

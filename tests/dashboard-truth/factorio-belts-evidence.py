@@ -222,6 +222,18 @@ with sync_playwright() as p:
         b = page.locator('.ship-arrow[data-square-left="' + square + '"] .ship-belt').bounding_box()
         assert b['height'] > b['width'], (square, b)
 
+    # Ben: chevrons alternate along a row, and row 2 starts UP because the
+    # row-end belt feeding it came down on the right. Row 1 starts down.
+    def flows_up(square):
+        return 'ship-belt-vertical-up' in page.locator('.ship-arrow[data-square-left="' + square + '"] .ship-belt').get_attribute('class')
+    row1 = ['bugs found', 'issues open', 'dispatched', 'prs open', 'ci q/run', 'review routed']
+    row2 = ['gate verdicts', 'conflicted', 'resolved', 'approved', 'in line', 'merged today']
+    assert [flows_up(sq) for sq in row1] == [False, True, False, True, False, True], [(sq, flows_up(sq)) for sq in row1]
+    assert [flows_up(sq) for sq in row2] == [True, False, True, False, True, False], [(sq, flows_up(sq)) for sq in row2]
+    # Row-end belts always carry work DOWN to the next row.
+    for sq in ('in review', 'folded'):
+        assert not flows_up(sq), (sq, 'row-end belt must flow down')
+
     # Round 2 (Elrond review, PR #35, defect 1): no stage may ever render a
     # bare '?' - it reads as indistinguishable from the no-data wreckage state
     # the sprite/remnant already carries. Every one of the 15 stages gets a
@@ -280,7 +292,11 @@ with sync_playwright() as p:
         from_box = page.locator('[data-square="' + from_sq + '"]').bounding_box()
         # Row 3's lone stage sits under row 2's last stage: the belt must be
         # a straight column beside both, never overlapping either.
-        assert elbow_box['x'] >= from_box['x'] + from_box['width'] or elbow_box['x'] + elbow_box['width'] <= from_box['x'], (elbow_id, 'overlaps from-stage', elbow_box, from_box)
+        # Ben: "we lost the transport belt going from row 2 to 3" - the whole
+        # column must be inside the strip's frame, never clipped off an edge.
+        assert elbow_box['x'] >= flow_left and elbow_box['x'] + elbow_box['width'] <= flow_right, (elbow_id, 'row-end belt outside the frame', elbow_box, flow_left, flow_right)
+        belt_box = page.locator('#' + elbow_id + ' .ship-belt').bounding_box()
+        assert belt_box['x'] >= flow_left and belt_box['x'] + belt_box['width'] <= flow_right, (elbow_id, 'row-end belt column clipped', belt_box, flow_left, flow_right)
 
     # Order 14 "the inserters must swing": a moving inserter's arm carries a
     # real animation, its duration is BOUND to the measured rate (two
