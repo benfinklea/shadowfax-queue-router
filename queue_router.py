@@ -230,10 +230,10 @@ FLEET_NODES = {
     # address, which silently duplicated one box's metrics onto two tiles. The
     # farthing .local names DID each resolve correctly when probed; they are pinned
     # only because the whole map is pinned for one night. Revert with the plan.
-    "northfarthing": {"ssh_host": FLEET_IPS["northfarthing"], "ssh_user": "ben", "wol_mac": "84:47:09:65:43:c3"},
-    "eastfarthing":  {"ssh_host": FLEET_IPS["eastfarthing"], "ssh_user": "ben", "wol_mac": "84:47:09:62:ef:60"},
-    "southfarthing": {"ssh_host": FLEET_IPS["southfarthing"], "ssh_user": "ben", "wol_mac": "84:47:09:65:42:5b"},
-    "westfarthing":  {"ssh_host": FLEET_IPS["westfarthing"], "ssh_user": "ben", "wol_mac": "84:47:09:65:42:85"},
+    "northfarthing": {"ssh_host": FLEET_IPS["northfarthing"], "ssh_user": "ben", "wol_mac": "84:47:09:65:43:c0"},
+    "eastfarthing":  {"ssh_host": FLEET_IPS["eastfarthing"], "ssh_user": "ben", "wol_mac": "84:47:09:62:ef:69"},
+    "southfarthing": {"ssh_host": FLEET_IPS["southfarthing"], "ssh_user": "ben", "wol_mac": "84:47:09:65:42:58"},
+    "westfarthing":  {"ssh_host": FLEET_IPS["westfarthing"], "ssh_user": "ben", "wol_mac": "84:47:09:65:42:88"},
     # Was {"local": True} when this service ran ON shadowfax. It moved to gandalf
     # 2026-07-21, so shadowfax is now just another remote box reached over SSH.
     "shadowfax":     {"ssh_host": FLEET_IPS["shadowfax"], "ssh_user": "ben"},
