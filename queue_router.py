@@ -7590,6 +7590,14 @@ gap:1px;padding:0 2px;border:0;background:transparent;color:var(--arrow-color);c
    unloading inserter top to bottom. */
 .ship-arrow-vertical{position:absolute;flex-direction:column;flex:0 0 auto;height:auto;
 width:38px;gap:2px;padding:2px 0;z-index:4}
+/* Ben's own built reference (a vertical belt bridging two side-by-side
+   buildings, both inserters bending toward it) showed the row layout never
+   had to change for this - only the belt segment WITHIN each arrow slot
+   does. Same column stack as .ship-arrow-vertical above, but stays in the
+   row's normal flex flow (not absolute) since it connects two stages that
+   are still side by side, not two different rows. */
+.ship-arrow-vbelt{flex-direction:column;flex:0 0 auto;height:auto;
+width:38px;gap:2px;padding:2px 0;align-self:center}
 /* The belt itself: a scrolling texture tile carrying the order-17 item
    chain. State is rendered, never captioned - order 9's "hover is where the
    numbers live" (native title attr on the arrow, unchanged). LORE order 17
@@ -8719,7 +8727,7 @@ function shipArrow(square, glyph, arrow, description, legacyCount, width, isBott
     const backlogText = (backlog === null || backlog === undefined) ? 'unknown waiting' : backlog + ' waiting';
     const label = shipEscape(description + ': ' + rateText + ', ' + backlogText + ', ' + shipDrainText(drain));
     const tag = agentLane ? 'button' : 'span';
-    const dirCls = (dir === 'left' ? ' ship-arrow-left' : '') + (vertical ? ' ship-arrow-vertical' : '');
+    const dirCls = (dir === 'left' ? ' ship-arrow-left' : '') + (vertical ? (elbowId ? ' ship-arrow-vertical' : ' ship-arrow-vbelt') : '');
     // Six arrows (bugs found/dispatched/review routed/gate verdicts/conflicted/
     // resolved) have never had a formal rate/backlog instrument - only a plain
     // count via arrowLabel (e.g. "5", or "?"/"n/a" when unavailable). Parsed
@@ -9398,11 +9406,11 @@ function shipFlowHtml(d) {
             // LORE order 15: unknown bugs_found_24h renders 'n/a' (Round 3's
             // rule - never empty, never a bare '?') the same way gate_verdicts
             // and resolved already do.
-            shipStage(d.bugs_found_24h === null || d.bugs_found_24h === undefined ? 'n/a' : d.bugs_found_24h, 'bugs found', bugsCls, '', null, HELP.bugsFound, '', 'bugs-found', [], null, null, null, null, d.last_issue_created_at) + shipArrow('bugs found', '⚡', null, 'Issues created in the last 24h', null, null, false, String(d.bugs_found_24h ?? '?'), null, 'right') +
-            shipStage(d.issues_open, 'issues open', '', '', null, HELP.issues, '', null, null, null, shipIssuesRatePanel(sp.issues), null, arrowByKey['issues-prs'] && arrowByKey['issues-prs'].drain_label, d.last_issue_created_at) + shipArrow('issues open', '🤖', arrowByKey['issues-prs'], 'PRs opened in the last hour, from GitHub search - click for live agent lanes', null, wFor('issues-prs'), isB('issues-prs'), arrowByKey['issues-prs'] && arrowByKey['issues-prs'].label, null, 'right') +
-            shipStage(d.dispatched ?? null, 'dispatched', '', '', null, HELP.dispatched, '', 'dispatched', [], null, null, null, null, d.dispatched_last_at) + shipArrow('dispatched', '🤖', null, 'Live dispatched lanes', null, null, false, String(d.dispatched ?? '?'), null, 'right') +
-            shipStage(d.prs_open, 'prs open', '', prsOld.sub, null, HELP.prs + shipOldestWords('prs open', 'age of the oldest open, non-draft pull request'), prsOld.cls, null, null, null, shipHistorySpark(sp.prs, 'prs'), null, null, d.prs_open_last_at) + shipArrow('prs open', '⚙', arrowByKey['prs-ci'], 'Distinct PRs with a CI run started this hour, from the GitHub workflow-runs list', d.ci_queued, wFor('prs-ci'), isB('prs-ci'), null, null, 'right') +
-            shipStage(ciNum, 'ci q/run', ciCls, ciOld.sub, null, HELP.ciqr + shipOldestWords('ci q/run', 'how long the oldest queued run in the last 48 h has waited to start (since it was re-queued, if it was re-run)') + ' Green waiting: ' + greenWaitingText + ' PRs approved and green but not yet enqueued.' + greenWaitWords, ciOld.cls, null, null, null, shipHistorySpark(sp.ci, 'ci'), 'green waiting: ' + greenWaitingText + (greenSub ? ' · ' + greenSub : '') + (greenWaitSub ? ' · ' + greenWaitSub : ''), null, d.ci_last_run_started_at) + shipArrow('ci q/run', '⚙', arrowByKey['ci-green'], 'Distinct PRs with a green Pre-Merge Gate run this hour (workflow 255384592)', d.ci_running, wFor('ci-green'), isB('ci-green'), null, null, 'right') +
+            shipStage(d.bugs_found_24h === null || d.bugs_found_24h === undefined ? 'n/a' : d.bugs_found_24h, 'bugs found', bugsCls, '', null, HELP.bugsFound, '', 'bugs-found', [], null, null, null, null, d.last_issue_created_at) + shipArrow('bugs found', '⚡', null, 'Issues created in the last 24h', null, null, false, String(d.bugs_found_24h ?? '?'), null, 'right', true) +
+            shipStage(d.issues_open, 'issues open', '', '', null, HELP.issues, '', null, null, null, shipIssuesRatePanel(sp.issues), null, arrowByKey['issues-prs'] && arrowByKey['issues-prs'].drain_label, d.last_issue_created_at) + shipArrow('issues open', '🤖', arrowByKey['issues-prs'], 'PRs opened in the last hour, from GitHub search - click for live agent lanes', null, wFor('issues-prs'), isB('issues-prs'), arrowByKey['issues-prs'] && arrowByKey['issues-prs'].label, null, 'right', true) +
+            shipStage(d.dispatched ?? null, 'dispatched', '', '', null, HELP.dispatched, '', 'dispatched', [], null, null, null, null, d.dispatched_last_at) + shipArrow('dispatched', '🤖', null, 'Live dispatched lanes', null, null, false, String(d.dispatched ?? '?'), null, 'right', true) +
+            shipStage(d.prs_open, 'prs open', '', prsOld.sub, null, HELP.prs + shipOldestWords('prs open', 'age of the oldest open, non-draft pull request'), prsOld.cls, null, null, null, shipHistorySpark(sp.prs, 'prs'), null, null, d.prs_open_last_at) + shipArrow('prs open', '⚙', arrowByKey['prs-ci'], 'Distinct PRs with a CI run started this hour, from the GitHub workflow-runs list', d.ci_queued, wFor('prs-ci'), isB('prs-ci'), null, null, 'right', true) +
+            shipStage(ciNum, 'ci q/run', ciCls, ciOld.sub, null, HELP.ciqr + shipOldestWords('ci q/run', 'how long the oldest queued run in the last 48 h has waited to start (since it was re-queued, if it was re-run)') + ' Green waiting: ' + greenWaitingText + ' PRs approved and green but not yet enqueued.' + greenWaitWords, ciOld.cls, null, null, null, shipHistorySpark(sp.ci, 'ci'), 'green waiting: ' + greenWaitingText + (greenSub ? ' · ' + greenSub : '') + (greenWaitSub ? ' · ' + greenWaitSub : ''), null, d.ci_last_run_started_at) + shipArrow('ci q/run', '⚙', arrowByKey['ci-green'], 'Distinct PRs with a green Pre-Merge Gate run this hour (workflow 255384592)', d.ci_running, wFor('ci-green'), isB('ci-green'), null, null, 'right', true) +
             // 'review routed' is row 1's own end - LORE order 17 #3: the turn
             // to 'in review' at the start of row 2 is now a real vertical
             // belt (position:absolute, JS-synced - see positionShipElbows),
@@ -9418,14 +9426,14 @@ function shipFlowHtml(d) {
             // NEW decorative arrow (no formal rate instrument existed for this
             // transition either before or after the rebalance): in review was
             // previously row 1's own dead end and never needed one.
-            shipStage(d.in_review ?? null, 'in review', '', '', null, HELP.inReview, '', 'in-review', [], null, null, null, null, d.in_review_last_at) + shipArrow('in review', '👁', null, 'PRs currently under human/AI review', null, null, false, String(d.in_review ?? '?'), null, 'left') +
+            shipStage(d.in_review ?? null, 'in review', '', '', null, HELP.inReview, '', 'in-review', [], null, null, null, null, d.in_review_last_at) + shipArrow('in review', '👁', null, 'PRs currently under human/AI review', null, null, false, String(d.in_review ?? '?'), null, 'left', true) +
             // Round 3 (Elrond review, PR #35): gate_verdicts has been null
             // since PR #34 dropped statusCheckRollup - the same "I cannot
             // know this" status as 'resolved', so it renders 'n/a' the same
             // way (was rendering nothing at all - a stage with no number and
             // no n/a is its own, different, confusing state).
-            shipStage(d.gate_verdicts === null || d.gate_verdicts === undefined ? 'n/a' : d.gate_verdicts, 'gate verdicts', gateCls, '', null, HELP.gateVerdicts + ((d.gate_verdicts === null || d.gate_verdicts === undefined) && d.gate_verdicts_na_reason ? ' (' + d.gate_verdicts_na_reason + ')' : ''), '', 'gate-verdicts', [], null, null, null, null, d.gate_verdicts_last_at) + shipArrow('gate verdicts', '⛨', null, 'PRs with a non-passing gate-verdict check', null, null, false, String(d.gate_verdicts ?? '?'), null, 'left') +
-            shipStage(d.conflicted ?? null, 'conflicted', conflictCls, '', null, HELP.conflicted, '', 'conflicted', [], null, null, null, null, d.conflicted_last_at) + shipArrow('conflicted', '⚠', null, 'Open PRs with a merge conflict', null, null, false, String(d.conflicted ?? '?'), null, 'left') +
+            shipStage(d.gate_verdicts === null || d.gate_verdicts === undefined ? 'n/a' : d.gate_verdicts, 'gate verdicts', gateCls, '', null, HELP.gateVerdicts + ((d.gate_verdicts === null || d.gate_verdicts === undefined) && d.gate_verdicts_na_reason ? ' (' + d.gate_verdicts_na_reason + ')' : ''), '', 'gate-verdicts', [], null, null, null, null, d.gate_verdicts_last_at) + shipArrow('gate verdicts', '⛨', null, 'PRs with a non-passing gate-verdict check', null, null, false, String(d.gate_verdicts ?? '?'), null, 'left', true) +
+            shipStage(d.conflicted ?? null, 'conflicted', conflictCls, '', null, HELP.conflicted, '', 'conflicted', [], null, null, null, null, d.conflicted_last_at) + shipArrow('conflicted', '⚠', null, 'Open PRs with a merge conflict', null, null, false, String(d.conflicted ?? '?'), null, 'left', true) +
             // 'resolved' is row 2's own end - LORE order 17 #3: the turn to
             // 'approved' at the start of row 3 is now a real vertical belt
             // too, carrying item #10 (Speed Module 3).
@@ -9438,12 +9446,12 @@ function shipFlowHtml(d) {
             // SHIP-16-FIX: this used to feed the now-removed 'green waiting' square;
             // it now points straight at 'in line' - approved PRs move toward the
             // queue, and green-waiting's own count/age live as ci q/run's sub-line above.
-            shipStage(d.approved ?? null, 'approved', '', '', null, HELP.approved, '', 'approved', [], null, null, null, null, d.approved_last_at) + shipArrow('approved', '✅', arrowByKey['green-inline'], 'Approved PRs not yet merged', null, wFor('green-inline'), isB('green-inline'), null, null, 'right') +
-            shipStage(queueNum, 'in line', queueCls, queueSub, null, queueHelp, queueOld.cls, 'in-line', d.queue_prs, 'in queue', shipHistorySpark(sp.queue, 'queue'), null, null, null) + shipArrow('in line', '⚡', arrowByKey['inline-merged'], 'Merge queue entries', d.queue_depth, wFor('inline-merged'), isB('inline-merged'), null, null, 'right') +
-            shipStage(d.merged_today, 'merged today', 'ok', mergedSub, d.merged_spark, HELP.merged + shipOldestWords('merged today', 'minutes since the last merge'), mergedStage, 'merged-today', d.merged_today_prs, null, shipHistorySpark(sp.merged, 'merged'), null, null, d.last_merge_at) + shipArrow('merged today', '⚡', arrowByKey['merged-deploy'], 'Production deploy workflows in flight, or merge awaiting deploy', shipDeployCount(d), wFor('merged-deploy'), isB('merged-deploy'), null, null, 'right') +
+            shipStage(d.approved ?? null, 'approved', '', '', null, HELP.approved, '', 'approved', [], null, null, null, null, d.approved_last_at) + shipArrow('approved', '✅', arrowByKey['green-inline'], 'Approved PRs not yet merged', null, wFor('green-inline'), isB('green-inline'), null, null, 'right', true) +
+            shipStage(queueNum, 'in line', queueCls, queueSub, null, queueHelp, queueOld.cls, 'in-line', d.queue_prs, 'in queue', shipHistorySpark(sp.queue, 'queue'), null, null, null) + shipArrow('in line', '⚡', arrowByKey['inline-merged'], 'Merge queue entries', d.queue_depth, wFor('inline-merged'), isB('inline-merged'), null, null, 'right', true) +
+            shipStage(d.merged_today, 'merged today', 'ok', mergedSub, d.merged_spark, HELP.merged + shipOldestWords('merged today', 'minutes since the last merge'), mergedStage, 'merged-today', d.merged_today_prs, null, shipHistorySpark(sp.merged, 'merged'), null, null, d.last_merge_at) + shipArrow('merged today', '⚡', arrowByKey['merged-deploy'], 'Production deploy workflows in flight, or merge awaiting deploy', shipDeployCount(d), wFor('merged-deploy'), isB('merged-deploy'), null, null, 'right', true) +
             // NEW decorative arrow: folded->deployed had no arrow at all
             // before (it was the old row2/row3 break) - now within row 3.
-            shipStage(d.folded ?? null, 'folded', '', '', null, HELP.folded, '', 'folded', [], null, null, null, null, d.folded_last_at) + shipArrow('folded', '🚀', null, 'Deploy workflows folded into this run', null, null, false, String(d.folded ?? '?'), null, 'right') +
+            shipStage(d.folded ?? null, 'folded', '', '', null, HELP.folded, '', 'folded', [], null, null, null, null, d.folded_last_at) + shipArrow('folded', '🚀', null, 'Deploy workflows folded into this run', null, null, false, String(d.folded ?? '?'), null, 'right', true) +
             shipStage(noDeploy ? 'n/a' : (d.deployed_prs_today === null || d.deployed_prs_today === undefined ? '?' : d.deployed_prs_today), 'last deploy', 'ok', deployLastLine, null, (noDeploy ? 'no deploy workflow on ' + (d.repo_name || d.repo_full || 'this repo') : HELP.lastdep + shipOldestWords('last deploy', 'minutes since the last deploy, counted only while main has commits newer than it') + deployWords), deployStateCls, 'last-deploy', (d.deployed_prs_today_list || []).map(n => ({number:n,title:'deployed'})), 'deployed', shipHistorySpark(sp.deploy, 'deploy'), null, null, d.last_deploy_at);
 
         // Round 2 (Elrond review, PR #35, defect 3): the turns used to be a

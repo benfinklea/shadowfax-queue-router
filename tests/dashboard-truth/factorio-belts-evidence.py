@@ -164,10 +164,12 @@ with sync_playwright() as p:
     assert page.locator('.ship-belt').count() == 14
     assert page.locator('.ship-belt-item').count() > 0
     assert page.locator('.ship-belt-backed-up').count() == 1
-    # Round 2 defect 4: belts must read as belts, not connector widgets - the
-    # brief's >=48px floor, with real margin above it.
-    belt_width = page.eval_on_selector('.ship-belt:not(.ship-belt-vertical)', 'el => el.getBoundingClientRect().width')
-    assert belt_width >= 64, belt_width
+    # Round 2 defect 4 / Ben's own built reference (all 14 belts now run
+    # vertical, per order 17 #3 below): belts must read as belts, not
+    # connector widgets - the brief's >=48px floor, applied to the belt's
+    # long axis (height, since every belt is now taller than wide).
+    belt_height = page.eval_on_selector('.ship-belt-vertical', 'el => el.getBoundingClientRect().height')
+    assert belt_height >= 48, belt_height
     # Round 2 defect 5: row 3 is no longer a lone square.
     assert page.locator('.ship-row-3 .ship-stage').count() == 5
 
@@ -197,18 +199,20 @@ with sync_playwright() as p:
         n = page.locator('.ship-arrow[data-square-left="' + square + '"] > .ship-inserter').count()
         assert n == 2, (square, 'expected 2 inserters, found', n)
 
-    # Order 17 #3 "belts run vertically": the two row-turn handoffs are
-    # taller than they are wide; every other belt stays horizontal (wider
-    # than tall).
+    # Order 17 #3 "belts run vertically": Ben's own built reference (a
+    # vertical belt bridging two side-by-side buildings, both inserters
+    # bending toward it) showed this doesn't require breaking the
+    # boustrophedon row layout at all - only the belt WITHIN each arrow slot
+    # needs to run top to bottom. All 14 belts are vertical (taller than
+    # wide): the 2 row-turn handoffs via the absolute-positioned
+    # `.ship-arrow-vertical` (bridging between rows), the other 12 via the
+    # in-row, normal-flow `.ship-arrow-vbelt` (still between two
+    # horizontally-adjacent stages in the same row).
     assert page.locator('.ship-arrow-vertical').count() == 2
-    for square in ('review routed', 'resolved'):
+    assert page.locator('.ship-arrow-vbelt').count() == 12
+    for square, _ in EXPECTED_CHAIN:
         b = page.locator('.ship-arrow[data-square-left="' + square + '"] .ship-belt').bounding_box()
         assert b['height'] > b['width'], (square, b)
-    for square, _ in EXPECTED_CHAIN:
-        if square in ('review routed', 'resolved'):
-            continue
-        b = page.locator('.ship-arrow[data-square-left="' + square + '"] .ship-belt').bounding_box()
-        assert b['width'] > b['height'], (square, b)
 
     # Round 2 (Elrond review, PR #35, defect 1): no stage may ever render a
     # bare '?' - it reads as indistinguishable from the no-data wreckage state
