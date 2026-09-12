@@ -9053,6 +9053,14 @@ function shipArrow(square, glyph, arrow, description, legacyCount, width, isBott
     // rate makes it swing. Before this it wrecked every un-instrumented
     // arrow even when the count was known.
     const noData = !hasRate && knownCount === null;
+    // Ben: "the inserters between PRs open and CI run are both animating but
+    // there's nothing moving into CI run - why are they moving?" They swung
+    // on the hourly rate alone. An inserter is the job STARTING, so it only
+    // swings when there is actually a job on its belt to move right now
+    // (queue > 0) - a measured rate with an empty queue means work moved
+    // earlier this hour, not that anything is being handed over now.
+    const carrying = backlog !== null && backlog !== undefined && Number(backlog) > 0;
+    const inserterRate = carrying ? rateForSpeed : 0;
     const loadAlign = (vertical && !elbowId) ? (vDown ? 'align-top' : 'align-bottom') : null;
     const unloadAlign = (vertical && !elbowId) ? (vDown ? 'align-bottom' : 'align-top') : null;
     return '<' + tag + (agentLane ? ' type="button"' : ' role="img"') + ' class="ship-arrow' + (isBottleneck ? ' bottleneck' : '') + dirCls + '"'
@@ -9064,9 +9072,9 @@ function shipArrow(square, glyph, arrow, description, legacyCount, width, isBott
         // (upstream, places items on) then unloading (downstream, takes them
         // off) - same rate/backedUp/unknown state on both, but each gets its
         // own phase seed so they are never mirror-synced.
-        + shipInserterHtml(rateForSpeed, armRest, noData, square + '-load', isBottleneck, duration, loadAlign)
+        + shipInserterHtml(inserterRate, armRest, noData, square + '-load', isBottleneck, duration, loadAlign)
         + shipBeltHtml(square, hasRate, rateForSpeed, isBottleneck, knownCount, dir, vertical, vDown, backlog)
-        + shipInserterHtml(rateForSpeed, armRest, noData, square + '-unload', isBottleneck, duration, unloadAlign)
+        + shipInserterHtml(inserterRate, armRest, noData, square + '-unload', isBottleneck, duration, unloadAlign)
         + '</' + tag + '>';
 }
 

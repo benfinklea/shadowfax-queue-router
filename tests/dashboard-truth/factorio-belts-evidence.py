@@ -365,6 +365,12 @@ with sync_playwright() as p:
     assert issues_arm['duration'] != prsci_arm['duration'], (issues_arm, prsci_arm)
     assert issues_arm['delay'] != prsci_arm['delay'], (issues_arm, prsci_arm)
     assert dispatched_arm['name'] == 'none', dispatched_arm
+    # Ben: an inserter only swings when there is a job on its belt to move.
+    # merged-deploy has a measured rate (1/h) but an empty queue (backlog 0)
+    # in this fixture - both its inserters must be idle, not swinging.
+    for which in ('load', 'unload'):
+        empty_arm = arm_style('merged today', which=which)
+        assert empty_arm['name'] == 'none', ('merged today', which, 'swinging with nothing on the belt', empty_arm)
     # Ben asked what "remnant" means: not time-based - the wreck sprite only
     # when the handoff's count is n/a. 'dispatched' has a plain count (2) and
     # no rate instrument, so its inserters are intact and idle, not wrecked;
