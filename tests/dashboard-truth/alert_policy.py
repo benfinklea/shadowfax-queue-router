@@ -8,6 +8,18 @@ DAY = 86400
 
 def fingerprint(failure):
     payload = {key: failure[key] for key in ("signal", "dashboard", "instrument")}
+    instrument = failure["instrument"]
+    # Credits-read reporting now labels its expected value honestly. Preserve the
+    # existing incident key for that presentation change, without discarding any
+    # changed expectation, dashboard claim, or additional measurement evidence.
+    if (payload["signal"] == "runson.credits_read"
+            and isinstance(instrument, dict)
+            and set(instrument) == {"kind", "expected", "independent_aws_measurement"}
+            and instrument["kind"] == "expected_contract"
+            and instrument["independent_aws_measurement"] is False
+            and isinstance(instrument["expected"], dict)
+            and set(instrument["expected"]) == {"credits_error"}):
+        payload["instrument"] = instrument["expected"]
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 

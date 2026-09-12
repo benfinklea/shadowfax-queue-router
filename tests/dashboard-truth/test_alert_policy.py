@@ -150,6 +150,77 @@ class AlertTests(unittest.TestCase):
         self.assertEqual(self.pages()[0][4], "routine")
         self.assertIn("Cirdan", self.pages()[0][-1])
 
+    def labeled_credits_failure(self):
+        with patch.object(suite, "results", []):
+            suite.check_runson_credits_read({"available": True, **FAILURE["dashboard"]})
+            return copy.deepcopy(suite.results[0])
+
+    def test_credits_contract_label_preserves_recorded_key_without_mutating_report(self):
+        recorded = json.loads(Path(__file__).with_name("credits-failure-fixture.json").read_text())
+        labeled = self.labeled_credits_failure()
+        before = copy.deepcopy(labeled)
+        self.assertEqual(fingerprint(labeled), fingerprint(recorded))
+        self.assertEqual(labeled, before, "canonicalization must not strip labels from the report")
+        self.tick([labeled])
+        self.assertEqual(self.pages()[0][4], "routine")
+        self.assertIn("Cirdan", self.pages()[0][-1])
+        self.assertIn("expected_contract", self.pages()[0][-1])
+
+    def test_credits_contract_label_retains_existing_backoff_and_owner(self):
+        self.tick([FAILURE])
+        key = fingerprint(FAILURE)
+        original = json.loads((self.state / "alerts.json").read_text())[key]
+        labeled = self.labeled_credits_failure()
+        self.tick([labeled])
+        self.assertEqual(len(self.pages()), 1, "relabeling the same denial must not page anew")
+        current = json.loads((self.state / "alerts.json").read_text())
+        self.assertEqual(set(current), {key})
+        self.assertEqual(current[key], dict(original, count=2))
+        for _ in range(4):
+            self.tick([labeled])
+        self.assertEqual(len(self.pages()), 2, "existing sixth-observation backoff remains due")
+        self.assertEqual(self.pages()[-1][4], "routine")
+        self.assertIn("Cirdan", self.pages()[-1][-1])
+        self.assertIn("/issues/611", self.pages()[-1][-1])
+
+    def test_changed_credit_claim_or_expectation_gets_new_key_and_immediate_page(self):
+        labeled = self.labeled_credits_failure()
+        self.tick([labeled])
+        seen = {fingerprint(labeled)}
+        for field, key, value in (
+            ("dashboard", "credits_error", "timeout"),
+            ("dashboard", "credits_remaining", 42),
+            ("expected", "credits_error", "different_expectation"),
+        ):
+            with self.subTest(field=field, key=key):
+                changed = copy.deepcopy(labeled)
+                target = changed["instrument"]["expected"] if field == "expected" else changed[field]
+                target[key] = value
+                self.assertNotIn(fingerprint(changed), seen)
+                seen.add(fingerprint(changed))
+                self.tick([changed])
+                self.assertEqual(len(self.pages()), len(seen))
+                self.assertEqual(self.pages()[-1][4], "urgent")
+
+    def test_credits_normalization_keeps_other_evidence_and_signals_distinct(self):
+        labeled = self.labeled_credits_failure()
+        key = fingerprint(labeled)
+        instruments = []
+        for value in (True, 0, None):
+            changed = copy.deepcopy(labeled["instrument"])
+            changed["independent_aws_measurement"] = value
+            instruments.append(changed)
+        for extra in ({"source": "independent AWS probe"}, {"kind": "measurement"},
+                      {"expected": {"credits_error": None, "additional_claim": True}},
+                      {"expected": None}):
+            instruments.append({**copy.deepcopy(labeled["instrument"]), **extra})
+        instruments.append({"kind": "expected_contract", "expected": {"credits_error": None}})
+        for instrument in instruments:
+            with self.subTest(instrument=instrument):
+                self.assertNotEqual(fingerprint(dict(labeled, instrument=instrument)), key)
+        self.assertNotEqual(fingerprint(dict(labeled, signal="unrelated.signal")),
+                            fingerprint(dict(FAILURE, signal="unrelated.signal")))
+
     def test_real_transport_contract_returns_nonzero_without_raising(self):
         # The production helper uses subprocess.run without check=True.
         with patch.object(suite, "run", self.real_run):

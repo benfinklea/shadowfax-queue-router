@@ -7,6 +7,8 @@ per 24 hours since the last successful delivery. An explicit PASS rearms the che
 A changed payload never inherits another payload's backoff or ownership.
 Interactive runs record results but do not change cron notification state.
 
+For `runson.credits_read`, the exact `expected_contract` wrapper with `independent_aws_measurement: false` and only `expected.credits_error` hashes as the legacy `{credits_error: ...}` instrument value. Labeling the same expectation therefore preserves its incident and ownership. Changed dashboard values or expectations, additional evidence fields, and other signals remain distinct.
+
 `alerts.json` in `/workspace/planning/state/dashboard-truth` stores current
 incidents. The lock covers read, send and atomic replacement, including recovery.
 Failed delivery remains due on the next run. The old signal-only
