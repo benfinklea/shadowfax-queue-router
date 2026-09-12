@@ -5437,7 +5437,10 @@ def _build_ship_arrows(result, rates):
     # source in plain words, so the row compares one unit of work left to right.
     specs = [
         ("issues-prs", "PRs opened in the last hour, from GitHub search (click the button for live agent lanes)", rates.get("pr_created_hour"), result.get("issues_open")),
-        ("prs-ci", "Distinct PRs with a CI run started this hour, from GitHub's workflow-runs list", rates.get("runs_created_hour"), result.get("prs_open")),
+        # Ben: "the Queue is the number of items on the belt to the left of CI
+        # RUN" - this belt's backlog is the CI queue itself (runs waiting to
+        # start), not the count of open PRs behind it.
+        ("prs-ci", "Distinct PRs with a CI run started this hour, from GitHub's workflow-runs list", rates.get("runs_created_hour"), ci_queued),
         ("ci-green", "Distinct PRs with a green Pre-Merge Gate run this hour (workflow 255384592), from GitHub's workflow-runs list", rates.get("runs_success_hour"), ci_backlog),
         ("green-inline", "Green eligible PRs not yet enqueued (approx., via merges/hr)", merged_hour, result.get("green_waiting")),
         ("inline-merged", "Merge queue entries (approx., via merges/hr)", merged_hour, result.get("queue_depth")),
@@ -7186,7 +7189,7 @@ box-shadow:0 0 7px rgba(255,0,68,0.3)}
    the next time either changes): now there is always slack for an
    edge-stage caption to overflow into, independent of exactly how wide the
    belts get tuned to be. */
-.ship-flow-wrap{display:flex;flex-direction:column;gap:0;padding:0 40px;
+.ship-flow-wrap{display:flex;flex-direction:column;gap:0;padding:0 64px;
 background-image:url('/static/factorio/ground/ground-tile.png');
 background-repeat:repeat;background-size:128px 128px;border-radius:6px}
 /* LORE order 17 #3: row1 and row2 (not row3, nothing follows it) get a much
@@ -7195,7 +7198,11 @@ background-repeat:repeat;background-size:128px 128px;border-radius:6px}
    position:absolute and JS-synced (positionShipElbows), replacing the old
    bare turn glyph that only needed a few px of clearance. */
 .ship-flow{display:flex;align-items:stretch;gap:0;flex-wrap:wrap;margin:0 0 9px 0}
-.ship-flow.ship-row-1,.ship-flow.ship-row-2{margin-bottom:160px}
+/* Ben: "the rows can be closer together" - the row-end belt now spans
+   from the from-stage's top to the to-stage's bottom regardless of this
+   gap (positionShipElbows sizes it), so the gap only needs to be enough
+   for the belt to visibly read as a run between the rows, not to hold it. */
+.ship-flow.ship-row-1,.ship-flow.ship-row-2{margin-bottom:56px}
 .ship-flow.ship-row-2{flex-direction:row-reverse}
 .ship-age{font-size:0.66em;color:#7d8798;white-space:nowrap;margin-top:1px;text-shadow:var(--text-outline)}
 .ship-age.warn{color:var(--neon-yellow)}
@@ -7280,7 +7287,7 @@ filter:var(--ground-shadow)}
    below: this sits in both a row-direction parent (plain/vbelt arrows) and
    a column-direction one (the row-turn arrows), and a fixed flex-basis
    would hijack whichever axis is "main" in each. */
-.ship-inserter{position:relative;width:38px;height:32px;flex:0 0 auto;display:flex;align-items:center;justify-content:center}
+.ship-inserter{position:relative;width:34px;height:32px;flex:0 0 auto;display:flex;align-items:center;justify-content:center}
 .ship-inserter .inserter-platform{position:absolute;left:0;bottom:0;width:30px;height:23px;
 background-image:url('/static/factorio/inserter/long-handed-inserter-platform.png');
 background-size:120px 23px;background-position:-30px 0;background-repeat:no-repeat;
@@ -7293,7 +7300,7 @@ image-rendering:pixelated;opacity:.85;filter:var(--ground-shadow)}
    left-to-right (90deg), horizontal right-to-left (-90deg), and vertical,
    always reaching downward for a top-to-bottom belt (180deg) - instead of a
    separate hardcoded keyframe/override pair per direction. */
-.ship-inserter .inserter-arm{position:absolute;left:12px;top:0;width:14px;height:32px;
+.ship-inserter .inserter-arm{position:absolute;left:10px;top:0;width:14px;height:32px;
 background-repeat:no-repeat;background-size:14px 32px;image-rendering:pixelated;
 transform-origin:50% 85%;transform:rotate(var(--arm-rest,90deg));transition:transform .4s ease,opacity .4s ease}
 .ship-inserter.idle .inserter-arm{opacity:.4}
@@ -7574,8 +7581,12 @@ font-size:0.85em;letter-spacing:0.5px;vertical-align:middle}
    apart. flex:0 0 auto sizes every stage the same across all three rows
    regardless of how many share the row - the leftover width now collects
    at the row's own far edge instead of between every stage. */
-.ship-stage{flex:0 1 auto;min-width:0;padding:8px 6px}
-.ship-cap{font-size:.65em;letter-spacing:1px}
+.ship-stage{flex:0 1 auto;min-width:0;padding:8px 3px}
+/* 7 stages per row (Ben) at a 1440 viewport: captions may wrap to a
+   second line and sub-lines may wrap too - the numerals stay full size
+   (legibility beats fidelity applies to the count, not the label). */
+.ship-cap{font-size:.6em;letter-spacing:.5px;white-space:normal;line-height:1.15;max-width:96px}
+.ship-sub{font-size:.72em;white-space:normal;max-width:110px}
 .ship-num.stamp{font-size:.85em}
 /* LORE order 11 #2 / order 1: a real belt segment (>=48px), not a glyph with
    a number beside it. Round 2 (Elrond review, PR #35, defect 4): the first
@@ -7598,8 +7609,24 @@ gap:1px;padding:0 2px;border:0;background:transparent;color:var(--arrow-color);c
    it can sit in the gap between two rows rather than inside either row's
    own flex flow; flex-direction:column stacks loading inserter / belt /
    unloading inserter top to bottom. */
-.ship-arrow-vertical{position:absolute;flex-direction:column;flex:0 0 auto;height:auto;
-width:38px;gap:2px;padding:2px 0;z-index:4}
+/* Ben's reference: the row-end belt is one tall column running BESIDE the
+   row's last stage all the way down to beside the next row's first stage
+   ("go all the way down to carry work to the next row" - not floating in
+   the gap between rows). Both inserters sit on the stage side of it, one
+   at the very top (loading from the stage above) and one at the very
+   bottom (unloading into the stage below). Height is set by
+   positionShipElbows to span exactly from the top of the from-stage to
+   the bottom of the to-stage. */
+.ship-arrow-vertical{position:absolute;display:block;flex:0 0 auto;width:58px;height:200px;
+padding:0;z-index:4}
+.ship-arrow-vertical .ship-belt-vertical{position:absolute;top:0;bottom:0;height:auto;left:36px}
+.ship-arrow-vertical .ship-inserter{position:absolute;left:0}
+.ship-arrow-vertical .ship-inserter:first-child{top:0}
+.ship-arrow-vertical .ship-inserter:last-child{bottom:0}
+/* Row 2 ends on the LEFT (row-reverse), so its row-end belt sits on the
+   left of the stage with the inserters on the belt's right. */
+.ship-arrow-vertical.ship-arrow-left .ship-belt-vertical{left:0}
+.ship-arrow-vertical.ship-arrow-left .ship-inserter{left:24px}
 /* Ben's own built reference (a vertical belt bridging two side-by-side
    buildings) - correction after the first pass stacked the inserters
    above/below the belt: "the inserters go to the left and right of the
@@ -7611,7 +7638,7 @@ width:38px;gap:2px;padding:2px 0;z-index:4}
    they connect really are stacked above/below on screen, so those stay a
    column stack. */
 .ship-arrow-vbelt{flex-direction:row;flex:0 0 auto;width:auto;height:auto;
-gap:2px;padding:2px 4px;align-self:center;align-items:center}
+gap:0;padding:2px 0;align-self:center;align-items:center}
 /* Ben's built reference: each inserter sits at the belt's own beginning or
    end - top or bottom - never centered beside it, so it visibly interacts
    with the correct extreme of the belt (where items actually enter/exit)
@@ -7649,7 +7676,7 @@ animation:ship-belt-flow linear infinite;animation-duration:var(--belt-duration,
    will show more items on the belt so I can see when they're backed up" -
    taller than the original 72px so a jam visibly piles up along real belt
    length, not just a couple of dots. */
-.ship-belt-vertical{width:26px;height:140px;flex:0 0 auto}
+.ship-belt-vertical{width:22px;height:140px;flex:0 0 auto}
 /* Ben's built reference: each belt segment's own chevron faces the actual
    direction of travel (down), not sideways - the base tile's chevron is
    baked in pointing right (it's a horizontal-belt asset), so a vertical
@@ -8676,9 +8703,8 @@ const SHIP_ARROW_ITEM = {
 // (the OVERALL item chain still always reads bug->rocket left to right);
 // only which end of THIS belt is "up" vs "down" flips.
 const SHIP_VBELT_ROW_ORDER = [
-    ['bugs found', 'issues open', 'dispatched', 'prs open', 'ci q/run'],
-    ['in review', 'gate verdicts', 'conflicted'],
-    ['approved', 'in line', 'merged today', 'folded'],
+    ['bugs found', 'issues open', 'dispatched', 'prs open', 'ci q/run', 'review routed'],
+    ['gate verdicts', 'conflicted', 'resolved', 'approved', 'in line', 'merged today'],
 ];
 function shipVbeltFlowsDown(square) {
     for (const row of SHIP_VBELT_ROW_ORDER) {
@@ -8703,32 +8729,48 @@ function shipItemImgHtml(itemPath, sizePx) {
 // that have never had a formal rate/backlog instrument. `vertical` (order
 // 17 #3) swaps the belt's own long axis and the item layout from left/right
 // to top/bottom - see the call site for which two arrows use it.
-function shipBeltHtml(square, hasRate, rate, backedUp, knownCount, dir, vertical, vDown) {
+// Ben's model: "the work in between the boxes are queues" - a belt shows
+// the jobs WAITING to enter the next stage, one item per job (capped at
+// what fits nose to tail), piled up from the downstream end the way a real
+// queue backs up against the inserter that drains it. The stage's own
+// number is what's being worked on right now; the inserter is the job
+// starting. Rate still sets the belt's scroll speed; it no longer invents
+// an item count.
+const SHIP_BELT_CAPACITY = 7;
+function shipBeltHtml(square, hasRate, rate, backedUp, knownCount, dir, vertical, vDown, backlog) {
     const itemPath = SHIP_ARROW_ITEM[square];
     if (!itemPath) return '';
     let state, slots;
-    // LORE order 16 #3: denser packing so "items packed nose to tail" reads
-    // as a factory, not a few dots on a long belt.
-    if (hasRate) {
-        if (backedUp) { state = 'backed-up'; slots = 6; }
-        else if (Number(rate) === 0) { state = 'starved'; slots = 0; }
-        else { state = 'flowing'; slots = Math.max(2, Math.min(5, Math.round(2 + Math.max(0.2, Math.min(3, Number(rate) / 4))))); }
+    const backlogKnown = backlog !== null && backlog !== undefined;
+    if (hasRate && backlogKnown) {
+        slots = Math.min(SHIP_BELT_CAPACITY, Math.max(0, Math.round(Number(backlog))));
+        if (backedUp) state = 'backed-up';
+        else if (Number(rate) === 0) state = 'starved';
+        else state = 'flowing';
+    } else if (hasRate) {
+        // Rate measured but no queue count: the belt moves, nothing is
+        // claimed to be on it - never a made-up number of items.
+        slots = 0; state = backedUp ? 'backed-up' : (Number(rate) === 0 ? 'starved' : 'flowing');
     } else if (knownCount !== null) {
-        state = 'known'; slots = Math.max(1, Math.min(4, Math.round(Math.sqrt(Math.max(1, knownCount)) * 1.3)));
+        // No rate instrument, only a plain count of what is waiting to move
+        // on from the stage before - shown as the queue, standing still.
+        state = 'known'; slots = Math.min(SHIP_BELT_CAPACITY, Math.max(0, Math.round(knownCount)));
     } else {
         state = 'unknown'; slots = 0;
     }
     const itemSize = vertical ? 15 : 16;
+    const step = 84 / (SHIP_BELT_CAPACITY - 1);
     let itemsHtml = '';
     for (let i = 0; i < slots; i++) {
-        const t = slots === 1 ? 0.5 : i / (slots - 1);
-        // LORE order 17 #3 fix: the belt now genuinely scrolls in its flow
-        // direction (see .ship-belt-track's keyframes), so item slot 0 is
-        // always the upstream (pickup) end - 'left'-dir mirrors which
-        // physical edge that is for a horizontal belt; a vertical belt's
-        // own vDown flips which end (top or bottom) is upstream, per Ben's
-        // built reference (consecutive in-row belts alternate direction).
-        const pos = vertical ? (vDown ? (8 + 84 * t) : (92 - 84 * t)) : (dir === 'left' ? (92 - 84 * t) : (8 + 84 * t));
+        // Item 0 sits at the DOWNSTREAM end (against the unloading inserter);
+        // each further item queues one step back toward the upstream end.
+        // A vertical belt's vDown says which end is downstream (bottom when
+        // flowing down, top when flowing up - consecutive in-row belts
+        // alternate, per Ben's built reference); a horizontal belt's dir
+        // says the same.
+        const fromDownstream = 92 - step * i;
+        const fromUpstream = 8 + step * i;
+        const pos = vertical ? (vDown ? fromDownstream : fromUpstream) : (dir === 'left' ? fromUpstream : fromDownstream);
         const axis = vertical ? 'top' : 'left';
         itemsHtml += '<span class="ship-belt-item" style="' + axis + ':' + pos.toFixed(1) + '%">' + shipItemImgHtml(itemPath, itemSize) + '</span>';
     }
@@ -8807,8 +8849,12 @@ function shipArrow(square, glyph, arrow, description, legacyCount, width, isBott
     // arc. The in-row vertical belts (vbelt) sit BESIDE two side-by-side
     // stages - Ben's correction - so their inserters swing horizontally,
     // same as a plain (non-vertical) arrow.
-    const armRest = (vertical && elbowId) ? 180 : (dir === 'left' ? -90 : 90);
-    // Ben's built reference: the two row-turn belts stay downstream-is-down
+    // Every inserter reaches sideways now - the row-end belts included:
+    // per Ben's reference, that tall belt runs BESIDE the last stage of the
+    // row down to beside the first stage of the next, with both inserters
+    // on the stage side of it, one at its top and one at its bottom.
+    const armRest = dir === 'left' ? -90 : 90;
+    // Ben's built reference: the two row-end belts stay downstream-is-down
     // (the stage before really is above, the stage after really is below);
     // the 12 in-row belts alternate per SHIP_VBELT_ROW_ORDER, and each
     // inserter sits at the belt's own beginning (top if flowing down, bottom
@@ -8826,7 +8872,7 @@ function shipArrow(square, glyph, arrow, description, legacyCount, width, isBott
         // off) - same rate/backedUp/unknown state on both, but each gets its
         // own phase seed so they are never mirror-synced.
         + shipInserterHtml(rateForSpeed, armRest, !hasRate, square + '-load', isBottleneck, duration, loadAlign)
-        + shipBeltHtml(square, hasRate, rateForSpeed, isBottleneck, knownCount, dir, vertical, vDown)
+        + shipBeltHtml(square, hasRate, rateForSpeed, isBottleneck, knownCount, dir, vertical, vDown, backlog)
         + shipInserterHtml(rateForSpeed, armRest, !hasRate, square + '-unload', isBottleneck, duration, unloadAlign)
         + '</' + tag + '>';
 }
@@ -8965,6 +9011,7 @@ function positionShipYard() {
 // centered ON the corner rather than flush against it, and dropped fully
 // below the row (row1/row2 now carry the extra margin-bottom for exactly
 // this) instead of overlapping its bottom edge by a few px.
+window.addEventListener('resize', () => positionShipElbows());
 function positionShipElbows() {
     const wrap = document.getElementById('ship-flow') && document.getElementById('ship-flow').parentElement;
     if (!wrap) return;
@@ -8975,22 +9022,32 @@ function positionShipElbows() {
     // 17 #3 made the vertical belt itself row1's actual last DOM child now
     // (appended after the 'review routed' stage), so ':last-child' matched
     // nothing and this silently never positioned at all until fixed.
-    const elbow1 = document.getElementById('ship-elbow-1');
-    const fromRow1 = document.querySelector('#ship-flow .ship-row-1 [data-square="review routed"]');
-    if (elbow1 && fromRow1) {
-        const r = fromRow1.getBoundingClientRect();
-        elbow1.style.left = (r.right - wrapRect.left - 19) + 'px';
-        elbow1.style.top = (r.bottom - wrapRect.top + 8) + 'px';
-    }
-    // Elbow 2 turns from row 2's own last square ('resolved') down to
-    // row 3's first ('approved').
-    const elbow2 = document.getElementById('ship-elbow-2');
-    const fromRow2 = document.querySelector('#ship-flow .ship-row-2 [data-square="resolved"]');
-    if (elbow2 && fromRow2) {
-        const r = fromRow2.getBoundingClientRect();
-        elbow2.style.left = (r.left - wrapRect.left - 19) + 'px';
-        elbow2.style.top = (r.bottom - wrapRect.top + 8) + 'px';
-    }
+    // Ben's reference: the row-end belt is a tall column BESIDE the row's
+    // last stage, running down to beside the next row's first stage - so it
+    // spans from the from-stage's top to the to-stage's bottom, sitting just
+    // outside the from-stage's outer edge (right for row 1, left for the
+    // row-reversed row 2). Both stages' sprites are what the inserters at
+    // its top/bottom visibly reach into.
+    const place = (elbowId, fromSel, toSel, side) => {
+        const elbow = document.getElementById(elbowId);
+        const from = document.querySelector(fromSel);
+        const to = document.querySelector(toSel);
+        if (!elbow || !from || !to) return;
+        const f = from.getBoundingClientRect();
+        const t = to.getBoundingClientRect();
+        const top = Math.min(f.top, t.top);
+        const bottom = Math.max(f.bottom, t.bottom);
+        elbow.style.top = (top - wrapRect.top) + 'px';
+        elbow.style.height = (bottom - top) + 'px';
+        const edge = side === 'right' ? Math.max(f.right, t.right) + 4 : Math.min(f.left, t.left) - 4 - elbow.offsetWidth;
+        elbow.style.left = (edge - wrapRect.left) + 'px';
+    };
+    // Row 1 ends on the right at 'in review'; row 2 (row-reverse) starts on
+    // the right at 'gate verdicts', directly under it.
+    place('ship-elbow-1', '#ship-flow .ship-row-1 [data-square="in review"]', '#ship-flow .ship-row-2 [data-square="gate verdicts"]', 'right');
+    // Row 2 ends on the left at 'folded'; row 3 starts on the left at
+    // 'last deploy' (DEPLOYED).
+    place('ship-elbow-2', '#ship-flow .ship-row-2 [data-square="folded"]', '#ship-flow .ship-row-3 [data-square="last deploy"]', 'left');
 }
 function renderShipYard(workers, completions) {
     const yard = document.getElementById('ship-yard');
@@ -9282,7 +9339,12 @@ function refreshShipFlow() {
         positionShipYard();
         // Round 2 (Elrond review, PR #35, defect 3): the row-turn elbows are
         // freshly recreated by the innerHTML swap above too - sync them now.
+        // The row-end belts are sized to the stages' rendered heights, which
+        // still shift when Orbitron finishes loading (measured: 8px), so run
+        // again once fonts settle and again a beat later for late images.
         positionShipElbows();
+        if (document.fonts && document.fonts.ready) document.fonts.ready.then(positionShipElbows);
+        setTimeout(positionShipElbows, 400);
     }).catch(() => {
         const el = document.getElementById('ship-flow');
         if (el && !el.querySelector('.ship-stage')) el.innerHTML = '<span class="gdim">shipping pipeline failed to load.</span>';
@@ -9326,13 +9388,15 @@ const SHIP_BLANK_PIPELINE = {
     spark12h: {}, arrows: [], folded: null, folded_last_at: null,
 };
 function shipFlowHtml(d) {
-        // A null half must never stringify into "null/null" and read as a real
-        // count - both halves have to be measured or the whole box is unknown.
-        const ciNum = (d.ci_queued === null || d.ci_queued === undefined
-            || d.ci_running === null || d.ci_running === undefined) ? null : (d.ci_queued + '/' + d.ci_running);
-        // ciNum === null (unknown) must stay neutral, never fall through to
-        // the 'ok' default meant for a MEASURED zero - that was a false green.
-        const ciCls = ciNum === null ? '' : (d.ci_queued > 5 ? 'hot' : (d.ci_queued > 0 ? 'warn' : 'ok'));
+        // Ben: "CI Q/RUN" -> "CI RUN" - the queue count now lives on the belt
+        // to this stage's left (prs open -> ci run), driven by the same
+        // ci_queued backlog via arrowByKey['prs-ci'] - this box shows only
+        // what's actually running, not a combined "queued/running" string.
+        const ciNum = (d.ci_running === null || d.ci_running === undefined) ? null : d.ci_running;
+        // No hot/warn coloring here any more - that was flagging a big
+        // QUEUE, which is now the belt's own backed-up/packed signal, not
+        // this box's. A running count isn't inherently urgent.
+        const ciCls = '';
         const greenCls = d.green_waiting >= 6 ? 'hot' : (d.green_waiting >= 3 ? 'warn' : (d.green_waiting > 0 ? 'ok' : ''));
         const stuck = (d.queue_prs || []).find(pr => pr.state === 'UNMERGEABLE');
         // SHIP-SPARK-3 item 4: has_merge_queue === false means this repo has none
@@ -9490,23 +9554,25 @@ function shipFlowHtml(d) {
             shipStage(d.issues_open, 'issues open', '', '', null, HELP.issues, '', null, null, null, shipIssuesRatePanel(sp.issues), null, arrowByKey['issues-prs'] && arrowByKey['issues-prs'].drain_label, d.last_issue_created_at) + shipArrow('issues open', '🤖', arrowByKey['issues-prs'], 'PRs opened in the last hour, from GitHub search - click for live agent lanes', null, wFor('issues-prs'), isB('issues-prs'), arrowByKey['issues-prs'] && arrowByKey['issues-prs'].label, null, 'right', true) +
             shipStage(d.dispatched ?? null, 'dispatched', '', '', null, HELP.dispatched, '', 'dispatched', [], null, null, null, null, d.dispatched_last_at) + shipArrow('dispatched', '🤖', null, 'Live dispatched lanes', null, null, false, String(d.dispatched ?? '?'), null, 'right', true) +
             shipStage(d.prs_open, 'prs open', '', prsOld.sub, null, HELP.prs + shipOldestWords('prs open', 'age of the oldest open, non-draft pull request'), prsOld.cls, null, null, null, shipHistorySpark(sp.prs, 'prs'), null, null, d.prs_open_last_at) + shipArrow('prs open', '⚙', arrowByKey['prs-ci'], 'Distinct PRs with a CI run started this hour, from the GitHub workflow-runs list', d.ci_queued, wFor('prs-ci'), isB('prs-ci'), null, null, 'right', true) +
-            shipStage(ciNum, 'ci q/run', ciCls, ciOld.sub, null, HELP.ciqr + shipOldestWords('ci q/run', 'how long the oldest queued run in the last 48 h has waited to start (since it was re-queued, if it was re-run)') + ' Green waiting: ' + greenWaitingText + ' PRs approved and green but not yet enqueued.' + greenWaitWords, ciOld.cls, null, null, null, shipHistorySpark(sp.ci, 'ci'), 'green waiting: ' + greenWaitingText + (greenSub ? ' · ' + greenSub : '') + (greenWaitSub ? ' · ' + greenWaitSub : ''), null, d.ci_last_run_started_at) + shipArrow('ci q/run', '⚙', arrowByKey['ci-green'], 'Distinct PRs with a green Pre-Merge Gate run this hour (workflow 255384592)', d.ci_running, wFor('ci-green'), isB('ci-green'), null, null, 'right', true) +
+            shipStage(ciNum, 'ci q/run', ciCls, ciOld.sub, null, HELP.ciqr + shipOldestWords('ci q/run', 'how long the oldest queued run in the last 48 h has waited to start (since it was re-queued, if it was re-run)') + ' Green waiting: ' + greenWaitingText + ' PRs approved and green but not yet enqueued.' + greenWaitWords, ciOld.cls, null, null, 'ci run', shipHistorySpark(sp.ci, 'ci'), 'green waiting: ' + greenWaitingText + (greenSub ? ' · ' + greenSub : '') + (greenWaitSub ? ' · ' + greenWaitSub : ''), null, d.ci_last_run_started_at) + shipArrow('ci q/run', '⚙', arrowByKey['ci-green'], 'Distinct PRs with a green Pre-Merge Gate run this hour (workflow 255384592)', d.ci_running, wFor('ci-green'), isB('ci-green'), null, null, 'right', true) +
             // 'review routed' is row 1's own end - LORE order 17 #3: the turn
             // to 'in review' at the start of row 2 is now a real vertical
             // belt (position:absolute, JS-synced - see positionShipElbows),
             // not a bare glyph, carrying item #6 (Green Circuit) of the
             // order-17 chain.
-            shipStage(d.review_routed ?? null, 'review routed', '', '', null, HELP.reviewRouted, '', 'review-routed', [], null, null, null, null, d.review_routed_last_at)
-            + shipArrow('review routed', '⤵', null, 'Reviewed items moving into review', null, null, false, String(d.review_routed ?? '?'), null, 'right', true, 'ship-elbow-1');
+            shipStage(d.review_routed ?? null, 'review routed', '', '', null, HELP.reviewRouted, '', 'review-routed', [], null, null, null, null, d.review_routed_last_at) + shipArrow('review routed', '⤵', null, 'Reviewed items moving into review', null, null, false, String(d.review_routed ?? '?'), null, 'right', true) +
+            // Ben: 7 stages per row. 'in review' is row 1's 7th and its own
+            // end - the turn down to 'gate verdicts' at the start of row 2 is
+            // the tall row-end belt (position:absolute, JS-sized to span both
+            // rows - see positionShipElbows), carrying item #7 (Red Circuit).
+            shipStage(d.in_review ?? null, 'in review', '', '', null, HELP.inReview, '', 'in-review', [], null, null, null, null, d.in_review_last_at)
+            + shipArrow('in review', '👁', null, 'PRs currently under human/AI review', null, null, false, String(d.in_review ?? '?'), null, 'right', true, 'ship-elbow-1');
 
-        // Row 2: in review -> gate verdicts -> conflicted -> resolved, in
-        // source order; the CSS row-reverse puts 'in review' at the right
-        // edge under 'review routed'.
+        // Row 2: gate verdicts -> conflicted -> resolved -> approved -> in
+        // line -> merged today -> folded, in source order; the CSS
+        // row-reverse puts 'gate verdicts' at the right edge under 'in
+        // review'.
         const row2 =
-            // NEW decorative arrow (no formal rate instrument existed for this
-            // transition either before or after the rebalance): in review was
-            // previously row 1's own dead end and never needed one.
-            shipStage(d.in_review ?? null, 'in review', '', '', null, HELP.inReview, '', 'in-review', [], null, null, null, null, d.in_review_last_at) + shipArrow('in review', '👁', null, 'PRs currently under human/AI review', null, null, false, String(d.in_review ?? '?'), null, 'left', true) +
             // Round 3 (Elrond review, PR #35): gate_verdicts has been null
             // since PR #34 dropped statusCheckRollup - the same "I cannot
             // know this" status as 'resolved', so it renders 'n/a' the same
@@ -9517,21 +9583,23 @@ function shipFlowHtml(d) {
             // 'resolved' is row 2's own end - LORE order 17 #3: the turn to
             // 'approved' at the start of row 3 is now a real vertical belt
             // too, carrying item #10 (Speed Module 3).
-            shipStage(d.resolved === null || d.resolved === undefined ? 'n/a' : d.resolved, 'resolved', '', '', null, HELP.resolved + ((d.resolved === null || d.resolved === undefined) && d.resolved_na_reason ? ' (' + d.resolved_na_reason + ')' : ''), '', 'resolved', [], null, null, null, null, null)
-            + shipArrow('resolved', '⤵', null, 'Resolved conflicts moving toward approval', null, null, false, String(d.resolved ?? 'n/a'), null, 'left', true, 'ship-elbow-2');
-
-        // Row 3: approved -> in line -> merged today -> folded -> deployed,
-        // left to right - five stages fill the row instead of one.
-        const row3 =
+            shipStage(d.resolved === null || d.resolved === undefined ? 'n/a' : d.resolved, 'resolved', '', '', null, HELP.resolved + ((d.resolved === null || d.resolved === undefined) && d.resolved_na_reason ? ' (' + d.resolved_na_reason + ')' : ''), '', 'resolved', [], null, null, null, null, null) + shipArrow('resolved', '⤵', null, 'Resolved conflicts moving toward approval', null, null, false, String(d.resolved ?? 'n/a'), null, 'left', true) +
             // SHIP-16-FIX: this used to feed the now-removed 'green waiting' square;
             // it now points straight at 'in line' - approved PRs move toward the
-            // queue, and green-waiting's own count/age live as ci q/run's sub-line above.
-            shipStage(d.approved ?? null, 'approved', '', '', null, HELP.approved, '', 'approved', [], null, null, null, null, d.approved_last_at) + shipArrow('approved', '✅', arrowByKey['green-inline'], 'Approved PRs not yet merged', null, wFor('green-inline'), isB('green-inline'), null, null, 'right', true) +
-            shipStage(queueNum, 'in line', queueCls, queueSub, null, queueHelp, queueOld.cls, 'in-line', d.queue_prs, 'in queue', shipHistorySpark(sp.queue, 'queue'), null, null, null) + shipArrow('in line', '⚡', arrowByKey['inline-merged'], 'Merge queue entries', d.queue_depth, wFor('inline-merged'), isB('inline-merged'), null, null, 'right', true) +
-            shipStage(d.merged_today, 'merged today', 'ok', mergedSub, d.merged_spark, HELP.merged + shipOldestWords('merged today', 'minutes since the last merge'), mergedStage, 'merged-today', d.merged_today_prs, null, shipHistorySpark(sp.merged, 'merged'), null, null, d.last_merge_at) + shipArrow('merged today', '⚡', arrowByKey['merged-deploy'], 'Production deploy workflows in flight, or merge awaiting deploy', shipDeployCount(d), wFor('merged-deploy'), isB('merged-deploy'), null, null, 'right', true) +
-            // NEW decorative arrow: folded->deployed had no arrow at all
-            // before (it was the old row2/row3 break) - now within row 3.
-            shipStage(d.folded ?? null, 'folded', '', '', null, HELP.folded, '', 'folded', [], null, null, null, null, d.folded_last_at) + shipArrow('folded', '🚀', null, 'Deploy workflows folded into this run', null, null, false, String(d.folded ?? '?'), null, 'right', true) +
+            // queue, and green-waiting's own count/age live as ci run's sub-line above.
+            shipStage(d.approved ?? null, 'approved', '', '', null, HELP.approved, '', 'approved', [], null, null, null, null, d.approved_last_at) + shipArrow('approved', '✅', arrowByKey['green-inline'], 'Approved PRs not yet merged', null, wFor('green-inline'), isB('green-inline'), null, null, 'left', true) +
+            shipStage(queueNum, 'in line', queueCls, queueSub, null, queueHelp, queueOld.cls, 'in-line', d.queue_prs, 'in queue', shipHistorySpark(sp.queue, 'queue'), null, null, null) + shipArrow('in line', '⚡', arrowByKey['inline-merged'], 'Merge queue entries', d.queue_depth, wFor('inline-merged'), isB('inline-merged'), null, null, 'left', true) +
+            shipStage(d.merged_today, 'merged today', 'ok', mergedSub, d.merged_spark, HELP.merged + shipOldestWords('merged today', 'minutes since the last merge'), mergedStage, 'merged-today', d.merged_today_prs, null, shipHistorySpark(sp.merged, 'merged'), null, null, d.last_merge_at) + shipArrow('merged today', '⚡', arrowByKey['merged-deploy'], 'Production deploy workflows in flight, or merge awaiting deploy', shipDeployCount(d), wFor('merged-deploy'), isB('merged-deploy'), null, null, 'left', true) +
+            // 'folded' is row 2's 7th and its own end - the turn down to
+            // 'deployed' (row 3's lone stage for now; Ben expects more steps
+            // to land here) is the second tall row-end belt, carrying item
+            // #14 (Rocket).
+            shipStage(d.folded ?? null, 'folded', '', '', null, HELP.folded, '', 'folded', [], null, null, null, null, d.folded_last_at)
+            + shipArrow('folded', '🚀', null, 'Deploy workflows folded into this run', null, null, false, String(d.folded ?? '?'), null, 'left', true, 'ship-elbow-2');
+
+        // Row 3: deployed, alone for now (Ben: "it's ok if the bottom row
+        // only has 1 or two" - more steps are expected to land here).
+        const row3 =
             shipStage(noDeploy ? 'n/a' : (d.deployed_prs_today === null || d.deployed_prs_today === undefined ? '?' : d.deployed_prs_today), 'last deploy', 'ok', deployLastLine, null, (noDeploy ? 'no deploy workflow on ' + (d.repo_name || d.repo_full || 'this repo') : HELP.lastdep + shipOldestWords('last deploy', 'minutes since the last deploy, counted only while main has commits newer than it') + deployWords), deployStateCls, 'last-deploy', (d.deployed_prs_today_list || []).map(n => ({number:n,title:'deployed'})), 'deployed', shipHistorySpark(sp.deploy, 'deploy'), null, null, d.last_deploy_at);
 
         // Round 2 (Elrond review, PR #35, defect 3): the turns used to be a
@@ -9899,7 +9967,7 @@ const HELP = {
     routesum:  'LOADED ROUTES - how many of your local model routes have their model actually sitting in memory right now, out of the total number of local routes. Grey dots are idle, not broken: models unload after sitting unused, and the next request loads them again. Only red is a real fault.',
     issues:    'ISSUES OPEN - open tickets on this repository.',
     prs:       'PULL REQUESTS OPEN - finished work waiting to be reviewed and merged.',
-    ciqr:      'CI QUEUED / RUNNING - automated test runs waiting to start, and runs happening now. A growing queued number means you are short on runners.',
+    ciqr:      'CI RUN - automated test runs happening right now. Queued runs waiting to start show as items packed on the belt to the left (PRS OPEN -> CI RUN); a backed-up belt there means you are short on runners.',
     merged:    'MERGED TODAY - pull requests that landed in the main branch today. The little bars are the last seven days, so you can see whether today is normal.',
     inLine: 'IN LINE - pull requests the merge queue is testing right now. Two is full and good. Zero means nothing is being merged.',
     greenWaiting: 'GREEN WAITING - approved pull requests with every required test passing and no open review gate that are not in the merge line yet. Zero is good. If this grows, the line is not being fed.',

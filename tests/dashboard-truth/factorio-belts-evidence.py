@@ -75,7 +75,12 @@ pipeline_fixture_no_data = dict(pipeline_fixture, prs_open=None, prs_open_last_a
 # can't show every one of the 14 belts carrying an item at once. This
 # fixture gives both a real, small count so the full item chain - and the
 # "readable bug to rocket" evidence screenshot - can be proven end to end.
-pipeline_fixture_full_chain = dict(pipeline_fixture, gate_verdicts=3, resolved=2)
+# Ben's queue model: a belt shows the jobs waiting to enter the next stage
+# (arrow.backlog), so the merged-deploy arrow's measured-zero queue in the
+# main fixture correctly renders an EMPTY belt there; this fixture gives it
+# one waiting job so the full chain (bug -> rocket) renders end to end.
+pipeline_fixture_full_chain = dict(pipeline_fixture, gate_verdicts=3, resolved=2,
+    arrows=[dict(a, backlog=(1 if a['key'] == 'merged-deploy' else a['backlog'])) for a in pipeline_fixture['arrows']])
 
 # Order 15: the three biter states, keyed off the SAME thresholds bugsCls
 # already uses for the number's own colour (0 neutral, 1-4 warn, >=5 hot) -
@@ -170,8 +175,11 @@ with sync_playwright() as p:
     # long axis (height, since every belt is now taller than wide).
     belt_height = page.eval_on_selector('.ship-belt-vertical', 'el => el.getBoundingClientRect().height')
     assert belt_height >= 48, belt_height
-    # Round 2 defect 5: row 3 is no longer a lone square.
-    assert page.locator('.ship-row-3 .ship-stage').count() == 5
+    # Ben: 7 stages per row, row 3 holds whatever is left (1 for now - more
+    # steps are expected to land there).
+    assert page.locator('.ship-row-1 .ship-stage').count() == 7
+    assert page.locator('.ship-row-2 .ship-stage').count() == 7
+    assert page.locator('.ship-row-3 .ship-stage').count() == 1
 
     # Order 17 #1 "THE REAL ITEM CHAIN": the underlying mapping (not the
     # rendered DOM, since gate_verdicts/resolved legitimately render zero
@@ -250,13 +258,20 @@ with sync_playwright() as p:
         assert cap_box['x'] >= flow_left, (square, 'clipped at left edge', cap_box, flow_left)
         assert cap_box['x'] + cap_box['width'] <= flow_right, (square, 'clipped at right edge', cap_box, flow_right)
 
-    # Round 2 defect 3: the row-turn elbows must sit tucked against their
-    # anchor square, not floating - within ~40px of it in both axes.
-    for elbow_id, anchor_square in (('ship-elbow-1', 'review routed'), ('ship-elbow-2', 'resolved')):
+    # Ben's reference: each row-end belt is a tall column beside the row's
+    # last stage that runs all the way down to beside the next row's first
+    # stage - its top is at the from-stage's top and its bottom reaches the
+    # to-stage's bottom, not a short stub floating in the gap between rows.
+    for elbow_id, from_sq, to_sq in (('ship-elbow-1', 'in review', 'gate verdicts'), ('ship-elbow-2', 'folded', 'last deploy')):
         elbow_box = page.locator('#' + elbow_id).bounding_box()
-        anchor_box = page.locator('[data-square="' + anchor_square + '"]').bounding_box()
-        assert elbow_box and anchor_box, (elbow_id, anchor_square)
-        assert abs(elbow_box['y'] - anchor_box['y'] - anchor_box['height']) < 40, (elbow_id, elbow_box, anchor_box)
+        from_box = page.locator('[data-square="' + from_sq + '"]').bounding_box()
+        to_box = page.locator('[data-square="' + to_sq + '"]').bounding_box()
+        assert elbow_box and from_box and to_box, (elbow_id, from_sq, to_sq)
+        assert abs(elbow_box['y'] - from_box['y']) < 6, (elbow_id, 'top not at from-stage top', elbow_box, from_box)
+        assert abs((elbow_box['y'] + elbow_box['height']) - (to_box['y'] + to_box['height'])) < 6, (elbow_id, 'bottom not at to-stage bottom', elbow_box, to_box)
+        # Row 3's lone stage sits under row 2's last stage: the belt must be
+        # a straight column beside both, never overlapping either.
+        assert elbow_box['x'] >= from_box['x'] + from_box['width'] or elbow_box['x'] + elbow_box['width'] <= from_box['x'], (elbow_id, 'overlaps from-stage', elbow_box, from_box)
 
     # Order 14 "the inserters must swing": a moving inserter's arm carries a
     # real animation, its duration is BOUND to the measured rate (two
