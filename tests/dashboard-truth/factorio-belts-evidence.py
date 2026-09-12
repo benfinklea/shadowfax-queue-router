@@ -633,10 +633,38 @@ with sync_playwright() as p:
     def wrap_box(sq):
         return page.locator('[data-square="' + sq + '"] .ship-sprite-wrap').bounding_box()
     assert wrap_box('dispatched')['width'] == 72 and wrap_box('dispatched')['height'] == 72, wrap_box('dispatched')
-    assert wrap_box('issues open')['width'] == 24 and wrap_box('issues open')['height'] == 24, wrap_box('issues open')
+    # Ben (3:40 PM): the chest is drawn 3x3 like the machines - his one
+    # deliberate departure from real scale, so every station reads alike.
+    assert wrap_box('issues open')['width'] == 72 and wrap_box('issues open')['height'] == 72, wrap_box('issues open')
     assert wrap_box('last deploy')['width'] == 216 and wrap_box('last deploy')['height'] == 216, wrap_box('last deploy')
-    assert abs(wrap_box('dispatched')['width'] / wrap_box('issues open')['width'] - 3) < 0.01, 'an assembler is 3 chests wide'
-    assert abs(wrap_box('last deploy')['width'] / wrap_box('issues open')['width'] - 9) < 0.01, 'the silo is 9 chests wide'
+    assert abs(wrap_box('last deploy')['width'] / wrap_box('dispatched')['width'] - 3) < 0.01, 'the 9x9 silo is three 3x3 machines wide'
+    # Ben: "the row 2 belts are too low" / "the inserters have to be right
+    # between the belt and the item they're inserting into - if they're off
+    # they can't reach it." Every in-row belt is exactly the machine's
+    # height and sits level with it (top AND bottom, so both end inserters
+    # are beside the machine), and each inserter touches the machine it
+    # serves: zero gap between the loader and the upstream footprint, and
+    # between the unloader and the downstream footprint. Checked for all
+    # eleven in-row belts, in every row.
+    geometry = page.evaluate('''() => { const R = e => e.getBoundingClientRect();
+        return [...document.querySelectorAll('.ship-arrow-vbelt')].map(a => {
+            let pe = a.previousElementSibling; while (pe && !pe.classList.contains('ship-stage')) pe = pe.previousElementSibling;
+            let ne = a.nextElementSibling; while (ne && !ne.classList.contains('ship-stage')) ne = ne.nextElementSibling;
+            const p = R(pe.querySelector('.ship-sprite-wrap')), n = R(ne.querySelector('.ship-sprite-wrap'));
+            const ins = a.querySelectorAll(':scope > .ship-inserter'); const b = R(a.querySelector('.ship-belt')); const l = R(ins[0]), u = R(ins[1]);
+            const gap = (x, y) => Math.max(x.left - y.right, y.left - x.right);
+            return {sq: a.dataset.squareLeft, top: b.top - p.top, bottom: b.bottom - p.bottom, loadGap: gap(l, p), unloadGap: gap(u, n),
+                    loadLevel: l.top >= p.top - 1 && l.bottom <= p.bottom + 1, unloadLevel: u.top >= n.top - 1 && u.bottom <= n.bottom + 1}; }); }''')
+    assert len(geometry) == 11, geometry
+    for g in geometry:
+        assert abs(g['top']) < 2 and abs(g['bottom']) < 2, (g['sq'], 'belt not exactly beside the machine', g)
+        assert abs(g['loadGap']) <= 1, (g['sq'], 'loader does not touch the upstream machine', g)
+        assert abs(g['unloadGap']) <= 1, (g['sq'], 'unloader does not touch the downstream machine', g)
+        assert g['loadLevel'] and g['unloadLevel'], (g['sq'], 'an inserter is not level with its machine', g)
+    # The row-end columns touch the machines too.
+    for elbow_id, sq in (('ship-elbow-1', 'in review'), ('ship-elbow-3', 'gate verdicts')):
+        e = page.locator('#' + elbow_id).bounding_box(); w = wrap_box(sq)
+        assert abs(e['x'] - (w['x'] + w['width'])) <= 1, (elbow_id, 'column inserters do not touch', e, w)
     plat = page.locator('.ship-inserter .inserter-platform').first.bounding_box()
     assert plat['width'] == 39 and plat['height'] == 30, plat
     hand = page.locator('.ship-inserter .inserter-arm').first.evaluate("el => [el.offsetWidth, el.offsetHeight]")
@@ -723,6 +751,43 @@ with sync_playwright() as p:
         assert not overlap(closed, ab), ('closed list overlaps a row-2 belt', closed, ab)
     assert not overlap(closed, box('#ship-elbow-4')), 'closed list overlaps the shared belt'
     page.screenshot(path=str(OUT / 'one-screen-1512x850.png'))
+    browser.close()
+
+# CLICK LISTS (Ben, 3:44 PM CDT 2026-09-12): "when clicking on most squares,
+# they say 'no live agents on this square' - not that helpful. What could we
+# put there instead?" A click shows what is INSIDE the square: its PRs where
+# it holds PRs, otherwise one plain sentence with the GitHub view that lists
+# those things. "No live agents" never appears.
+pipeline_fixture_lists = dict(pipeline_fixture,
+    in_review_prs=[{'number': 7601, 'title': 'fix(hq): sidebar nav'}],
+    approved_prs=[{'number': 7602, 'title': 'feat: approved thing'}, {'number': 7603, 'title': 'second approved'}],
+    conflicted_prs=[{'number': 7604, 'title': 'conflicted rebase'}],
+    review_routed_prs=[{'number': 7605, 'title': 'routed to a reviewer'}])
+with sync_playwright() as p:
+    browser, page = render(p, pipeline_fixture_lists)
+    def click_list(sq):
+        page.locator('.ship-stage[data-square="' + sq + '"]').click()
+        page.wait_for_timeout(150)
+        panel = page.locator('.ship-stage[data-square="' + sq + '"] .ship-dropdown')
+        assert not panel.get_attribute('hidden') and panel.get_attribute('hidden') is None, (sq, 'list did not open')
+        text = panel.inner_text()
+        page.locator('.ship-stage[data-square="' + sq + '"]').click()   # close again
+        page.wait_for_timeout(100)
+        return text
+    t = click_list('in review');   assert '#7601' in t and 'fix(hq)' in t, t   # titles are shortened by shipShortTitle
+    t = click_list('approved');    assert '#7602' in t and '#7603' in t, t
+    t = click_list('conflicted');  assert '#7604' in t, t
+    t = click_list('review routed'); assert '#7605' in t, t
+    t = click_list('ci q/run');    assert 'GitHub Actions' in t and 'in progress: 2' in t, t
+    t = click_list('bugs found');  assert 'issues opened in the last 24 hours: 3' in t and 'GitHub' in t, t
+    # issues open has a live lane in agents_fixture, so its list is the lane, not the sentence
+    t = click_list('issues open'); assert 'agents' in t and 'open issues' not in t, t
+    t = click_list('gate verdicts'); assert t.startswith('n/a') and 'statusCheckRollup' in t, t
+    t = click_list('folded');      assert 'not yet folded' in t and '1' in t, t
+    assert 'No live agents' not in page.locator('#ship-flow').inner_text() and page.locator('.ship-dropdown', has_text='No live agents').count() == 0
+    # ...and the merge queue / merged / deployed lists still list their PRs
+    # (queue_prs etc. are empty in this fixture, so their sentence shows).
+    t = click_list('in line');     assert 'merge queue is empty' in t, t
     browser.close()
 
 # Order 14 evidence: at least three frames at different points in the swing,

@@ -5545,6 +5545,14 @@ PR_OPEN_BUCKET_ORDER = ("drafts", "human-gated", "conflicted", "unreviewed",
                         "approved, checks failing", "ready to merge")
 
 
+def _pr_rows(prs, limit=40):
+    """The rows a stage's click-list shows: number + title of every PR in it
+    (Ben, 3:44 PM CDT 2026-09-12: "no live agents on this square" is not
+    helpful - show what is INSIDE the square). Oldest-updated first, capped."""
+    rows = sorted(prs, key=lambda p: p.get("updatedAt") or "")
+    return [{"number": p.get("number"), "title": p.get("title") or ""} for p in rows[:limit]]
+
+
 def _pr_open_breakdown(prs):
     """What is actually INSIDE the PRS OPEN tile, bucketed for its hover tooltip.
 
@@ -6148,11 +6156,13 @@ def get_pipeline_status(repo=None, default_branch=None, force_refresh=False):
                 routed = [p for p in all_open_prs
                           if any(l["name"].lower().endswith(REVIEW_ROUTED_LABEL_SUFFIX) for l in p.get("labels", []))]
                 result["review_routed"] = len(routed)
+                result["review_routed_prs"] = _pr_rows(routed)
                 routed_ats = [p["updatedAt"] for p in routed if p.get("updatedAt")]
                 result["review_routed_last_at"] = max(routed_ats) if routed_ats else None
 
                 in_rev = [p for p in all_open_prs if p.get("reviewDecision") in ("REVIEW_REQUIRED", "CHANGES_REQUESTED")]
                 result["in_review"] = len(in_rev)
+                result["in_review_prs"] = _pr_rows(in_rev)
                 rev_subs = [rv.get("submittedAt") for p in in_rev for rv in (p.get("reviews") or []) if rv.get("submittedAt")]
                 result["in_review_last_at"] = max(rev_subs) if rev_subs else None
 
@@ -6171,6 +6181,7 @@ def get_pipeline_status(repo=None, default_branch=None, force_refresh=False):
 
                 conflicted = [p for p in all_open_prs if p.get("mergeable") == "CONFLICTING"]
                 result["conflicted"] = len(conflicted)
+                result["conflicted_prs"] = _pr_rows(conflicted)
                 conf_ats = [p["updatedAt"] for p in conflicted if p.get("updatedAt")]
                 result["conflicted_last_at"] = max(conf_ats) if conf_ats else None
 
@@ -6183,6 +6194,7 @@ def get_pipeline_status(repo=None, default_branch=None, force_refresh=False):
 
                 approved = [p for p in all_open_prs if p.get("reviewDecision") == "APPROVED"]
                 result["approved"] = len(approved)
+                result["approved_prs"] = _pr_rows(approved)
                 appr_ats = [rv.get("submittedAt") for p in approved for rv in (p.get("reviews") or [])
                             if rv.get("state") == "APPROVED" and rv.get("submittedAt")]
                 result["approved_last_at"] = max(appr_ats) if appr_ats else None
@@ -6195,7 +6207,8 @@ def get_pipeline_status(repo=None, default_branch=None, force_refresh=False):
                     ("queue_oldest_min", None), ("green_oldest_min", None),
                     ("has_merge_queue", None), ("prs_oldest_min", None),
                     ("prs_open_last_at", None), ("prs_open_breakdown", None),
-                    ("review_routed", None),
+                    ("review_routed", None), ("review_routed_prs", []), ("in_review_prs", []),
+                    ("conflicted_prs", []), ("approved_prs", []),
                     ("review_routed_last_at", None), ("in_review", None),
                     ("in_review_last_at", None), ("gate_verdicts", None),
                     ("gate_verdicts_last_at", None), ("conflicted", None),
@@ -7402,7 +7415,7 @@ box-shadow:0 0 7px rgba(255,0,68,0.3)}
    the next time either changes): now there is always slack for an
    edge-stage caption to overflow into, independent of exactly how wide the
    belts get tuned to be. */
-.ship-flow-wrap{display:flex;flex-direction:column;gap:0;padding:0 64px;
+.ship-flow-wrap{display:flex;flex-direction:column;gap:0;padding:0 40px;
 /* Ben (10:50 AM, 2026-09-12): "give it more of a grassland backdrop - look
    in the art folder." ground-grass.jpg is two 1024x256 runs of the game's
    own grass-1 terrain sheet (the big blended variants with the dirt
@@ -7418,20 +7431,32 @@ background-repeat:repeat;background-size:1536px 768px;border-radius:6px}
    inserters + belt, ~144px tall) that now sits in the turn between rows,
    position:absolute and JS-synced (positionShipElbows), replacing the old
    bare turn glyph that only needed a few px of clearance. */
-.ship-flow{display:flex;align-items:stretch;gap:0;flex-wrap:wrap;margin:0 0 9px 0}
+.ship-flow{display:flex;align-items:stretch;gap:0;flex-wrap:wrap;margin:0}
 /* Ben: "the rows can be closer together" - the row-end belt now spans
    from the from-stage's top to the to-stage's bottom regardless of this
    gap (positionShipElbows sizes it), so the gap only needs to be enough
    for the belt to visibly read as a run between the rows, not to hold it. */
+/* The inner strip (#ship-flow) carries only enough side padding for the
+   first/last station's caption to overflow onto; the outer wrap's 64px
+   keeps the frame. Any more and, at 1440 wide, row 1 plus its row-end
+   column no longer fits and the column gets clamped INTO 'in review'. */
+#ship-flow.ship-flow-wrap{padding:0 75px 0 12px}
+/* Rows 2 and 3 are row-reversed (right-aligned); row 1 ends at the same
+   right edge so IN REVIEW sits over GATE VERDICTS over CONFLICTED and the
+   row-end column is one straight line. The 75px right padding is that
+   column's 63px plus the caption slack. */
+.ship-flow.ship-row-1{justify-content:flex-end}
 /* Ben (3:27 PM, 2026-09-12): "tighten everything up vertically - the full
    CI/CD should fit on one screen easily." The row-end belts span sprite to
    sprite whatever the gap, so the rows only need enough air to read as
    rows. Row 3 (the conflict loop + closed-issues list, all of it right of
    x~360) is pulled UP into the empty ground beside the 9x9 silo's lower
    half, which is what row 2's height is made of. */
-.ship-flow.ship-row-1{margin-bottom:14px}
+.ship-flow.ship-row-1{margin-bottom:84px}
 .ship-flow.ship-row-2{margin-bottom:0}
-.ship-flow.ship-row-3{margin-top:-98px}
+/* Row 3's captions hang below its footprints (text blocks are absolute),
+   so the strip keeps that much ground under them. */
+.ship-flow.ship-row-3{margin-top:-77px;margin-bottom:45px}
 /* Ben's 10:08 AM rig (2026-09-12): row 2 AND row 3 both start at the right
    edge, under 'in review' - row 3 is the short conflict side-loop
    (conflicted, resolved) hanging under gate verdicts / approved, so it is
@@ -7456,9 +7481,20 @@ padding-right:12px;white-space:nowrap}
    stage with no sparkline reserves the sparkline's slot (.ship-hist-spacer)
    so its sprite is not higher than a neighbour's that has one, which is
    what had the shared belt's unloader 32px off IN QUEUE's chest. */
+/* Ben (3:41 PM, 2026-09-12): "the inserters have to be right between the
+   belt and the item they're inserting into. If they're off, they can't
+   reach it." So a station's box is exactly its sprite's footprint wide -
+   the inserter on either side touches the machine - and the caption, sub-
+   lines and age hang BELOW the footprint in an absolutely-positioned text
+   block that may overflow the box sideways (it never widens it). */
 .ship-stage{background:none;border:0;border-radius:0;
-padding:7px 6px;min-width:92px;text-align:center;display:flex;flex-direction:column;
+padding:7px 0;min-width:72px;width:72px;text-align:center;display:flex;flex-direction:column;
 align-items:center;justify-content:flex-start;gap:2px;cursor:pointer}
+.ship-stage:has(.kind-silo){width:216px;min-width:216px}
+.ship-stage-text{position:absolute;top:calc(var(--ship-ground,33px) + 72px + 2px);left:50%;transform:translateX(-50%);
+display:flex;flex-direction:column;align-items:center;gap:2px;width:max-content;max-width:170px;z-index:2;pointer-events:none}
+.ship-sprite-wrap.kind-silo ~ .ship-stage-text{top:calc(var(--ship-ground,33px) + 216px + 2px)}
+
 .ship-hist-spacer{height:22px;margin:0 auto 2px auto}
 .ship-stage{position:relative}
 /* SHIP-GAME item 0: the whole box is the click target now (no caret button) -
@@ -7469,6 +7505,8 @@ align-items:center;justify-content:flex-start;gap:2px;cursor:pointer}
 .ship-dropdown[hidden]{display:none}
 .ship-stage{position:relative}
 .ship-agents{padding-bottom:6px;margin-bottom:5px;border-bottom:1px solid #364563}
+.ship-empty{font-size:12px;color:#c7cee0;white-space:normal;line-height:1.35}
+.ship-empty a{color:var(--neon-cyan)}
 .ship-agent-row{font-size:12px;white-space:nowrap;padding:3px 0}
 .ship-agent-row a{color:var(--neon-cyan)}
 .ship-fleet{font-size:12px;color:#c7cee0;margin:0}
@@ -7508,12 +7546,18 @@ align-items:center;justify-content:flex-start;gap:2px;cursor:pointer}
    footprint; the sprite overhangs it exactly as the sheet overhangs the
    footprint in game. */
 .ship-sprite-wrap{position:relative;width:72px;height:72px;margin:0 auto;flex:0 0 auto}
-.ship-sprite-wrap.kind-chest{width:24px;height:24px;margin-top:22px}
-.ship-sprite-wrap.kind-robot{width:30px;height:30px;margin-top:22px}
+/* Ben (3:40 PM): "you can make the steel boxes bigger to match the size of
+   the assembler" - the one deliberate departure from real scale: a chest
+   drawn 3x3 like the machines (its 64x80 sheet at 72x90), so a stage's
+   number and caption read the same on every station. */
+.ship-sprite-wrap.kind-chest{width:72px;height:72px}
+/* The biter nest is a 3x3 footprint too (so the inserter beside it
+   reaches), the biter itself drawn 40px in its middle. */
+.ship-sprite-wrap.kind-robot{width:72px;height:72px}
 .ship-sprite-wrap.kind-silo{width:216px;height:216px}
 /* A 1-tile entity is too small to carry its number on top - it sits just
    above, alt-mode style. */
-.ship-sprite-wrap.kind-chest .ship-num,.ship-sprite-wrap.kind-robot .ship-num{bottom:auto;top:-24px}
+
 .ship-sprite{position:absolute;left:0;top:0;width:100%;height:100%;
 background-repeat:no-repeat;image-rendering:pixelated;pointer-events:none;opacity:.95;
 filter:var(--ground-shadow)}
@@ -7528,9 +7572,9 @@ filter:var(--ground-shadow)}
 .ship-inserter.remnant .inserter-arm{opacity:.15!important;animation:none!important}
 /* Standard icon sheets are Factorio mip chains: 64+32+16+8=120 wide, 64 tall -
    the first (64x64) mip scaled to the 24x24 slot. */
-.ship-sprite.ico{background-size:56px 30px;background-position:0 0}
+.ship-sprite.ico{width:40px;height:40px;left:16px;top:14px;background-size:75px 40px;background-position:0 0}
 /* steel-chest.png 64x80 @0.5, shift by_pixel(-0.25,-0.5): 24x30 on a 24px footprint. */
-.ship-sprite.chest-ico{width:24px;height:30px;top:-3px;background-size:24px 30px;background-position:0 0;image-rendering:auto}
+.ship-sprite.chest-ico{width:72px;height:90px;top:-9px;background-size:72px 90px;background-position:0 0;image-rendering:auto}
 /* The rocket silo composite (shadow, hole, doors, base, front - each at its
    Lua shift) is 261px over the 216px 9x9 footprint. */
 .ship-sprite.silo-ico{width:261px;height:261px;left:-22px;top:-22px;background-size:261px 261px;image-rendering:auto}
@@ -7686,9 +7730,9 @@ border-radius:1px 1px 0 0;min-height:1px}
    width wider than the machine, a touch taller, and on the same dark plate
    as the captions so the line reads. */
 .ship-history-spark{display:block;width:100%;height:22px}
-.ship-stage>.ship-history-spark,.ship-stage .ship-issues-rate{width:110px;min-width:110px;margin:0 auto 2px auto}
+.ship-stage>.ship-history-spark,.ship-stage .ship-issues-rate{width:110px;min-width:110px;flex:0 0 auto;margin:0 auto 2px auto}
 .ship-stage>.ship-history-spark{height:22px;background:rgba(0,0,0,.5);border-radius:3px;padding:2px 3px;box-sizing:border-box}
-.ship-stage .ship-issues-rate{background:rgba(0,0,0,.5);border-radius:3px;padding:2px 3px;box-sizing:border-box;height:auto}
+.ship-stage .ship-issues-rate{background:rgba(0,0,0,.5);border-radius:3px;padding:2px 3px;box-sizing:border-box;height:22px}
 .ship-stage .ship-issues-rate .ship-history-spark{height:22px}
 /* SHIP-SPARK-3 hover-tooltip fix: SHIP-SPARK/SHIP-SPARK-2 used a native SVG
    <title> per column, which real hover shows fine but a headless-Chrome
@@ -7913,12 +7957,12 @@ font-size:0.85em;letter-spacing:0.5px;vertical-align:middle}
    apart. flex:0 0 auto sizes every stage the same across all three rows
    regardless of how many share the row - the leftover width now collects
    at the row's own far edge instead of between every stage. */
-.ship-stage{flex:0 1 auto;min-width:0;padding:8px 3px}
+.ship-stage{flex:0 0 auto;padding:7px 0}
 /* 7 stages per row (Ben) at a 1440 viewport: captions may wrap to a
    second line and sub-lines may wrap too - the numerals stay full size
    (legibility beats fidelity applies to the count, not the label). */
 .ship-cap{font-size:.6em;letter-spacing:.5px;white-space:normal;line-height:1.15;max-width:96px}
-.ship-sub{font-size:.72em;white-space:normal;max-width:110px}
+.ship-sub{font-size:.72em;white-space:normal;max-width:150px}
 /* Ben: "give the stage text more contrast - I can't read them. Same for
    the time stamps." Light-grey text with an outline still sank into the
    tan sand; the fix is the same one order 11 already permits for the
@@ -7994,8 +8038,13 @@ display:block;flex:none;background:transparent;border:0;z-index:4}
    arrows (.ship-arrow-vertical above) are the opposite case: the blocks
    they connect really are stacked above/below on screen, so those stay a
    column stack. */
+/* Ben (3:40 PM, 2026-09-12): "the row 2 belts are too low - move them up."
+   They were centred in the row's band, which the 9x9 silo makes tall; a
+   belt belongs at machine height, so every in-row belt pins to the row's
+   ground line: 7px stage padding + the 24px sparkline slot = 31px down,
+   where every sprite's top sits. */
 .ship-arrow-vbelt{flex-direction:row;flex:0 0 auto;width:auto;height:auto;
-gap:0;padding:2px 0;align-self:center;align-items:center}
+gap:0;padding:0;align-self:flex-start;margin-top:var(--ship-ground,33px);align-items:center}
 /* Ben's built reference: each inserter sits at the belt's own beginning or
    end - top or bottom - never centered beside it, so it visibly interacts
    with the correct extreme of the belt (where items actually enter/exit)
@@ -8054,7 +8103,12 @@ animation:ship-belt-flow linear infinite;animation-duration:var(--belt-duration,
 /* Real scale: transport-belt.png frames are 128x128 @0.5 with the belt's
    own tile in the centre 64x64 - one tile wide (24px), one tile of tread
    per 24px. */
-.ship-belt-vertical{width:24px;height:140px;flex:0 0 auto}
+/* Ben (3:41 PM): an inserter at each end of the belt must be level with
+   the machine it reaches - so an in-row belt is exactly the machine's
+   height, three tiles: inserters on its top and bottom tiles, both beside
+   the 3x3 station. Items pack at the game's 4 per tile (SHIP_BELT_CAPACITY
+   12), so a backed-up belt reads as a dense line. */
+.ship-belt-vertical{width:24px;height:72px;flex:0 0 auto}
 /* Ben's built reference: each belt segment's own chevron faces the actual
    direction of travel (down), not sideways - the base tile's chevron is
    baked in pointing right (it's a horizontal-belt asset), so a vertical
@@ -8690,6 +8744,7 @@ function hideShipBreakdownTooltip() {
 
 let openShipDropdown = null;
 let shipAgents = null;
+let shipLastPipeline = null;   // the last /api/pipeline payload rendered (the click lists read counts from it)
 function shipEscape(value) {
     return String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
@@ -8760,14 +8815,48 @@ function shipStageKeydown(event, key) {
         toggleShipDropdown(key);
     }
 }
+// Ben (3:44 PM CDT 2026-09-12): "when clicking on most squares, they say
+// 'no live agents on this square' - not that helpful. What could we put
+// there instead?" A click now shows what is INSIDE the square: its PRs
+// (number + title, links) where the square holds PRs, its live lanes where
+// it holds lanes, and for the squares that are a count of something we do
+// not list (issues, CI runs, commits) a plain sentence plus the GitHub view
+// that lists them. The agents block only renders when there ARE agents.
 function shipAgentRows(agents) {
-    if (!agents.length) return '<div class="ship-agents"><strong>agents</strong><div>' + (shipAgents ? 'No live agents on this square' : 'Could not establish live agents') + '</div></div>';
+    if (!agents.length) return '';
     return '<div class="ship-agents"><strong>agents</strong>' + agents.map(agent => {
         const target = agent.target;
         const link = target ? '<a href="https://github.com/' + shipEscape(target.repo) + '/' + (target.pr ? 'pull' : 'issues') + '/' + Number(target.number) + '" target="_blank" rel="noopener noreferrer">#' + Number(target.number) + '</a>' : '';
         return '<div class="ship-agent-row">' + shipEscape(agent.session + ' ' + agent.window) + ' → ' + link
             + ' <span>' + shipEscape(Array.from(agent.title || '').slice(0, 15).join('')) + '</span></div>';
     }).join('') + '</div>';
+}
+// What a click on a square with nothing to LIST says instead - one line of
+// what the number is, and the GitHub page that lists those things.
+function shipEmptyListHtml(key, repoPath) {
+    const gh = 'https://github.com/' + shipEscape(repoPath);
+    const d = shipLastPipeline || {};
+    const n = v => (v === null || v === undefined) ? 'n/a' : v;
+    const map = {
+        'bugs-found':    ['issues opened in the last 24 hours: ' + n(d.bugs_found_24h), gh + '/issues?q=is%3Aissue+created%3A%3E%3D' + new Date(Date.now() - 86400000).toISOString().slice(0, 10), 'open them on GitHub'],
+        'issues-open':   ['open issues: ' + n(d.issues_open), gh + '/issues?q=is%3Aissue+is%3Aopen', 'open them on GitHub'],
+        'dispatched':    ['no lane is running right now - a lane is an AI seat working one issue', null, null],
+        'prs-open':      ['open pull requests: ' + n(d.prs_open) + ' (hover the station for the breakdown)', gh + '/pulls', 'open them on GitHub'],
+        'ci-q-run':      ['CI runs in progress: ' + n(d.ci_running) + ', queued: ' + n(d.ci_queued), gh + '/actions', 'open GitHub Actions'],
+        'review-routed': ['no open PR carries a reviewer label right now', gh + '/pulls', 'open the PRs'],
+        'in-review':     ['no open PR is waiting on a review verdict', gh + '/pulls?q=is%3Apr+is%3Aopen+review%3Arequired', 'open the PRs'],
+        'gate-verdicts': ['n/a - ' + (d.gate_verdicts_na_reason || 'no gate-verdict instrument'), null, null],
+        'conflicted':    ['no open PR has a merge conflict', gh + '/pulls', 'open the PRs'],
+        'resolved':      ['n/a - ' + (d.resolved_na_reason || 'no resolve instrument'), null, null],
+        'approved':      ['no open PR is approved and unmerged', gh + '/pulls?q=is%3Apr+is%3Aopen+review%3Aapproved', 'open the PRs'],
+        'in-line':       ['the merge queue is empty', gh + '/queue', 'open the merge queue'],
+        'merged-today':  ['nothing merged today yet', gh + '/pulls?q=is%3Apr+is%3Amerged', 'open merged PRs'],
+        'folded':        ['commits on master not yet folded into live: ' + n(d.folded), gh + '/compare/live...master', 'open the compare'],
+        'last-deploy':   ['deploys today: ' + n(d.deployed_prs_today), gh + '/actions', 'open GitHub Actions'],
+    };
+    const row = map[key] || ['nothing to list for this station', null, null];
+    return '<div class="ship-empty">' + shipEscape(row[0])
+        + (row[1] ? ' <a href="' + row[1] + '" target="_blank" rel="noopener noreferrer">' + shipEscape(row[2]) + '</a>' : '') + '</div>';
 }
 function shipFleetRow() {
     const el = document.getElementById('ship-fleet');
@@ -8789,8 +8878,9 @@ function shipDropdown(key, prs, agents) {
     // SHIP-GAME item 0: the ▾ caret button is gone - shipStage's own outer div
     // is the click/keyboard target that opens this panel now.
     const repoPath = (shipCurrentRepo && shipCurrentRepo.includes('/')) ? shipCurrentRepo : ('armbrain-io/' + (shipCurrentRepo || 'armbrain'));
+    const empty = (!agents.length && !prs.length) ? shipEmptyListHtml(key, repoPath) : '';
     return '<div class="ship-dropdown" id="ship-list-' + key + '"' + (open ? '' : ' hidden') + '>'
-        + shipAgentRows(agents)
+        + shipAgentRows(agents) + empty
         + prs.map(pr => '<div class="ship-pr" data-pr-number="' + pr.number + '"><a href="https://github.com/' + shipEscape(repoPath) + '/pull/' + pr.number + '" target="_blank" rel="noopener">#' + pr.number + '</a><span>' + shipEscape(shipShortTitle(pr.title)) + '</span>'
             + (key === 'in-line' ? '<span class="ship-sub ' + (pr.state === 'UNMERGEABLE' ? 'hot' : '') + '">' + (pr.state === 'UNMERGEABLE' ? 'stuck' : 'testing') + '</span>' : '') + '</div>').join('') + '</div>';
 }
@@ -8919,7 +9009,7 @@ const REMNANT_SPRITE = {
     'assembler': { url: '/static/factorio/remnants/assembling-machine-1-remnants.png', size: '75px 192px', pos: '0 0' },
     'lab.png': { url: '/static/factorio/remnants/lab-remnants.png', size: '88px 128px', pos: '0 0' },
     'radar.png': { url: '/static/factorio/remnants/radar-remnants.png', size: '85px 64px', pos: 'center' },
-    'chest/steel-chest-24.png': { url: '/static/factorio/remnants/steel-chest-remnants.png', size: '51px 30px', pos: '0 0' },
+    'chest/steel-chest-24.png': { url: '/static/factorio/remnants/steel-chest-remnants.png', size: '153px 90px', pos: '0 0' },
     // assembling-machine-3 wreckage: the AM1 remnant sheet stands in (same
     // footprint), scaled to the AM3 frame box.
     'asm3': { url: '/static/factorio/remnants/assembling-machine-1-remnants.png', size: '94px 240px', pos: '0 0' },
@@ -9021,7 +9111,7 @@ function shipStage(num, cap, cls, sub, spark, help, stageCls, dropdownKey, prs, 
          // it must never read as a measured 0, and must never look like a
          // second, competing "no data" signal next to the sprite/remnant.
          + (shownNum !== '' ? '<div class="ship-num ' + (cls || '') + '">' + shownNum + '</div>' : '') + '</div>'
-         + '<div class="ship-cap">' + (label || cap) + '</div>'
+         + '<div class="ship-stage-text"><div class="ship-cap">' + (label || cap) + '</div>'
          + (belowCap ? '<div class="ship-stage-drain">' + shipEscape(belowCap) + '</div>' : '')
          + (sub ? '<div class="ship-sub">' + sub + '</div>' : '')
          // SHIP-SPARK-2: a second, independent sub-line (e.g. green waiting's "Ave: 42m") -
@@ -9029,7 +9119,7 @@ function shipStage(num, cap, cls, sub, spark, help, stageCls, dropdownKey, prs, 
          // a distinct line, not just another " · "-joined clause of the first one.
          + (sub2 ? '<div class="ship-sub">' + sub2 + '</div>' : '')
          + shipAgeHtml(cap, lastActivity)
-         + (spark ? sparkHtml(spark) : '') + shipDropdown(key, prs || [], agents) + '</div>';
+         + (spark ? sparkHtml(spark) : '') + '</div>' + shipDropdown(key, prs || [], agents) + '</div>';
 }
 
 // stage 4 (prs open) assembler: running when its count is above zero AND its
@@ -9343,7 +9433,7 @@ function shipItemImgHtml(itemPath, sizePx) {
 // number is what's being worked on right now; the inserter is the job
 // starting. Rate still sets the belt's scroll speed; it no longer invents
 // an item count.
-const SHIP_BELT_CAPACITY = 7;
+const SHIP_BELT_CAPACITY = 12;   // 4 items per tile, three tiles (transport-belt: 4 per lane per tile)
 // `capacity` (optional) overrides SHIP_BELT_CAPACITY for a taller belt - the
 // shared row-2/row-3 up-belt is about twice a normal belt's height, so it
 // holds twice the items nose to tail. `extra` (optional, {itemPath, count})
@@ -9728,7 +9818,7 @@ function positionShipElbows() {
     // gate's machine, roughly the belt's own width.
     const inReview = sprite('in review'), gate = sprite('gate verdicts'), conflicted = sprite('conflicted');
     if (inReview && gate && conflicted) {
-        const x = Math.max(inReview.right, gate.right, conflicted.right) + 4;
+        const x = Math.max(inReview.right, gate.right, conflicted.right);   // touching the machines (Ben: the inserter must reach)
         const gateMid = gate.top + gate.height / 2;
         column('ship-elbow-1', inReview.top, gateMid - SHIP_COLUMN_SPLIT_PX / 2, x);
         column('ship-elbow-3', gateMid + SHIP_COLUMN_SPLIT_PX / 2, conflicted.bottom, x);
@@ -10103,6 +10193,7 @@ const SHIP_BLANK_PIPELINE = {
     spark12h: {}, arrows: [], folded: null, folded_last_at: null,
 };
 function shipFlowHtml(d) {
+    shipLastPipeline = d;
         // STAGE-HOVER: load this payload's stage breakdowns before any shipStage
         // call below reads them (shipBreakdownText is called from inside shipStage).
         shipSetBreakdowns(d);
@@ -10278,12 +10369,12 @@ function shipFlowHtml(d) {
             // belt (position:absolute, JS-synced - see positionShipElbows),
             // not a bare glyph, carrying item #6 (Green Circuit) of the
             // order-17 chain.
-            shipStage(d.review_routed ?? null, 'review routed', '', '', null, HELP.reviewRouted, '', 'review-routed', [], null, null, null, null, d.review_routed_last_at) + shipArrow('review routed', '⤵', null, 'Reviewed items moving into review', null, null, false, String(d.review_routed ?? '?'), null, 'right', true) +
+            shipStage(d.review_routed ?? null, 'review routed', '', '', null, HELP.reviewRouted, '', 'review-routed', d.review_routed_prs || [], null, null, null, null, d.review_routed_last_at) + shipArrow('review routed', '⤵', null, 'Reviewed items moving into review', null, null, false, String(d.review_routed ?? '?'), null, 'right', true) +
             // Ben: 7 stages per row. 'in review' is row 1's 7th and its own
             // end - the turn down to 'gate verdicts' at the start of row 2 is
             // the tall row-end belt (position:absolute, JS-sized to span both
             // rows - see positionShipElbows), carrying item #7 (Red Circuit).
-            shipStage(d.in_review ?? null, 'in review', '', '', null, HELP.inReview, '', 'in-review', [], null, null, null, null, d.in_review_last_at)
+            shipStage(d.in_review ?? null, 'in review', '', '', null, HELP.inReview, '', 'in-review', d.in_review_prs || [], null, null, null, null, d.in_review_last_at)
             + shipArrow('in review', '👁', null, 'PRs currently under human/AI review', null, null, false, String(d.in_review ?? '?'), null, 'right', true, 'ship-elbow-1');
 
         // Ben's 10:08 AM rig (2026-09-12): "From gate verdicts, split
@@ -10321,7 +10412,7 @@ function shipFlowHtml(d) {
             // beside resolved (row 3) up past approved to 'in line'.
             // Approved loads it level with its own machine; resolved loads it
             // at the bottom (the belt's start); 'in line' unloads at the top.
-            shipStage(d.approved ?? null, 'approved', '', '', null, HELP.approved, '', 'approved', [], null, null, null, null, d.approved_last_at)
+            shipStage(d.approved ?? null, 'approved', '', '', null, HELP.approved, '', 'approved', d.approved_prs || [], null, null, null, null, d.approved_last_at)
             + shipArrow('approved', '✅', arrowByKey['green-inline'], 'Approved PRs not yet merged (resolved conflicts rejoin this belt from below)', null, wFor('green-inline'), isB('green-inline'), null, null, 'left', true, 'ship-elbow-4',
                 {shared: true, extraSquare: 'resolved', extraCount: resNa ? null : d.resolved, extraGlyph: '⤴',
                  extraDescription: 'Resolved conflicts passed back up onto the APPROVED belt'})
@@ -10339,7 +10430,7 @@ function shipFlowHtml(d) {
         // the shared up-belt's column, then Ben's closed-issues list in the
         // open space on the left.
         const row3 =
-            shipStage(d.conflicted ?? null, 'conflicted', conflictCls, '', null, HELP.conflicted, '', 'conflicted', [], null, null, null, null, d.conflicted_last_at) + shipArrow('conflicted', '⚠', null, 'Open PRs with a merge conflict, waiting to be resolved', null, null, false, String(d.conflicted ?? '?'), null, 'left', true) +
+            shipStage(d.conflicted ?? null, 'conflicted', conflictCls, '', null, HELP.conflicted, '', 'conflicted', d.conflicted_prs || [], null, null, null, null, d.conflicted_last_at) + shipArrow('conflicted', '⚠', null, 'Open PRs with a merge conflict, waiting to be resolved', null, null, false, String(d.conflicted ?? '?'), null, 'left', true) +
             shipStage(resNa ? 'n/a' : d.resolved, 'resolved', '', '', null, HELP.resolved + (resNa && d.resolved_na_reason ? ' (' + d.resolved_na_reason + ')' : ''), '', 'resolved', [], null, null, null, null, null)
             + '<span class="ship-elbow-slot"></span>'
             + shipClosedIssuesHtml(d.closed_issue_timings);
