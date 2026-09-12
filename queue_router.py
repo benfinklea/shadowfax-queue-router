@@ -7640,7 +7640,15 @@ animation:ship-belt-flow linear infinite;animation-duration:var(--belt-duration,
    belt sits inside a column-direction parent (.ship-arrow-vertical, the
    row-turn) AND a row-direction one (.ship-arrow-vbelt, in-row) now. */
 .ship-belt-vertical{width:26px;height:72px;flex:0 0 auto}
-.ship-belt-vertical .ship-belt-track{background-size:18px 18px;background-repeat:repeat;animation-name:ship-belt-flow-vertical}
+/* Ben's built reference: each belt segment's own chevron faces the actual
+   direction of travel (down), not sideways - the base tile's chevron is
+   baked in pointing right (it's a horizontal-belt asset), so a vertical
+   belt swaps to a separately pre-rotated tile (belt-tile-vertical.png,
+   rotated -90deg/clockwise from the same source so a rightward chevron
+   becomes a downward one) rather than trying to CSS-rotate the live
+   non-square element, which would fight its own width/height. */
+.ship-belt-vertical .ship-belt-track{background-image:url('/static/factorio/belt/belt-tile-vertical.png');
+background-size:18px 18px;background-repeat:repeat;animation-name:ship-belt-flow-vertical}
 @keyframes ship-belt-flow-vertical{to{background-position-y:18px}}
 .ship-belt-items{position:absolute;inset:0}
 .ship-belt-item{position:absolute;top:50%;left:50%;width:16px;height:16px;transform:translate(-50%,-50%);
