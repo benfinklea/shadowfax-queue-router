@@ -2,13 +2,15 @@
 removal, real belts carrying the order-10 item chain, and rate-driven
 animation. Same fixture/stub-fetch pattern as factorio-evidence.py.
 
+Also covers order 14 (inserter swing), order 15 (BUGS FOUND biter), and
+order 16 (ground/shadow/density realism pass).
+
 Requires a live copy of this app on 127.0.0.1:5099 (see evidence/factorio-belts/
 README.md for the one-line startup command) - not started here, same as the
 existing factorio-evidence.py, so this can run against either a fixture-only
 sandbox or a fully-configured checkout.
 """
 import json
-import sys
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 
@@ -67,17 +69,47 @@ agents_fixture = [
 # "we structurally never have this number", and both need their own proof.
 pipeline_fixture_no_data = dict(pipeline_fixture, prs_open=None, prs_open_last_at=None)
 
-def stub_routes(page):
+# Order 15: the three biter states, keyed off the SAME thresholds bugsCls
+# already uses for the number's own colour (0 neutral, 1-4 warn, >=5 hot) -
+# not an independently-picked number. The main fixture above (bugs_found_24h=3)
+# is the "small" demo; these three cover corpse/medium/unknown.
+pipeline_fixture_bugs_corpse = dict(pipeline_fixture, bugs_found_24h=0)
+pipeline_fixture_bugs_medium = dict(pipeline_fixture, bugs_found_24h=6)
+pipeline_fixture_bugs_unknown = dict(pipeline_fixture, bugs_found_24h=None, last_issue_created_at=None)
+
+def stub_routes(page, fixture=None):
     # Network-level route interception, registered BEFORE navigation, so it
     # cannot race the page's own on-load fetch the way a post-hoc
     # window.fetch monkeypatch can (this app also has a real, working
     # /api/pipeline in this sandbox - a real background fetch racing in
     # after a same-tick fetch stub was installed was observed to
     # occasionally overwrite the fixture render mid-test).
+    payload = fixture if fixture is not None else pipeline_fixture
     page.route('**/api/pipeline*', lambda route: route.fulfill(
-        status=200, content_type='application/json', body=json.dumps(pipeline_fixture)))
+        status=200, content_type='application/json', body=json.dumps(payload)))
     page.route('**/api/agents*', lambda route: route.fulfill(
         status=200, content_type='application/json', body=json.dumps(agents_fixture)))
+
+
+def render(p, fixture, reduced_motion=False):
+    """Fresh browser context, navigated and refreshed against `fixture`."""
+    browser = p.chromium.launch(headless=True)
+    page = browser.new_page(viewport={'width': 1440, 'height': 900})
+    if reduced_motion:
+        page.emulate_media(reduced_motion='reduce')
+    errors = []
+    page.on('pageerror', lambda e: errors.append(str(e)))
+    stub_routes(page, fixture)
+    page.goto('http://127.0.0.1:5099/', wait_until='domcontentloaded')
+    page.evaluate('async()=>{await refreshShipFlow();}')
+    page.wait_for_timeout(1000)
+    assert not errors, errors
+    return browser, page
+
+
+def sprite_bg_url(page, square):
+    return page.locator('[data-square="' + square + '"] .ship-sprite').evaluate(
+        "el => getComputedStyle(el).backgroundImage")
 
 
 with sync_playwright() as p:
@@ -139,6 +171,37 @@ with sync_playwright() as p:
         assert elbow_box and anchor_box, (elbow_id, anchor_square)
         assert abs(elbow_box['y'] - anchor_box['y'] - anchor_box['height']) < 40, (elbow_id, elbow_box, anchor_box)
 
+    # Order 14 "the inserters must swing": a moving inserter's arm carries a
+    # real animation, its duration is BOUND to the measured rate (two
+    # different real rates -> two different durations, not a constant), and
+    # its delay is staggered (two moving inserters -> two different delays,
+    # never lockstep). An unmeasured arrow's arm never animates at all.
+    def arm_style(square):
+        return page.locator('[data-square-left="' + square + '"] .inserter-arm').evaluate(
+            "el => ({name: getComputedStyle(el).animationName, "
+            "duration: getComputedStyle(el).animationDuration, "
+            "delay: getComputedStyle(el).animationDelay})")
+    issues_arm = arm_style('issues open')   # rate 6/h
+    prsci_arm = arm_style('prs open')       # rate 3/h
+    dispatched_arm = arm_style('dispatched')  # no formal rate instrument
+    assert issues_arm['name'] == 'inserter-swing', issues_arm
+    assert prsci_arm['name'] == 'inserter-swing', prsci_arm
+    assert issues_arm['duration'] != prsci_arm['duration'], (issues_arm, prsci_arm)
+    assert issues_arm['delay'] != prsci_arm['delay'], (issues_arm, prsci_arm)
+    assert dispatched_arm['name'] == 'none', dispatched_arm
+    # ci-green is the fixture's bottleneck (rate 0, backlog 5) - its inserter
+    # must freeze at the pickup end, not swing, even though it IS measured.
+    ci_arm = page.locator('[data-square-left="ci q/run"] .ship-inserter').evaluate("el => el.className")
+    assert 'backed-up' in ci_arm, ci_arm
+    ci_arm_anim = arm_style('ci q/run')
+    assert ci_arm_anim['name'] == 'none', ci_arm_anim
+
+    # Order 15 "BUGS FOUND is a biter": the main fixture's count (3) is the
+    # "small" state - never the corpse (measured zero) or the remnant/dim
+    # (unknown) art, which are proven separately below with their own fixtures.
+    assert 'small-biter.png' in sprite_bg_url(page, 'bugs found')
+    assert 'corpse' not in sprite_bg_url(page, 'bugs found')
+
     # Three states side by side, proven never to look alike.
     page.locator('[data-square="bugs found"]').screenshot(path=str(OUT / 'state-idle.png'))
     page.locator('[data-square="ci q/run"]').screenshot(path=str(OUT / 'state-stalled.png'))
@@ -149,6 +212,12 @@ with sync_playwright() as p:
     strip.screenshot(path=str(OUT / 'strip-1440-greyscale.png'))
     page.evaluate("document.documentElement.style.filter=''")
 
+    # Order 16: a legibility check while we have this render up - the count
+    # numerals must still be there and non-empty over the new ground texture.
+    for square in ('bugs found', 'issues open', 'prs open', 'ci q/run'):
+        num = page.locator('[data-square="' + square + '"] .ship-num').inner_text()
+        assert num.strip() != '', square
+
     browser.close()
 
 # Separate pass for the no-data/remnant-wreckage state: prs_open unavailable
@@ -158,34 +227,85 @@ with sync_playwright() as p:
 # assertion (a transient per-refresh miss legitimately still renders no
 # number, only the sprite's remnant art carries that signal).
 with sync_playwright() as p:
-    browser = p.chromium.launch(headless=True)
-    page = browser.new_page(viewport={'width': 1440, 'height': 900})
-    errors = []
-    page.on('pageerror', lambda e: errors.append(str(e)))
-    page.route('**/api/pipeline*', lambda route: route.fulfill(
-        status=200, content_type='application/json', body=json.dumps(pipeline_fixture_no_data)))
-    page.route('**/api/agents*', lambda route: route.fulfill(
-        status=200, content_type='application/json', body=json.dumps(agents_fixture)))
-    page.goto('http://127.0.0.1:5099/', wait_until='domcontentloaded')
-    page.evaluate('async()=>{await refreshShipFlow();}')
-    page.wait_for_timeout(1000)
-    assert not errors, errors
+    browser, page = render(p, pipeline_fixture_no_data)
     assert page.locator('[data-square="prs open"] .ship-sprite.remnant').count() == 1
     page.locator('[data-square="prs open"]').screenshot(path=str(OUT / 'state-no-data.png'))
+    browser.close()
+
+# Order 15: the three biter states, and the assertion order 15's evidence
+# section explicitly asks for - corpse (measured zero) and the unknown/dim
+# fallback are NOT the same asset, so "no bugs" and "nobody knows" can never
+# look alike (the whole point of this dashboard, per the brief).
+with sync_playwright() as p:
+    browser, page = render(p, pipeline_fixture_bugs_corpse)
+    corpse_url = sprite_bg_url(page, 'bugs found')
+    assert 'small-biter-corpse.png' in corpse_url, corpse_url
+    page.locator('[data-square="bugs found"]').screenshot(path=str(OUT / 'biter-corpse.png'))
+    browser.close()
+
+with sync_playwright() as p:
+    browser, page = render(p, pipeline_fixture_bugs_medium)
+    medium_url = sprite_bg_url(page, 'bugs found')
+    assert 'medium-biter.png' in medium_url, medium_url
+    page.locator('[data-square="bugs found"]').screenshot(path=str(OUT / 'biter-medium.png'))
+    browser.close()
+
+with sync_playwright() as p:
+    browser, page = render(p, pipeline_fixture_bugs_unknown)
+    unknown_url = sprite_bg_url(page, 'bugs found')
+    assert 'corpse' not in unknown_url, unknown_url
+    assert corpse_url != unknown_url, (corpse_url, unknown_url)
+    # Round 3's rule applies here too: unknown renders 'n/a', never empty.
+    num_text = page.locator('[data-square="bugs found"] .ship-num').inner_text()
+    assert num_text.strip() == 'n/a', num_text
+    page.locator('[data-square="bugs found"]').screenshot(path=str(OUT / 'biter-unknown.png'))
+    browser.close()
+
+# Order 14 evidence: at least three frames at different points in the swing,
+# proving arms actually moved (not a single still) AND that two different
+# inserters are staggered (not swinging in lockstep). Real wall-clock waits
+# between screenshots - the CSS animation runs on the browser's own clock,
+# independent of these waits, so each capture is a genuine later point in
+# the cycle, not a re-render of the same frame.
+with sync_playwright() as p:
+    browser, page = render(p, pipeline_fixture)
+
+    def transforms():
+        return {
+            sq: page.locator('[data-square-left="' + sq + '"] .inserter-arm').evaluate(
+                "el => getComputedStyle(el).transform")
+            for sq in ('issues open', 'prs open', 'approved')
+        }
+
+    frames = []
+    for i in range(3):
+        page.locator('#ship-flow').screenshot(path=str(OUT / ('swing-frame-' + str(i + 1) + '.png')))
+        frames.append(transforms())
+        if i < 2:
+            page.wait_for_timeout(650)
+
+    # Each moving inserter's own transform changed across the three frames -
+    # it swung, this was not a static screenshot repeated three times.
+    for sq in ('issues open', 'prs open', 'approved'):
+        values = {f[sq] for f in frames}
+        assert len(values) > 1, (sq, frames)
+    # At any single frame, two inserters with different measured rates are at
+    # DIFFERENT points of the arc - staggered, not lockstep.
+    assert frames[0]['issues open'] != frames[0]['prs open'], frames[0]
     browser.close()
 
 # Reduced-motion pass, in a fresh context (emulate_media must be set before
 # navigation to take effect on first paint).
 with sync_playwright() as p:
-    browser = p.chromium.launch(headless=True)
-    page = browser.new_page(viewport={'width': 1440, 'height': 900})
-    page.emulate_media(reduced_motion='reduce')
-    stub_routes(page)
-    page.goto('http://127.0.0.1:5099/', wait_until='domcontentloaded')
-    page.evaluate('async()=>{await refreshShipFlow();}')
-    page.wait_for_timeout(500)
+    browser, page = render(p, pipeline_fixture, reduced_motion=True)
     assert page.eval_on_selector('.ship-belt-track', "el => getComputedStyle(el).animationName") == 'none'
     assert page.eval_on_selector('.ship-arrow.bottleneck', "el => getComputedStyle(el).animationName") == 'none'
+    # Order 14: extend reduced-motion coverage to the swinging arm too.
+    moving_arms = page.locator('.ship-inserter.moving .inserter-arm')
+    assert moving_arms.count() > 0
+    for i in range(moving_arms.count()):
+        name = moving_arms.nth(i).evaluate("el => getComputedStyle(el).animationName")
+        assert name == 'none', name
     page.locator('#ship-flow').screenshot(path=str(OUT / 'strip-1440-reduced-motion.png'))
     browser.close()
 

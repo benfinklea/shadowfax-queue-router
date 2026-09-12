@@ -6871,6 +6871,13 @@ def index():
 --glow-green:0 0 10px #39ff14,0 0 20px #39ff14,0 0 40px #39ff1488;
 --glow-red:0 0 10px #ff0044,0 0 20px #ff0044,0 0 40px #ff004488;
 --glow-yellow:0 0 10px #ffff00,0 0 20px #ffff00,0 0 40px #ffff0088;
+/* LORE order 16 #2: every entity casts a soft shadow down-and-right at the
+   same angle - "nothing in our render casts anything, so every sprite looks
+   pasted on rather than sitting on the ground." One shared term, appended to
+   every filter: rule that touches a sprite (filter does not merge across
+   the cascade, so each override has to repeat this var rather than losing
+   the shadow when it wins). */
+--ground-shadow:drop-shadow(3px 5px 2px rgba(0,0,0,.55));
 }
 *{box-sizing:border-box}
 body{font-family:'Rajdhani',sans-serif;background:var(--bg-dark);color:#e0e0e0;padding:20px;margin:0;
@@ -7152,7 +7159,15 @@ box-shadow:0 0 7px rgba(255,0,68,0.3)}
 .ft-routes{display:flex;gap:3px;flex-wrap:wrap;margin-top:5px}
 /* One-row glance strip: CI queue + route health + agents, ~1/3 the height of
    the three cards it replaced (Ben, 2026-07-29). Numbers big, words small. */
-.ship-flow-wrap{display:flex;flex-direction:column;gap:0}
+/* LORE order 16 #1: textured ground instead of flat navy - "the single
+   biggest tell". Cropped and re-tinted dark (see static/factorio/ground -
+   the raw sand sheet is bright tan, which would fight the Orbitron
+   numerals, so this keeps only the grain/variation, recoloured into the
+   strip's own dark palette) rather than muting it with opacity, which
+   would have thinned the grain along with the colour. */
+.ship-flow-wrap{display:flex;flex-direction:column;gap:0;
+background-image:url('/static/factorio/ground/ground-tile.png');
+background-repeat:repeat;background-size:128px 128px;border-radius:6px}
 .ship-flow{display:flex;align-items:stretch;gap:0;flex-wrap:wrap;margin:0 0 9px 0}
 .ship-flow.ship-row-2{flex-direction:row-reverse}
 /* Round 2 (Elrond review, PR #35, defect 3): position:absolute + JS sync
@@ -7203,7 +7218,7 @@ align-items:center;justify-content:center;gap:2px;cursor:pointer}
    still legible without a rectangle around it. */
 .ship-stage.stage-machine{background:none;border:0;border-radius:0}
 .ship-stage.stage-robot{background:none;border:0;border-radius:0;box-shadow:none}
-.ship-stage.stage-robot .ship-sprite{filter:drop-shadow(0 0 5px rgba(0,255,242,.55)) drop-shadow(0 0 9px rgba(255,0,255,.28))}
+.ship-stage.stage-robot .ship-sprite{filter:drop-shadow(0 0 5px rgba(0,255,242,.55)) drop-shadow(0 0 9px rgba(255,0,255,.28)) var(--ground-shadow)}
 .ship-stage.stage-chest{background:none;border:0;border-radius:0;box-shadow:none}
 /* Chest squares are piles waiting to be collected - staleness there is the
    loudest signal on the strip, so weight it heavier than any other age. */
@@ -7215,7 +7230,8 @@ align-items:center;justify-content:center;gap:2px;cursor:pointer}
    directly instead of living in a caption below a card. */
 .ship-sprite-wrap{position:relative;width:64px;height:64px;margin:0 auto;flex:0 0 auto}
 .ship-sprite{position:absolute;inset:0;width:64px;height:64px;
-background-repeat:no-repeat;image-rendering:pixelated;pointer-events:none;opacity:.95}
+background-repeat:no-repeat;image-rendering:pixelated;pointer-events:none;opacity:.95;
+filter:var(--ground-shadow)}
 .ship-sprite.dim{opacity:.4}
 /* Remnants (Ben, 4:40 PM CDT): wreckage in place of the machine when a square
    has NO DATA, not just a measured zero - distinct from .dim (which still
@@ -7223,7 +7239,7 @@ background-repeat:no-repeat;image-rendering:pixelated;pointer-events:none;opacit
    background-size/position are set per-sprite inline (frame crop, see
    REMNANT_SPRITE) - inline style already wins over .ico/.chest-ico/.asm on
    specificity, so this rule only carries the tint, not geometry. */
-.ship-sprite.remnant{filter:grayscale(.35);opacity:.65}
+.ship-sprite.remnant{filter:grayscale(.35) var(--ground-shadow);opacity:.65}
 .ship-inserter.remnant .inserter-arm{opacity:.15!important;animation:none!important}
 /* Standard icon sheets are Factorio mip chains: 64+32+16+8=120 wide, 64 tall -
    the first (64x64) mip scaled to the 24x24 slot. */
@@ -7243,7 +7259,7 @@ background-repeat:no-repeat;image-rendering:pixelated;pointer-events:none;opacit
 .ship-inserter .inserter-platform{position:absolute;left:2px;bottom:0;width:30px;height:23px;
 background-image:url('/static/factorio/inserter/long-handed-inserter-platform.png');
 background-size:120px 23px;background-position:-30px 0;background-repeat:no-repeat;
-image-rendering:pixelated;opacity:.85}
+image-rendering:pixelated;opacity:.85;filter:var(--ground-shadow)}
 /* Hand images are a tall 72x164 single frame - scaled with width/height in the
    SAME ratio as the source (no stretch), then rotated 90deg to reach sideways. */
 .ship-inserter .inserter-arm{position:absolute;left:14px;top:0;width:14px;height:32px;
@@ -7251,19 +7267,37 @@ background-repeat:no-repeat;background-size:14px 32px;image-rendering:pixelated;
 transform-origin:50% 85%;transform:rotate(90deg);transition:transform .4s ease,opacity .4s ease}
 .ship-arrow-left .ship-inserter .inserter-arm{transform:rotate(-90deg)}
 .ship-inserter.idle .inserter-arm{opacity:.4}
-.ship-inserter.moving .inserter-arm{opacity:1;animation:inserter-reach 1.6s ease-in-out infinite}
-@keyframes inserter-reach{0%,100%{transform:rotate(75deg)}50%{transform:rotate(105deg)}}
-.ship-arrow-left .ship-inserter.moving .inserter-arm{animation:inserter-reach-left 1.6s ease-in-out infinite}
-@keyframes inserter-reach-left{0%,100%{transform:rotate(-75deg)}50%{transform:rotate(-105deg)}}
+/* LORE order 14 "the inserters must swing": a real Factorio inserter's arm
+   rotates through roughly 180 degrees between the pickup and drop side - the
+   old 30-degree "inserter-reach" wiggle read as a nervous twitch, not a
+   swing. Duration comes from --swing-duration (order 9's clamped
+   rate_per_hour mapping, set alongside --belt-duration in shipArrow - same
+   handoff, same speed); animation-delay is a per-inserter negative offset
+   (--swing-delay, from shipStagePhase(square)) so a row of them swings
+   staggered, never in lockstep. */
+.ship-inserter.moving .inserter-arm{opacity:1;animation-name:inserter-swing;
+animation-timing-function:ease-in-out;animation-iteration-count:infinite;
+animation-duration:var(--swing-duration,1.6s);animation-delay:var(--swing-delay,0s)}
+@keyframes inserter-swing{0%,100%{transform:rotate(15deg)}50%{transform:rotate(165deg)}}
+.ship-arrow-left .ship-inserter.moving .inserter-arm{animation-name:inserter-swing-left}
+@keyframes inserter-swing-left{0%,100%{transform:rotate(-15deg)}50%{transform:rotate(-165deg)}}
+/* A backed-up (bottleneck) handoff freezes the arm at the pickup end (the
+   swing's own 0%/100% extreme) instead of the resting middle - it reached,
+   grabbed, and cannot release because the belt it feeds is jammed; that is
+   the information, not an idle machine. Same specificity as .moving, placed
+   after it so a bottleneck arrow that also happens to have rate>0 still
+   freezes rather than swings. */
+.ship-inserter.backed-up .inserter-arm{animation:none!important;opacity:1;transform:rotate(15deg)}
+.ship-arrow-left .ship-inserter.backed-up .inserter-arm{transform:rotate(-15deg)}
 @media(prefers-reduced-motion:reduce){.ship-inserter.moving .inserter-arm{animation:none;transform:rotate(90deg)}
 .ship-arrow-left .ship-inserter.moving .inserter-arm{transform:rotate(-90deg)}}
 /* No card border left to color for deploy state (order 11) - the state
    becomes a glow on the sprite itself instead. */
-.ship-stage.merge-green .ship-sprite{filter:drop-shadow(0 0 8px rgba(57,255,20,.9))}
-.ship-stage.merge-yellow .ship-sprite{filter:drop-shadow(0 0 8px rgba(255,255,0,.9))}
-.ship-stage.merge-red .ship-sprite{filter:drop-shadow(0 0 8px rgba(255,0,68,.9))}
+.ship-stage.merge-green .ship-sprite{filter:drop-shadow(0 0 8px rgba(57,255,20,.9)) var(--ground-shadow)}
+.ship-stage.merge-yellow .ship-sprite{filter:drop-shadow(0 0 8px rgba(255,255,0,.9)) var(--ground-shadow)}
+.ship-stage.merge-red .ship-sprite{filter:drop-shadow(0 0 8px rgba(255,0,68,.9)) var(--ground-shadow)}
 /* SHIP-SPARK-2 item 6: the deploy box while a deploy run is actually shipping. */
-.ship-stage.merge-blue .ship-sprite{filter:drop-shadow(0 0 8px rgba(0,168,255,.9))}
+.ship-stage.merge-blue .ship-sprite{filter:drop-shadow(0 0 8px rgba(0,168,255,.9)) var(--ground-shadow)}
 .ship-stage.merge-pulse .ship-sprite{animation:merge-rate-pulse 4s ease-in-out infinite}
 @keyframes merge-rate-pulse{0%,100%{opacity:1}50%{opacity:.75}}
 @media(prefers-reduced-motion:reduce){.ship-stage.merge-pulse .ship-sprite{animation:none}}
@@ -7271,7 +7305,7 @@ transform-origin:50% 85%;transform:rotate(90deg);transition:transform .4s ease,o
    stepping is driven by JS (32 frames, 8x4 grid) since it must mean
    something: running when work is flowing, frozen at frame 0 when idle,
    frozen+dimmed when stalled - never a screensaver. */
-.ship-sprite.asm.stalled{opacity:.4;filter:grayscale(.5)}
+.ship-sprite.asm.stalled{opacity:.4;filter:grayscale(.5) var(--ground-shadow)}
 /* The count overlays the sprite's base in a small dark plate (order 11: "if
    the sprite cannot carry the number legibly... the way Factorio itself
    labels things") rather than sitting in a caption under a card. */
@@ -7505,8 +7539,12 @@ font-size:0.85em;letter-spacing:0.5px;vertical-align:middle}
    pass's 56px belt still read as "a connector widget, not a belt" - widened
    again, and the row rebalance (defects 4+5, "the same layout problem") frees
    up the room to do it without re-cramping the squares. */
-.ship-arrow{position:relative;flex:0 0 132px;align-self:center;justify-content:center;height:36px;
-gap:3px;padding:0 4px;border:0;background:transparent;color:var(--arrow-color);cursor:pointer;font-size:11px;text-shadow:none}
+/* LORE order 16 #3/#6: gap tightened to 1px and padding to 2px (from 3px/4px)
+   so the belt and inserter read as one continuous mechanism, not two boxes
+   with a visible seam between them - "a belt that starts and stops reads
+   as an icon". */
+.ship-arrow{position:relative;flex:0 0 146px;align-self:center;justify-content:center;height:36px;
+gap:1px;padding:0 2px;border:0;background:transparent;color:var(--arrow-color);cursor:pointer;font-size:11px;text-shadow:none}
 .ship-arrow.bottleneck{animation:ship-arrow-bottleneck-pulse 1.6s ease-in-out infinite}
 @keyframes ship-arrow-bottleneck-pulse{0%,100%{filter:drop-shadow(0 0 4px var(--neon-red))}50%{filter:drop-shadow(0 0 11px var(--neon-red))}}
 @media(prefers-reduced-motion:reduce){.ship-arrow.bottleneck{animation:none}}
@@ -7514,7 +7552,7 @@ gap:3px;padding:0 4px;border:0;background:transparent;color:var(--arrow-color);c
 /* The belt itself: a scrolling texture tile carrying the order-10 item chain.
    State is rendered, never captioned - order 9's "hover is where the numbers
    live" (native title attr on the arrow, unchanged). */
-.ship-belt{position:relative;width:76px;height:24px;flex:0 0 76px;overflow:hidden;
+.ship-belt{position:relative;width:96px;height:24px;flex:0 0 96px;overflow:hidden;
 border-radius:2px;outline:1px solid var(--arrow-outline)}
 .ship-belt-track{position:absolute;inset:0;background-image:url('/static/factorio/belt/belt-tile.png');
 background-repeat:repeat-x;background-size:18px 18px;image-rendering:pixelated;opacity:.85;
@@ -8263,9 +8301,31 @@ const REMNANT_SPRITE = {
     'radar.png': { url: '/static/factorio/remnants/radar-remnants.png', size: '85px 64px', pos: 'center' },
     'chest/steel-chest.png': { url: '/static/factorio/remnants/steel-chest-remnants.png', size: '136px 80px', pos: '0 0' },
 };
-function shipSpriteHtml(cap, unknown) {
-    const meta = SHIP_STAGE_META[cap];
+// LORE order 15: BUGS FOUND is a biter, not a fixed sprite - bugs are the
+// thing attacking the line, not a machine in it. Which biter depends on the
+// count: reuses the EXACT thresholds `bugsCls` already uses for the
+// number's own colour (0 neutral, 1-4 warn, >=5 hot) so the sprite says the
+// same thing the colour already says, not a second, independently-tuned
+// judgement call. Zero is the corpse (calm, healthy, nothing attacking) -
+// deliberately NOT the same asset as the no-data/remnant case below, per
+// the brief's "no bugs and nobody knows must never look alike".
+function shipBugsFoundSprite(num) {
+    const n = Number(num);
+    if (n === 0) return 'biter/small-biter-corpse.png';
+    return n >= 5 ? 'biter/medium-biter.png' : 'biter/small-biter.png';
+}
+function shipSpriteHtml(cap, unknown, num) {
+    let meta = SHIP_STAGE_META[cap];
     if (!meta) return '';
+    if (cap === 'bugs found') {
+        // Unknown (no measured count at all) still needs A biter sprite to
+        // dim - small-biter is the neutral base for that, since we do not
+        // know if it would have been few or many. No remnant crop exists for
+        // any biter sprite (none were staged), so this stage falls back to
+        // the plain dim treatment on unknown, same as every other sprite
+        // with no dedicated remnant art (inserter.png, programmable-speaker.png, etc).
+        meta = { kind: meta.kind, sprite: unknown ? 'biter/small-biter.png' : shipBugsFoundSprite(num) };
+    }
     const remnant = unknown ? REMNANT_SPRITE[meta.sprite] : null;
     const dimCls = unknown && !remnant ? ' dim' : '';
     const remnantCls = remnant ? ' remnant' : '';
@@ -8318,7 +8378,7 @@ function shipStage(num, cap, cls, sub, spark, help, stageCls, dropdownKey, prs, 
          + ' role="button" tabindex="0" aria-haspopup="true" aria-expanded="' + open + '" aria-controls="ship-list-' + key + '"'
          + ' onclick="toggleShipDropdown(this.dataset.dropdown)" onkeydown="shipStageKeydown(event,this.dataset.dropdown)"'
          + (help ? ' title="' + help.replace(/"/g, '') + '"' : '') + '>' + (hist || '')
-         + '<div class="ship-sprite-wrap">' + shipSpriteHtml(cap, unknown)
+         + '<div class="ship-sprite-wrap">' + shipSpriteHtml(cap, unknown, num)
          // An unknown count renders NOTHING here (no plate, no '?' glyph) -
          // it must never read as a measured 0, and must never look like a
          // second, competing "no data" signal next to the sprite/remnant.
@@ -8398,12 +8458,30 @@ function capacityOutline(card, colour, glow) {
         : 'none');
 }
 
+// LORE order 14: a stable, deterministic per-stage phase in [0,1) so a row of
+// swinging arms staggers instead of swinging in lockstep (which reads as a
+// screensaver, not a factory). Hashed from the square name rather than
+// threaded through as a numeric index - the name already IS a stable,
+// unique key for the stage's fixed position in the strip, so it satisfies
+// the same "stable across renders, not random per frame" requirement
+// without adding an index parameter to every shipArrow/shipStage call site.
+function shipStagePhase(square) {
+    let h = 0;
+    for (let i = 0; i < square.length; i++) h = (h * 31 + square.charCodeAt(i)) >>> 0;
+    return (h % 997) / 997;
+}
+
 // The arrows are long-handed inserters (Ben, 3:21 PM CDT 2026-09-11): an
 // inserter is literally the thing that moves items between two machines -
 // every outage found today was an arrow, not a box. Carries the moving/idle
 // state where the held item would be; mirrored on row 2 so it reaches the
 // direction work actually moves.
-function shipInserterHtml(count, dir, unknown) {
+// LORE order 14: `square` (for the stagger phase) and `swingDuration`/
+// `backedUp` (arm swing speed and the frozen-at-pickup jam state) are new -
+// swingDuration is the same order-9-clamped value shipArrow already computes
+// for the belt (same handoff, same speed), never invented for an unmeasured
+// arrow (those arrive as `unknown` and never carry a real swingDuration).
+function shipInserterHtml(count, dir, unknown, square, backedUp, swingDuration) {
     const moving = count > 0;
     const hand = moving ? 'long-handed-inserter-hand-closed.png' : 'long-handed-inserter-hand-open.png';
     // Ben's remnants amendment: an arrow with NO measured rate (unknown, not
@@ -8411,14 +8489,19 @@ function shipInserterHtml(count, dir, unknown) {
     // near-invisible - "nobody knows whether anything is stuck" must never
     // look like the idle (measured-zero) inserter.
     const remnantCls = unknown ? ' remnant' : '';
+    const backedUpCls = backedUp ? ' backed-up' : '';
     // long-handed-inserter-remnants.png measured 134x376: 4 frames stacked
     // 134x94 each - crop frame 1, don't scale the whole strip into the slot.
     const platformStyle = unknown
         ? ' style="background-image:url(/static/factorio/remnants/long-handed-inserter-remnants.png);background-size:30px 84px;background-position:0 0"'
         : '';
-    return '<span class="ship-inserter ' + (moving ? 'moving' : 'idle') + remnantCls + '">'
+    const phase = shipStagePhase(square);
+    const swingVars = (moving && swingDuration)
+        ? '--swing-duration:' + swingDuration + 's;--swing-delay:-' + (phase * swingDuration).toFixed(3) + 's;'
+        : '';
+    return '<span class="ship-inserter ' + (moving ? 'moving' : 'idle') + remnantCls + backedUpCls + '">'
         + '<span class="inserter-platform"' + platformStyle + '></span>'
-        + '<span class="inserter-arm" style="background-image:url(/static/factorio/inserter/' + hand + ')"></span>'
+        + '<span class="inserter-arm" style="' + swingVars + 'background-image:url(/static/factorio/inserter/' + hand + ')"></span>'
         + '</span>';
 }
 
@@ -8495,12 +8578,15 @@ function shipBeltHtml(square, hasRate, rate, backedUp, knownCount, dir) {
     if (!items) return '';
     const upItem = items[0], downItem = items[1];
     let state, slots;
+    // LORE order 16 #3: denser packing now that the belt itself is wider
+    // (96px, up from 76px) - "items packed nose to tail" reads as a factory,
+    // a few dots on a long belt reads as an icon.
     if (hasRate) {
-        if (backedUp) { state = 'backed-up'; slots = 5; }
+        if (backedUp) { state = 'backed-up'; slots = 6; }
         else if (Number(rate) === 0) { state = 'starved'; slots = 0; }
-        else { state = 'flowing'; slots = Math.max(1, Math.min(4, Math.round(1 + Math.max(0.2, Math.min(3, Number(rate) / 4))))); }
+        else { state = 'flowing'; slots = Math.max(2, Math.min(5, Math.round(2 + Math.max(0.2, Math.min(3, Number(rate) / 4))))); }
     } else if (knownCount !== null) {
-        state = 'known'; slots = Math.max(1, Math.min(3, Math.round(Math.sqrt(Math.max(1, knownCount)))));
+        state = 'known'; slots = Math.max(1, Math.min(4, Math.round(Math.sqrt(Math.max(1, knownCount)) * 1.3)));
     } else {
         state = 'unknown'; slots = 0;
     }
@@ -8580,7 +8666,7 @@ function shipArrow(square, glyph, arrow, description, legacyCount, width, isBott
         + (agentLane ? ' data-dropdown="' + key + '" aria-controls="ship-list-' + key
             + '" aria-expanded="' + (openShipDropdown === key) + '" onclick="toggleShipDropdown(this.dataset.dropdown)"' : '') + '>'
         + shipBeltHtml(square, hasRate, rateForSpeed, isBottleneck, knownCount, dir)
-        + shipInserterHtml(rateForSpeed, dir, !hasRate)
+        + shipInserterHtml(rateForSpeed, dir, !hasRate, square, isBottleneck, duration)
         + '</' + tag + '>';
 }
 
@@ -9227,7 +9313,10 @@ function shipFlowHtml(d) {
         // Row 1: bugs found -> issues open -> dispatched -> prs open ->
         // ci q/run -> review routed, left to right.
         const row1 =
-            shipStage(d.bugs_found_24h ?? null, 'bugs found', bugsCls, '', null, HELP.bugsFound, '', 'bugs-found', [], null, null, null, null, d.last_issue_created_at) + shipArrow('bugs found', '⚡', null, 'Issues created in the last 24h', null, null, false, String(d.bugs_found_24h ?? '?'), null, 'right') +
+            // LORE order 15: unknown bugs_found_24h renders 'n/a' (Round 3's
+            // rule - never empty, never a bare '?') the same way gate_verdicts
+            // and resolved already do.
+            shipStage(d.bugs_found_24h === null || d.bugs_found_24h === undefined ? 'n/a' : d.bugs_found_24h, 'bugs found', bugsCls, '', null, HELP.bugsFound, '', 'bugs-found', [], null, null, null, null, d.last_issue_created_at) + shipArrow('bugs found', '⚡', null, 'Issues created in the last 24h', null, null, false, String(d.bugs_found_24h ?? '?'), null, 'right') +
             shipStage(d.issues_open, 'issues open', '', '', null, HELP.issues, '', null, null, null, shipIssuesRatePanel(sp.issues), null, arrowByKey['issues-prs'] && arrowByKey['issues-prs'].drain_label, d.last_issue_created_at) + shipArrow('issues open', '🤖', arrowByKey['issues-prs'], 'PRs opened in the last hour, from GitHub search - click for live agent lanes', null, wFor('issues-prs'), isB('issues-prs'), arrowByKey['issues-prs'] && arrowByKey['issues-prs'].label, null, 'right') +
             shipStage(d.dispatched ?? null, 'dispatched', '', '', null, HELP.dispatched, '', 'dispatched', [], null, null, null, null, d.dispatched_last_at) + shipArrow('dispatched', '🤖', null, 'Live dispatched lanes', null, null, false, String(d.dispatched ?? '?'), null, 'right') +
             shipStage(d.prs_open, 'prs open', '', prsOld.sub, null, HELP.prs + shipOldestWords('prs open', 'age of the oldest open, non-draft pull request'), prsOld.cls, null, null, null, shipHistorySpark(sp.prs, 'prs'), null, null, d.prs_open_last_at) + shipArrow('prs open', '⚙', arrowByKey['prs-ci'], 'Distinct PRs with a CI run started this hour, from the GitHub workflow-runs list', d.ci_queued, wFor('prs-ci'), isB('prs-ci'), null, null, 'right') +
