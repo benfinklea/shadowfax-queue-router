@@ -5576,6 +5576,182 @@ def _pr_open_breakdown(prs):
             "buckets": [{"label": name, "count": counts[name]} for name in PR_OPEN_BUCKET_ORDER]}
 
 
+# MONITOR-REVIEW-OWNERS (Ben, 3:20 PM CDT 2026-09-12): who is slacking on
+# reviews, per seat - not just how many reviews are waiting. Three pieces,
+# all derived from the SAME open-PR list _get_shipping_readiness already
+# fetches (reviews + headRefOid, no added GitHub calls):
+#   _review_routed_breakdown - per-seat waiting/oldest for square 6
+#   _in_review_breakdown_and_stale - per-seat waiting/oldest for square 7,
+#     plus the stale-verdict detector for square 8 (a blocking verdict left
+#     against a commit that is no longer the PR's head)
+REVIEW_AUTHOR_SEAT_SUFFIX = "-seat"
+
+
+def _seat_from_review_label(label_name):
+    """'gimli-review' -> 'gimli'. Mirrors REVIEW_ROUTED_LABEL_SUFFIX."""
+    return label_name[:-len(REVIEW_ROUTED_LABEL_SUFFIX)]
+
+
+def _seat_from_review_author(login):
+    """'gimli-seat' -> 'gimli'; accounts without the '-seat' convention
+    (e.g. a human GitHub login) pass through unchanged."""
+    return login[:-len(REVIEW_AUTHOR_SEAT_SUFFIX)] if login.endswith(REVIEW_AUTHOR_SEAT_SUFFIX) else login
+
+
+def _latest_review_by_author(pr):
+    """Each author's most recent review on this PR, keyed by login. Mirrors
+    GitHub's own reviewDecision algorithm: only the LATEST verdict per
+    reviewer counts toward the aggregate decision, an earlier one from the
+    same author is superseded, not summed."""
+    latest = {}
+    for rv in (pr.get("reviews") or []):
+        author = (rv.get("author") or {}).get("login")
+        ts = rv.get("submittedAt")
+        if not author or not ts:
+            continue
+        if author not in latest or ts > latest[author]["submittedAt"]:
+            latest[author] = rv
+    return latest
+
+
+def _oldest_hours(timestamps):
+    """Hours since the OLDEST of the given ISO timestamps, rounded to one
+    decimal; None when there is nothing to measure - callers must render
+    that as SKIP, never as 0h (an empty stage and a fresh one must not read
+    the same)."""
+    mins = _oldest_minutes(timestamps)
+    return None if mins is None else round(mins / 60.0, 1)
+
+
+def _seat_rows(per_seat_prs):
+    """Turn {seat: [pr, ...]} into the buckets[] shape the client's
+    ship-breakdown tooltip renders, sorted oldest-first (the whole point:
+    surface who has been sitting on something longest, not who has the
+    biggest pile)."""
+    rows = [{"label": seat, "count": len(prs),
+             "oldest_h": _oldest_hours(p.get("updatedAt") for p in prs)}
+            for seat, prs in per_seat_prs.items()]
+    rows.sort(key=lambda r: (r["oldest_h"] is None, -(r["oldest_h"] or 0)))
+    return rows
+
+
+def _review_routed_breakdown(prs):
+    """Per-seat waiting/oldest for the REVIEW ROUTED square (6).
+
+    'Waiting on seat X' means: the PR carries an X-review label AND X has
+    not already reviewed the CURRENT head. Labels are not auto-removed when
+    a review lands, so a PR X reviewed and cleared can still carry X's
+    label - counting it anyway would put a seat that already acted on the
+    slacker table. Excluding those is what makes this table name an actual
+    slacker instead of whoever was routed the label first.
+
+    'oldest' is hours since the seat's oldest routed PR last had ANY
+    activity (updatedAt) - the mirror of review_routed_last_at's existing
+    max(), just min() and per-seat. updatedAt bumps on comments too, so
+    this is a LOWER BOUND on the true wait, not an exact figure - the
+    client's help text says so.
+
+    Rows are independent per seat and are NOT expected to sum to
+    review_routed's total: a PR carrying two `-review` labels appears in
+    two seats' rows (unlike _pr_open_breakdown's mutually-exclusive
+    buckets, this is a fan-out, not a partition)."""
+    per_seat = {}
+    for pr in prs:
+        labels = [l.get("name", "") for l in (pr.get("labels") or [])]
+        seats = {_seat_from_review_label(l.lower()) for l in labels
+                  if l.lower().endswith(REVIEW_ROUTED_LABEL_SUFFIX)}
+        if not seats:
+            continue
+        head = pr.get("headRefOid")
+        latest_by_author = _latest_review_by_author(pr)
+        reviewed_at_head = {
+            _seat_from_review_author(author) for author, rv in latest_by_author.items()
+            if head and (rv.get("commit") or {}).get("oid") == head}
+        for seat in seats - reviewed_at_head:
+            per_seat.setdefault(seat, []).append(pr)
+    return {"noun": "PRs routed", "total": None, "buckets": _seat_rows(per_seat)}
+
+
+def _in_review_breakdown_and_stale(prs):
+    """Per-seat rows for the IN REVIEW square (7), plus the stale-verdict
+    detector (item B): a PR whose latest BLOCKING verdict (CHANGES_REQUESTED)
+    was submitted against a commit that is no longer the PR's head.
+
+    Only PRs with reviewDecision in (REVIEW_REQUIRED, CHANGES_REQUESTED) are
+    considered - the same set 'in_review' already counts.
+
+    REVIEW_REQUIRED has no review yet to attribute to a reviewer, so it is
+    bucketed by the PR's `-review` routing label(s) - 'unassigned' if none.
+
+    CHANGES_REQUESTED is attributed per-reviewer using the SAME latest-per-
+    author logic as GitHub's own aggregate decision: for each reviewer whose
+    latest review is still CHANGES_REQUESTED, if that review's commit is the
+    current head the PR also gets bucketed under 'author' (the ball is with
+    whoever has to fix the code); if that review's commit is NOT the current
+    head, the reviewer's OWN verdict is stale - it is what needs re-doing,
+    not the code - so it is bucketed under that reviewer's seat AND recorded
+    as a stale verdict. A PR with an unreadable head (headRefOid missing)
+    is never flagged stale - an unknown must not read as a defect."""
+    seat_prs = {}
+    stale = []  # [{"pr": number, "seat": seat, "submittedAt": iso}, ...]
+
+    def add(seat, pr):
+        seat_prs.setdefault(seat, []).append(pr)
+
+    for pr in prs:
+        decision = pr.get("reviewDecision")
+        if decision not in ("REVIEW_REQUIRED", "CHANGES_REQUESTED"):
+            continue
+        if decision == "REVIEW_REQUIRED":
+            labels = [l.get("name", "") for l in (pr.get("labels") or [])]
+            seats = [_seat_from_review_label(l.lower()) for l in labels
+                     if l.lower().endswith(REVIEW_ROUTED_LABEL_SUFFIX)]
+            for seat in (seats or ["unassigned"]):
+                add(seat, pr)
+            continue
+        head = pr.get("headRefOid")
+        latest_by_author = _latest_review_by_author(pr)
+        blocking = [(author, rv) for author, rv in latest_by_author.items()
+                    if rv.get("state") == "CHANGES_REQUESTED"]
+        if not blocking:
+            # GitHub reports CHANGES_REQUESTED but no latest-per-author review
+            # is in that state - our model of the algorithm doesn't match
+            # something about this PR's history. Bucket to 'author' rather
+            # than silently dropping the PR from every seat's count.
+            add("author", pr)
+            continue
+        if not head:
+            for author, _rv in blocking:
+                add(_seat_from_review_author(author), pr)
+            continue
+        any_fresh = False
+        for author, rv in blocking:
+            if (rv.get("commit") or {}).get("oid") == head:
+                any_fresh = True
+            else:
+                seat = _seat_from_review_author(author)
+                add(seat, pr)
+                stale.append({"pr": pr.get("number"), "seat": seat, "submittedAt": rv.get("submittedAt")})
+        if any_fresh:
+            add("author", pr)
+
+    stale_prs = {s["pr"] for s in stale}
+    stale_by_seat = {}
+    for s in stale:
+        stale_by_seat.setdefault(s["seat"], []).append(s)
+    stale_rows = [{"label": seat, "count": len(entries),
+                    "oldest_h": _oldest_hours(e["submittedAt"] for e in entries if e.get("submittedAt"))}
+                   for seat, entries in stale_by_seat.items()]
+    stale_rows.sort(key=lambda r: (r["oldest_h"] is None, -(r["oldest_h"] or 0)))
+    stale_last_at = max((s["submittedAt"] for s in stale if s.get("submittedAt")), default=None)
+
+    return (
+        {"noun": "PRs", "total": None, "buckets": _seat_rows(seat_prs)},
+        {"count": len(stale_prs), "last_at": stale_last_at,
+         "breakdown": {"noun": "PRs", "total": None, "buckets": stale_rows}},
+    )
+
+
 def _get_shipping_readiness(token, repo=None, default_branch="main"):
     """Read every open PR (up to OPEN_PR_LIST_LIMIT) and the repo's merge queue together.
     SHIP-SPARK-3 item 4: mergeQueue(branch: default_branch) legitimately returns
@@ -5585,7 +5761,11 @@ def _get_shipping_readiness(token, repo=None, default_branch="main"):
 
     Widened --json selection (added createdAt/updatedAt/reviews) so the 15-stage
     strip's review-routed/in-review/conflicted/approved squares derive from THIS
-    single call rather than one query per new square.
+    single call rather than one query per new square. headRefOid was added on
+    top of that (MONITOR-REVIEW-OWNERS) so the per-seat breakdowns and the
+    stale-verdict detector - "was this review left against the CURRENT head,
+    or an old one" - can compare a review's commit.oid to the PR's live head
+    without a second call per PR.
 
     statusCheckRollup was dropped from this selection (measured live 4:37 PM CDT
     2026-09-11): with 48 open PRs on armbrain, GitHub's GraphQL backend cannot
@@ -5608,7 +5788,11 @@ def _get_shipping_readiness(token, repo=None, default_branch="main"):
     prs = gh_json(["pr", "list", "--repo", repo, "--state", "open",
                    "--limit", str(OPEN_PR_LIST_LIMIT), "--search", "sort:created-asc", "--json",
                    "number,title,isDraft,reviewDecision,mergeable,mergeStateStatus,labels,updatedAt,"
-                   "createdAt,reviews"])
+                   # headRefOid added for the stale-verdict detector (MONITOR-REVIEW-OWNERS):
+                   # one more scalar field on the SAME call, not a second one - the 504
+                   # history on this query was the nested statusCheckRollup field, not the
+                   # row count, so a bare scalar carries none of that risk.
+                   "createdAt,reviews,headRefOid"])
     owner, name = repo.split("/")
     query = '''query($owner:String!,$name:String!,$branch:String!){
       repository(owner:$owner,name:$name){mergeQueue(branch:$branch){
@@ -6186,6 +6370,16 @@ def get_pipeline_status(repo=None, default_branch=None, force_refresh=False):
                 appr_ats = [rv.get("submittedAt") for p in approved for rv in (p.get("reviews") or [])
                             if rv.get("state") == "APPROVED" and rv.get("submittedAt")]
                 result["approved_last_at"] = max(appr_ats) if appr_ats else None
+
+                # MONITOR-REVIEW-OWNERS: per-seat breakdowns for squares 6/7,
+                # and the stale-verdict detector surfaced on square 8 - see
+                # the functions' own docstrings. Zero added GitHub calls.
+                result["review_routed_breakdown"] = _review_routed_breakdown(all_open_prs)
+                in_review_breakdown, stale = _in_review_breakdown_and_stale(all_open_prs)
+                result["in_review_breakdown"] = in_review_breakdown
+                result["stale_verdicts"] = stale["count"]
+                result["stale_verdicts_last_at"] = stale["last_at"]
+                result["stale_verdicts_breakdown"] = stale["breakdown"]
             except Exception as e:
                 logger.warning(f"shipping-readiness read failed ({repo}): {e}")
                 github_fetches_ok = False
@@ -6201,6 +6395,9 @@ def get_pipeline_status(repo=None, default_branch=None, force_refresh=False):
                     ("gate_verdicts_last_at", None), ("conflicted", None),
                     ("conflicted_last_at", None), ("resolved", None),
                     ("resolved_last_at", None), ("approved", None), ("approved_last_at", None),
+                    ("review_routed_breakdown", None), ("in_review_breakdown", None),
+                    ("stale_verdicts", None), ("stale_verdicts_last_at", None),
+                    ("stale_verdicts_breakdown", None),
                 ):
                     result.setdefault(field, default)
                 result["gate_verdicts_na_reason"] = "shipping-readiness read (PR list + merge queue) failed this refresh"
@@ -7436,6 +7633,13 @@ background-repeat:repeat;background-size:1536px 768px;border-radius:6px}
 .ship-age{font-size:0.66em;color:#7d8798;white-space:nowrap;margin-top:1px;text-shadow:var(--text-outline)}
 .ship-age.warn{color:var(--neon-yellow)}
 .ship-age.hot{color:var(--neon-red)}
+/* MONITOR-REVIEW-OWNERS item B/C: stale-verdict badge on the gate-verdicts
+   square. Border + glyph carry the signal, not colour alone - it must still
+   read in a greyscale screenshot the same way the machine/robot/chest shapes
+   already have to. */
+.ship-stale-badge{display:inline-block;margin-top:2px;padding:1px 7px;border:2px solid var(--neon-red);
+border-radius:10px;font-size:0.68em;font-weight:700;letter-spacing:0.3px;color:var(--neon-red);
+text-shadow:0 0 8px var(--neon-red)}
 .ship-logo{width:30px;height:30px;display:block;margin:0 auto 3px auto;
 filter:drop-shadow(0 0 6px rgba(99,102,241,0.75))}
 .ship-label{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:0;font-family:'Orbitron',monospace;
@@ -8602,7 +8806,30 @@ function hideShipSparkTooltip() {
 // 14-argument signature - and so a second tile only needs one more line here.
 let shipBreakdowns = {};
 function shipSetBreakdowns(d) {
-    shipBreakdowns = { 'prs open': d.prs_open_breakdown || null };
+    shipBreakdowns = {
+        'prs open': d.prs_open_breakdown || null,
+        // MONITOR-REVIEW-OWNERS: per-seat waiting/oldest for squares 6/7,
+        // and the stale-verdict rows on square 8 - same tooltip mechanism,
+        // buckets carry an extra optional oldest_h (hours) the prs-open
+        // buckets never set, so this changes nothing for that tile.
+        'review routed': d.review_routed_breakdown || null,
+        'in review': d.in_review_breakdown || null,
+        'gate verdicts': d.stale_verdicts_breakdown || null,
+    };
+}
+// Budget hours per seat-row kind, mirroring pr-stage-clock.sh's
+// budget_hours(): awaiting-review/awaiting-gate 2h, needs-repair 8h. A
+// stale verdict is a defect from the moment it exists - budget 0, always
+// the 'hot' glyph. Green under budget, amber 1-2x, red past 2x (item C).
+const SHIP_SEAT_ROW_BUDGET_H = { 'review routed': 2, 'in review': 2, 'gate verdicts': 0 };
+function shipSeatRowGlyph(cap, hours) {
+    // Colour must survive greyscale (item C) - carried on a glyph, not hue
+    // alone, since this tooltip is plain text (white-space:pre-line).
+    if (hours === null || hours === undefined || !Number.isFinite(hours)) return '';
+    const budget = SHIP_SEAT_ROW_BUDGET_H[cap] ?? 0;
+    if (budget <= 0) return '⛔ ';
+    if (hours < budget) return '';
+    return hours < budget * 2 ? '⚠ ' : '⛔ ';
 }
 function shipBreakdownText(cap, num) {
     const b = shipBreakdowns[cap];
@@ -8616,7 +8843,20 @@ function shipBreakdownText(cap, num) {
     // Only non-zero buckets, in the server's order - Ben's example omits
     // conflicted and ready-to-merge precisely because they were 1 and 0.
     b.buckets.forEach(bucket => {
-        if (Number(bucket.count) > 0) lines.push(bucket.count + ' ' + bucket.label);
+        if (!(Number(bucket.count) > 0)) return;
+        let line = bucket.count + ' ' + bucket.label;
+        // MONITOR-REVIEW-OWNERS: per-seat rows carry oldest_h (hours since
+        // the OLDEST thing waiting, per _oldest_hours) - a min over waits,
+        // not a max over activity (that's the whole point of this brief).
+        // Zero rows never reach here (the count>0 guard above), so a bucket
+        // that DOES have oldest_h === null is a genuine data gap, not "0h" -
+        // render SKIP rather than fabricate a number.
+        if ('oldest_h' in bucket) {
+            const oh = bucket.oldest_h;
+            line += ' · oldest ' + (oh === null || oh === undefined ? 'SKIP'
+                : shipSeatRowGlyph(cap, oh) + shipOldestText(oh * 60));
+        }
+        lines.push(line);
     });
     if (lines.length === 1) return '';  // a total with nothing inside it explains nothing
     return lines.join('\\n');
@@ -10075,9 +10315,10 @@ const SHIP_BLANK_PIPELINE = {
     ci_queued: null, ci_running: null, ci_oldest_min: null, ci_last_run_started_at: null,
     green_waiting: null, green_waiting_prs: [], green_oldest_min: null,
     green_wait_avg_min: null, green_wait_n: null, green_wait_excluded: null, green_wait_prs: [],
-    review_routed: null, review_routed_last_at: null,
-    in_review: null, in_review_last_at: null,
+    review_routed: null, review_routed_last_at: null, review_routed_breakdown: null,
+    in_review: null, in_review_last_at: null, in_review_breakdown: null,
     gate_verdicts: null, gate_verdicts_last_at: null,
+    stale_verdicts: null, stale_verdicts_last_at: null, stale_verdicts_breakdown: null,
     conflicted: null, conflicted_last_at: null,
     resolved: null, approved: null, approved_last_at: null,
     has_merge_queue: null, queue_depth: null, queue_oldest_min: null, queue_prs: [],
@@ -10288,13 +10529,20 @@ function shipFlowHtml(d) {
         // carries approved's queue up to 'in line'.
         const gvNa = d.gate_verdicts === null || d.gate_verdicts === undefined;
         const resNa = d.resolved === null || d.resolved === undefined;
+        // MONITOR-REVIEW-OWNERS item B: a stale verdict is a defect the moment
+        // it exists (a blocking review left against a commit that's no longer
+        // the head), so this badge is its own visual - not folded into
+        // gate_verdicts' own (permanently n/a) count, and always shown in the
+        // alarm style when count > 0, never a plain number.
+        const staleBadge = Number(d.stale_verdicts) > 0
+            ? '<span class="ship-stale-badge">⛔ ' + d.stale_verdicts + ' stale</span>' : '';
         const row2 =
             // Round 3 (Elrond review, PR #35): gate_verdicts has been null
             // since PR #34 dropped statusCheckRollup - the same "I cannot
             // know this" status as 'resolved', so it renders 'n/a' the same
             // way (was rendering nothing at all - a stage with no number and
             // no n/a is its own, different, confusing state).
-            shipStage(gvNa ? 'n/a' : d.gate_verdicts, 'gate verdicts', gateCls, '', null, HELP.gateVerdicts + (gvNa && d.gate_verdicts_na_reason ? ' (' + d.gate_verdicts_na_reason + ')' : ''), '', 'gate-verdicts', [], null, null, null, null, d.gate_verdicts_last_at)
+            shipStage(gvNa ? 'n/a' : d.gate_verdicts, 'gate verdicts', gateCls, '', null, HELP.gateVerdicts + (gvNa && d.gate_verdicts_na_reason ? ' (' + d.gate_verdicts_na_reason + ')' : ''), '', 'gate-verdicts', [], null, null, staleBadge, null, d.gate_verdicts_last_at)
             // The split's DOWN branch: the row-end column continues straight
             // down past gate verdicts to conflicted on row 3 (#ship-elbow-3,
             // JS-positioned directly under #ship-elbow-1 so the two read as
@@ -10705,9 +10953,9 @@ const HELP = {
     maxutil:   'The busiest this graphics card got today, as a percentage.',
     bugsFound:     'BUGS FOUND - issues opened in the last 24 hours on the selected repository.',
     dispatched:    'DISPATCHED - live automated worker lanes currently spawned to work the backlog.',
-    reviewRouted:  'REVIEW ROUTED - open pull requests carrying a reviewer label, meaning they have been handed to a specific reviewer.',
-    inReview:      'IN REVIEW - open pull requests awaiting a review verdict (review required or changes requested).',
-    gateVerdicts:  'GATE VERDICTS - open pull requests whose automated gate-verdict check has not passed.',
+    reviewRouted:  'REVIEW ROUTED - open pull requests carrying a reviewer label, meaning they have been handed to a specific reviewer. Hover for the per-seat breakdown: who it is waiting on, and the oldest wait in that seat\\'s pile (a lower bound - it is time since the PR last had ANY activity, not since the label landed).',
+    inReview:      'IN REVIEW - open pull requests awaiting a review verdict (review required or changes requested). Hover for the per-seat breakdown - "author" means the ball is back with whoever opened the PR, not a reviewer.',
+    gateVerdicts:  'GATE VERDICTS - open pull requests whose automated gate-verdict check has not passed. The ⛔ badge (when shown) counts STALE VERDICTS - a blocking review left against a commit that is no longer the PR\\'s head; hover for who left it and how long it\\'s been stale.',
     conflicted:    'CONFLICTED - open pull requests GitHub reports as having a merge conflict.',
     resolved:      'RESOLVED - merge conflicts cleared in the last 24 hours. Shown as n/a when there is no history store to detect the clearing event cheaply.',
     approved:      'APPROVED - pull requests with an approving review that have not merged yet.',
