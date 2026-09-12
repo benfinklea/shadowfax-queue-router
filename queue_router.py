@@ -9033,18 +9033,38 @@ function positionShipElbows() {
         const from = document.querySelector(fromSel);
         const to = document.querySelector(toSel);
         if (!elbow || !from || !to) return;
-        const f = from.getBoundingClientRect();
-        const t = to.getBoundingClientRect();
+        // Ben: the inserters at the belt's top and bottom must sit level
+        // with the two machines (sprites) they reach into, not with the
+        // stage boxes' outer edges (which include captions, sparklines and
+        // sub-lines) - so the belt spans sprite-top to sprite-bottom.
+        const fs = from.querySelector('.ship-sprite-wrap') || from;
+        const ts = to.querySelector('.ship-sprite-wrap') || to;
+        const f = fs.getBoundingClientRect();
+        const t = ts.getBoundingClientRect();
+        const fb = from.getBoundingClientRect();
+        const tb = to.getBoundingClientRect();
         const top = Math.min(f.top, t.top);
         const bottom = Math.max(f.bottom, t.bottom);
         elbow.style.top = (top - wrapRect.top) + 'px';
         elbow.style.height = (bottom - top) + 'px';
-        const edge = side === 'right' ? Math.max(f.right, t.right) + 4 : Math.min(f.left, t.left) - 4 - elbow.offsetWidth;
+        const edge = side === 'right' ? Math.max(fb.right, tb.right) + 4 : Math.min(fb.left, tb.left) - 4 - elbow.offsetWidth;
         elbow.style.left = (edge - wrapRect.left) + 'px';
     };
     // Row 1 ends on the right at 'in review'; row 2 (row-reverse) starts on
     // the right at 'gate verdicts', directly under it.
     place('ship-elbow-1', '#ship-flow .ship-row-1 [data-square="in review"]', '#ship-flow .ship-row-2 [data-square="gate verdicts"]', 'right');
+    // Ben: DEPLOYED sits directly under FOLDED - line the two sprites'
+    // centres up (row 3's box is wider than row 2's last, so left-aligning
+    // the boxes leaves the machine itself sitting off to the right).
+    const folded = document.querySelector('#ship-flow .ship-row-2 [data-square="folded"] .ship-sprite-wrap');
+    const deployedStage = document.querySelector('#ship-flow .ship-row-3 [data-square="last deploy"]');
+    const deployed = deployedStage && deployedStage.querySelector('.ship-sprite-wrap');
+    if (folded && deployed) {
+        deployedStage.style.marginLeft = '';
+        const fc = folded.getBoundingClientRect(); const dc = deployed.getBoundingClientRect();
+        const delta = (fc.left + fc.width / 2) - (dc.left + dc.width / 2);
+        if (Math.abs(delta) > 1) deployedStage.style.marginLeft = delta + 'px';
+    }
     // Row 2 ends on the left at 'folded'; row 3 starts on the left at
     // 'last deploy' (DEPLOYED).
     place('ship-elbow-2', '#ship-flow .ship-row-2 [data-square="folded"]', '#ship-flow .ship-row-3 [data-square="last deploy"]', 'left');

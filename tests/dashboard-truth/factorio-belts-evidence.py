@@ -264,11 +264,20 @@ with sync_playwright() as p:
     # to-stage's bottom, not a short stub floating in the gap between rows.
     for elbow_id, from_sq, to_sq in (('ship-elbow-1', 'in review', 'gate verdicts'), ('ship-elbow-2', 'folded', 'last deploy')):
         elbow_box = page.locator('#' + elbow_id).bounding_box()
-        from_box = page.locator('[data-square="' + from_sq + '"]').bounding_box()
-        to_box = page.locator('[data-square="' + to_sq + '"]').bounding_box()
+        # Ben: the top/bottom inserters must sit level with the two MACHINES
+        # (sprites), not the stage boxes' outer edges - captions and
+        # sub-lines below a sprite were dragging the unloading inserter too
+        # low and a tall neighbour was pushing the loading one too high.
+        from_box = page.locator('[data-square="' + from_sq + '"] .ship-sprite-wrap').bounding_box()
+        to_box = page.locator('[data-square="' + to_sq + '"] .ship-sprite-wrap').bounding_box()
         assert elbow_box and from_box and to_box, (elbow_id, from_sq, to_sq)
-        assert abs(elbow_box['y'] - from_box['y']) < 6, (elbow_id, 'top not at from-stage top', elbow_box, from_box)
-        assert abs((elbow_box['y'] + elbow_box['height']) - (to_box['y'] + to_box['height'])) < 6, (elbow_id, 'bottom not at to-stage bottom', elbow_box, to_box)
+        assert abs(elbow_box['y'] - from_box['y']) < 6, (elbow_id, 'top not at from-sprite top', elbow_box, from_box)
+        assert abs((elbow_box['y'] + elbow_box['height']) - (to_box['y'] + to_box['height'])) < 6, (elbow_id, 'bottom not at to-sprite bottom', elbow_box, to_box)
+        top_ins = page.locator('#' + elbow_id + ' .ship-inserter').nth(0).bounding_box()
+        bot_ins = page.locator('#' + elbow_id + ' .ship-inserter').nth(1).bounding_box()
+        assert from_box['y'] <= top_ins['y'] + top_ins['height'] / 2 <= from_box['y'] + from_box['height'], (elbow_id, 'loading inserter not level with from-sprite', top_ins, from_box)
+        assert to_box['y'] <= bot_ins['y'] + bot_ins['height'] / 2 <= to_box['y'] + to_box['height'], (elbow_id, 'unloading inserter not level with to-sprite', bot_ins, to_box)
+        from_box = page.locator('[data-square="' + from_sq + '"]').bounding_box()
         # Row 3's lone stage sits under row 2's last stage: the belt must be
         # a straight column beside both, never overlapping either.
         assert elbow_box['x'] >= from_box['x'] + from_box['width'] or elbow_box['x'] + elbow_box['width'] <= from_box['x'], (elbow_id, 'overlaps from-stage', elbow_box, from_box)
