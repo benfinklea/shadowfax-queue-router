@@ -109,7 +109,11 @@ EXPECTED_CHAIN = [
     ('ci q/run', 'items/copper-cable.png'),
     ('review routed', 'items/electronic-circuit.png'),
     ('in review', 'items/advanced-circuit.png'),
+    # Ben's 10:08 AM rig (2026-09-12): gate verdicts SPLITS - one belt left
+    # to approved, one straight down to conflicted. Same source machine,
+    # same item on both (a fork of one output, not a 15th item).
     ('gate verdicts', 'items/speed-module.png'),
+    ('gate verdicts conflicted', 'items/speed-module.png'),
     ('conflicted', 'items/speed-module-2.png'),
     ('resolved', 'items/speed-module-3.png'),
     ('approved', 'items/processing-unit.png'),
@@ -182,11 +186,14 @@ with sync_playwright() as p:
     # long axis (height, since every belt is now taller than wide).
     belt_height = page.eval_on_selector('.ship-belt-vertical', 'el => el.getBoundingClientRect().height')
     assert belt_height >= 48, belt_height
-    # Ben: 7 stages per row, row 3 holds whatever is left (1 for now - more
-    # steps are expected to land there).
+    # Ben's 10:08 AM rig (2026-09-12): conflicted and resolved drop to a
+    # conflict loop on row 3, which frees room on row 2 for DEPLOYED -
+    # 7 / 6 / 2, with DEPLOYED as row 2's left end.
     assert page.locator('.ship-row-1 .ship-stage').count() == 7
-    assert page.locator('.ship-row-2 .ship-stage').count() == 7
-    assert page.locator('.ship-row-3 .ship-stage').count() == 1
+    assert page.locator('.ship-row-2 .ship-stage').count() == 6
+    assert page.locator('.ship-row-3 .ship-stage').count() == 2
+    assert page.locator('.ship-row-2 [data-square="last deploy"]').count() == 1
+    assert [e.get_attribute('data-square') for e in page.locator('.ship-row-3 .ship-stage').all()] == ['conflicted', 'resolved']
 
     # Order 17 #1 "THE REAL ITEM CHAIN": the underlying mapping (not the
     # rendered DOM, since gate_verdicts/resolved legitimately render zero
@@ -210,8 +217,16 @@ with sync_playwright() as p:
     # Order 17 #4 "an inserter on BOTH sides of every belt": exactly two
     # `.ship-inserter` children per arrow - loading and unloading - never one,
     # never a stray third.
+    # Ben's rig: resolved is the one exception - it has NO belt of its own,
+    # just a loading inserter placing onto the shared approved up-belt
+    # (#ship-elbow-4), so it carries exactly one inserter and no unloader.
     for square, _ in EXPECTED_CHAIN:
         n = page.locator('.ship-arrow[data-square-left="' + square + '"] > .ship-inserter').count()
+        if square == 'resolved':
+            assert n == 1, (square, 'the feeder has exactly one (loading) inserter, found', n)
+            assert page.locator('.ship-arrow[data-square-left="resolved"] .ship-belt').count() == 0
+            assert page.locator('#ship-elbow-4 > .ship-arrow[data-square-left="resolved"]').count() == 1, 'resolved feeder must be nested in the shared belt'
+            continue
         assert n == 2, (square, 'expected 2 inserters, found', n)
 
     # Order 17 #3 "belts run vertically": Ben's own built reference (a
@@ -223,20 +238,30 @@ with sync_playwright() as p:
     # `.ship-arrow-vertical` (bridging between rows), the other 12 via the
     # in-row, normal-flow `.ship-arrow-vbelt` (still between two
     # horizontally-adjacent stages in the same row).
-    assert page.locator('.ship-arrow-vertical').count() == 2
-    assert page.locator('.ship-arrow-vbelt').count() == 12
+    # Ben's rig: three tall column belts now (in review -> gate verdicts,
+    # gate verdicts -> conflicted straight down the same column, and the
+    # shared resolved/approved -> in line up-belt) plus 11 in-row belts
+    # (6 on row 1, 4 on row 2, 1 on row 3) = the same 14.
+    assert page.locator('.ship-arrow-vertical').count() == 3
+    assert page.locator('.ship-arrow-vbelt').count() == 11
     for square, _ in EXPECTED_CHAIN:
+        if square == 'resolved':
+            continue
         b = page.locator('.ship-arrow[data-square-left="' + square + '"] .ship-belt').bounding_box()
         assert b['height'] > b['width'], (square, b)
 
-    # Ben: chevrons alternate along a row, and row 2 starts UP because the
-    # row-end belt feeding it came down on the right. Row 1 starts down.
+    # Ben: chevrons alternate along a row. His 10:08 AM rig, read belt by
+    # belt at native resolution: row 1 down/up/down/up/down/up; row 2 (from
+    # gate verdicts leftward) down, UP (the shared belt - which is what lets
+    # resolved ride it back up), down, up, down; row 3's one belt down.
     def flows_up(square):
         return 'ship-belt-vertical-up' in page.locator('.ship-arrow[data-square-left="' + square + '"] .ship-belt').get_attribute('class')
     row1 = ['bugs found', 'issues open', 'dispatched', 'prs open', 'ci q/run', 'review routed']
-    row2 = ['gate verdicts', 'conflicted', 'resolved', 'approved', 'in line', 'merged today']
+    row2 = ['gate verdicts', 'approved', 'in line', 'merged today', 'folded']
+    row3 = ['conflicted']
     assert [flows_up(sq) for sq in row1] == [False, True, False, True, False, True], [(sq, flows_up(sq)) for sq in row1]
-    assert [flows_up(sq) for sq in row2] == [True, False, True, False, True, False], [(sq, flows_up(sq)) for sq in row2]
+    assert [flows_up(sq) for sq in row2] == [False, True, False, True, False], [(sq, flows_up(sq)) for sq in row2]
+    assert [flows_up(sq) for sq in row3] == [False], [(sq, flows_up(sq)) for sq in row3]
     # Ben: "the inserters are placing on the start and removing at the end"
     # - the loading inserter (DOM-first) sits on the upstream stage's side of
     # the belt: left of it in row 1 (flows left-to-right), RIGHT of it in the
@@ -248,12 +273,23 @@ with sync_playwright() as p:
         return 'right' if load['x'] > belt['x'] else 'left'
     for sq in row1:
         assert load_side(sq) == 'left', (sq, 'row 1 loading inserter must be left of the belt')
-    for sq in row2:
-        assert load_side(sq) == 'right', (sq, 'row 2 loading inserter must be right of the belt')
+    for sq in row2 + row3:
+        assert load_side(sq) == 'right', (sq, 'row 2/3 loading inserter must be right of the belt')
+    # ...and on the shared belt the resolved feeder loads from the right too,
+    # at the belt's START (its bottom - it flows up), while the unloader into
+    # in line is on the left at the belt's END (its top).
+    shared_belt = page.locator('#ship-elbow-4 .ship-belt').bounding_box()
+    feeder = page.locator('#ship-elbow-4 .ship-arrow-feeder .ship-inserter').bounding_box()
+    unload = page.locator('#ship-elbow-4 > .ship-inserter').nth(1).bounding_box()
+    assert feeder['x'] > shared_belt['x'] and unload['x'] < shared_belt['x'], (feeder, unload, shared_belt)
+    assert abs((feeder['y'] + feeder['height']) - (shared_belt['y'] + shared_belt['height'])) < 6, ('feeder not at the belt start (bottom)', feeder, shared_belt)
+    assert abs(unload['y'] - shared_belt['y']) < 6, ('unloader not at the belt end (top)', unload, shared_belt)
 
-    # Row-end belts always carry work DOWN to the next row.
-    for sq in ('in review', 'folded'):
+    # Row-end belts carry work DOWN to the next row - except the shared
+    # belt, which is the one that carries resolved work back UP.
+    for sq in ('in review', 'gate verdicts conflicted'):
         assert not flows_up(sq), (sq, 'row-end belt must flow down')
+    assert flows_up('approved'), 'the shared resolved/approved belt must flow up'
 
     # Ben: "I don't want to lose the spark lines" - the five history
     # sparklines plus the issues-rate panel still render, one per stage that
@@ -266,15 +302,16 @@ with sync_playwright() as p:
     assert rb and rb['width'] >= 100, ('issues open', 'rate sparkline missing or squeezed', rb)
 
     # Ben's closed-issues list on row 3: hh:mm for each measured leg, n/a for
-    # an unmeasured one - and it sits to the right of DEPLOYED on row 3.
+    # an unmeasured one - and it sits in row 3's open space, which is now on
+    # the LEFT of the conflict loop, clear of the shared belt's column.
     closed = page.locator('.ship-row-3 .ship-closed')
     assert closed.count() == 1
     closed_text = closed.inner_text()
     assert '#7265' in closed_text and '02:28' in closed_text and '05:11' in closed_text, closed_text
     assert '#7301' in closed_text and closed_text.count('n/a') >= 2, closed_text
-    deployed_box = page.locator('[data-square="last deploy"]').bounding_box()
     closed_box = closed.bounding_box()
-    assert closed_box['x'] > deployed_box['x'] + deployed_box['width'], (closed_box, deployed_box)
+    shared_box = page.locator('#ship-elbow-4').bounding_box()
+    assert closed_box['x'] + closed_box['width'] <= shared_box['x'], ('closed list overlaps the shared belt column', closed_box, shared_box)
 
     # Round 2 (Elrond review, PR #35, defect 1): no stage may ever render a
     # bare '?' - it reads as indistinguishable from the no-data wreckage state
@@ -316,29 +353,69 @@ with sync_playwright() as p:
     # last stage that runs all the way down to beside the next row's first
     # stage - its top is at the from-stage's top and its bottom reaches the
     # to-stage's bottom, not a short stub floating in the gap between rows.
-    for elbow_id, from_sq, to_sq in (('ship-elbow-1', 'in review', 'gate verdicts'), ('ship-elbow-2', 'folded', 'last deploy')):
+    # Ben's 10:08 AM rig: the right-hand column is ONE continuous belt from
+    # IN REVIEW down past GATE VERDICTS to CONFLICTED, with four inserters
+    # on it - two stacked beside gate verdicts (the unloader into it above
+    # the loader out of it). Built as two belts (#ship-elbow-1 ends at gate
+    # verdicts' middle, #ship-elbow-3 starts there) at the SAME x.
+    def sprite_box(sq):
+        return page.locator('[data-square="' + sq + '"] .ship-sprite-wrap').bounding_box()
+    gate_box = sprite_box('gate verdicts')
+    gate_mid = gate_box['y'] + gate_box['height'] / 2
+    for elbow_id, from_sq, to_sq, top_at, bottom_at in (
+            ('ship-elbow-1', 'in review', 'gate verdicts', sprite_box('in review')['y'], gate_mid),
+            ('ship-elbow-3', 'gate verdicts', 'conflicted', gate_mid, sprite_box('conflicted')['y'] + sprite_box('conflicted')['height'])):
         elbow_box = page.locator('#' + elbow_id).bounding_box()
         # Ben: the top/bottom inserters must sit level with the two MACHINES
         # (sprites), not the stage boxes' outer edges - captions and
         # sub-lines below a sprite were dragging the unloading inserter too
         # low and a tall neighbour was pushing the loading one too high.
-        from_box = page.locator('[data-square="' + from_sq + '"] .ship-sprite-wrap').bounding_box()
-        to_box = page.locator('[data-square="' + to_sq + '"] .ship-sprite-wrap').bounding_box()
+        from_box = sprite_box(from_sq)
+        to_box = sprite_box(to_sq)
         assert elbow_box and from_box and to_box, (elbow_id, from_sq, to_sq)
-        assert abs(elbow_box['y'] - from_box['y']) < 6, (elbow_id, 'top not at from-sprite top', elbow_box, from_box)
-        assert abs((elbow_box['y'] + elbow_box['height']) - (to_box['y'] + to_box['height'])) < 6, (elbow_id, 'bottom not at to-sprite bottom', elbow_box, to_box)
+        assert abs(elbow_box['y'] - top_at) < 6, (elbow_id, 'top misplaced', elbow_box, top_at)
+        assert abs((elbow_box['y'] + elbow_box['height']) - bottom_at) < 6, (elbow_id, 'bottom misplaced', elbow_box, bottom_at)
         top_ins = page.locator('#' + elbow_id + ' .ship-inserter').nth(0).bounding_box()
         bot_ins = page.locator('#' + elbow_id + ' .ship-inserter').nth(1).bounding_box()
         assert from_box['y'] <= top_ins['y'] + top_ins['height'] / 2 <= from_box['y'] + from_box['height'], (elbow_id, 'loading inserter not level with from-sprite', top_ins, from_box)
         assert to_box['y'] <= bot_ins['y'] + bot_ins['height'] / 2 <= to_box['y'] + to_box['height'], (elbow_id, 'unloading inserter not level with to-sprite', bot_ins, to_box)
-        from_box = page.locator('[data-square="' + from_sq + '"]').bounding_box()
-        # Row 3's lone stage sits under row 2's last stage: the belt must be
-        # a straight column beside both, never overlapping either.
         # Ben: "we lost the transport belt going from row 2 to 3" - the whole
         # column must be inside the strip's frame, never clipped off an edge.
         assert elbow_box['x'] >= flow_left and elbow_box['x'] + elbow_box['width'] <= flow_right, (elbow_id, 'row-end belt outside the frame', elbow_box, flow_left, flow_right)
         belt_box = page.locator('#' + elbow_id + ' .ship-belt').bounding_box()
         assert belt_box['x'] >= flow_left and belt_box['x'] + belt_box['width'] <= flow_right, (elbow_id, 'row-end belt column clipped', belt_box, flow_left, flow_right)
+    e1 = page.locator('#ship-elbow-1').bounding_box(); e3 = page.locator('#ship-elbow-3').bounding_box()
+    assert abs(e1['x'] - e3['x']) < 1, ('the two column belts must share one x - one straight column', e1, e3)
+    assert abs((e1['y'] + e1['height']) - e3['y']) < 1, ('the two column belts must butt end to end', e1, e3)
+
+    # The shared up-belt (#ship-elbow-4): top level with IN LINE's machine
+    # (its unloader), bottom at RESOLVED's machine bottom (the feeder, at the
+    # belt's start), approved's loader level with APPROVED's machine.
+    e4 = page.locator('#ship-elbow-4').bounding_box()
+    inline_box, approved_box, resolved_box = sprite_box('in line'), sprite_box('approved'), sprite_box('resolved')
+    assert abs((e4['y'] + e4['height']) - (resolved_box['y'] + resolved_box['height'])) < 6, ('shared belt bottom not at resolved sprite bottom', e4, resolved_box)
+    load_ins = page.locator('#ship-elbow-4 > .ship-inserter').nth(0).bounding_box()
+    unload_ins = page.locator('#ship-elbow-4 > .ship-inserter').nth(1).bounding_box()
+    feeder_ins = page.locator('#ship-elbow-4 .ship-arrow-feeder .ship-inserter').bounding_box()
+    def level(ins, box, what):
+        c = ins['y'] + ins['height'] / 2
+        assert box['y'] <= c <= box['y'] + box['height'], (what, 'inserter not level with its machine', ins, box)
+    level(load_ins, approved_box, 'approved loader')
+    level(unload_ins, inline_box, 'in line unloader')
+    level(feeder_ins, resolved_box, 'resolved feeder')
+    assert e4['x'] >= flow_left and e4['x'] + e4['width'] <= flow_right, ('shared belt outside the frame', e4)
+    # It runs in the column both rows reserve for it - between approved and
+    # in line on row 2, and beside resolved on row 3 - overlapping no stage.
+    for sq in ('approved', 'in line', 'resolved', 'conflicted', 'gate verdicts'):
+        sb = page.locator('[data-square="' + sq + '"]').bounding_box()
+        assert sb['x'] + sb['width'] <= e4['x'] + 1 or sb['x'] >= e4['x'] + e4['width'] - 1, ('shared belt overlaps', sq, sb, e4)
+    assert approved_box['x'] > e4['x'] and inline_box['x'] < e4['x'], ('shared belt must sit between in line (left) and approved (right)', inline_box, e4, approved_box)
+
+    # Ben's rig: CONFLICTED sits directly under GATE VERDICTS and RESOLVED
+    # directly under APPROVED - sprite centres line up column for column.
+    for above, below in (('gate verdicts', 'conflicted'), ('approved', 'resolved')):
+        a, b = sprite_box(above), sprite_box(below)
+        assert abs((a['x'] + a['width'] / 2) - (b['x'] + b['width'] / 2)) < 2, (below, 'not under', above, a, b)
 
     # Order 14 "the inserters must swing": a moving inserter's arm carries a
     # real animation, its duration is BOUND to the measured rate (two
@@ -448,9 +525,15 @@ with sync_playwright() as p:
 with sync_playwright() as p:
     browser, page = render(p, pipeline_fixture_full_chain)
     for square, expected_item in EXPECTED_CHAIN:
-        belt = page.locator('.ship-arrow[data-square-left="' + square + '"] .ship-belt-item-img').first
-        url = belt.evaluate("el => getComputedStyle(el).backgroundImage")
-        assert expected_item in url, (square, expected_item, url)
+        # Ben's rig: resolved's item rides the SHARED belt (#ship-elbow-4),
+        # queued behind approved's own - so that belt carries both items.
+        sel = '#ship-elbow-4 .ship-belt-item-img' if square == 'resolved' else '.ship-arrow[data-square-left="' + square + '"] .ship-belt-item-img'
+        urls = [e.evaluate("el => getComputedStyle(el).backgroundImage") for e in page.locator(sel).all()]
+        assert any(expected_item in u for u in urls), (square, expected_item, urls)
+    shared_urls = [e.evaluate("el => getComputedStyle(el).backgroundImage") for e in page.locator('#ship-elbow-4 .ship-belt-item-img').all()]
+    # fixture: green-inline backlog 1 (processing unit), resolved 2 (speed module 3),
+    # in that order from the downstream (top) end.
+    assert [('processing-unit' in u, 'speed-module-3' in u) for u in shared_urls] == [(True, False), (False, True), (False, True)], shared_urls
     page.locator('#ship-flow').screenshot(path=str(OUT / 'strip-1440-item-chain.png'))
     browser.close()
 
