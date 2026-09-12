@@ -211,3 +211,112 @@ narrow and dark.
 
 Side-by-side comparison with Ben's reference frames, and which differences
 remain: see the PR body (image comparison lives there, not in this repo).
+
+## Round 2 review (PR #36) - two blockers, both fixed
+
+1. **`BUGS FOUND` clipped to `UGS FOUND` again** - a regression from order
+   16's belt widening (76px -> 96px, arrow slot 132px -> 146px) squeezing row
+   1's six stage boxes to 95px, narrower than the caption itself (101px).
+   Fixed at the container, not the stages: `.ship-flow-wrap` gained real
+   horizontal padding (40px, tuned up from 18px after measuring every one of
+   the 15 captions' own margins against `#ship-flow`'s bounding box - 18px
+   left "review routed" only 3.5px of margin). Belt/stage widths were left
+   untouched this time, since the review didn't flag them.
+   `tests/dashboard-truth/factorio-belts-evidence.py` now asserts every
+   stage's caption box stays fully inside `#ship-flow`'s own bounds on both
+   edges - mutation-tested by zeroing the padding
+   (`AssertionError: ('bugs found', 'clipped at left edge', ...)`), restored.
+2. **Ground came out dark chocolate brown; Ben's reference is warm light tan
+   sand** - his own brief's "legibility beats fidelity" line over-applied:
+   round 1 had grayscaled and dark-retinted `ground-tile.png` to protect the
+   numerals, solving legibility at the terrain instead of the text. Reverted
+   to a completely untouched crop of `sand-1.png` at its own real tone.
+   Legibility moved to the text: a new `--text-outline` custom property
+   (four-directional dark `text-shadow` plus a soft glow) applied to every
+   stage caption, age line, sub-line, legend, and rate label, and
+   `.ship-num`'s dark plate opacity bumped `.72` -> `.85`. Re-checked
+   afterward: the drop-shadow on every sprite still reads clearly against the
+   lighter ground (same offset/angle, just more contrast against sand than it
+   had against the old dark retint).
+
+## Order 17 - the real item chain, vertical belts, two inserters
+
+**The item chain.** `SHIP_ARROW_ITEM` replaces round 1's inline-SVG
+`SHIP_ARROW_ITEMS` placeholder map with Ben's actual 14-item Factorio chain,
+now that `static/factorio/items/` is staged: bug (reusing the order-15 biter
+art) -> lab -> copper ore -> copper plate -> copper wire -> green circuit ->
+red/advanced circuit -> speed module 1/2/3 -> processing unit -> car -> tank
+-> rocket. Ben's own list said "Red Circuit" and "advanced circuit" -
+deduped to one item (they're the same item in Factorio), which is exactly
+what lands the count on 14 for 14 arrows. Verified against the live
+`SHIP_ARROW_ITEM` object via `page.evaluate`, not just read from source, so
+the test is an independent check of the mapping, not a copy of it that could
+silently drift. Because `gate_verdicts`/`resolved` are permanently-null
+fields (Round 3's `n/a` proof), their belts correctly render zero item slots
+in the main fixture (never inventing a count) - a separate
+`pipeline_fixture_full_chain` (gate_verdicts=3, resolved=2) proves every one
+of the 14 belts renders its item when the data exists, and is what
+`strip-1440-item-chain.png` was captured against.
+
+**No boxes around belts.** `.ship-belt`'s `outline` rule removed entirely;
+the backed-up (jam) state still reads red via glow only
+(`box-shadow`), never a border. Asserted for all 14 belts
+(`border-style`/`outline-style` both `none`), mutation-tested by re-adding
+`border:1px solid #3a4560` - failed by name
+(`AssertionError: ('belt has a border', 0, 'solid')`), restored.
+
+**Vertical belts - the honest compromise.** Ben's own brief contained a
+self-acknowledged contradiction: "make the belts run up to down" and "belts
+... moving right to left but should move left to right" pull in different
+directions, and a literal "all belts vertical" would mean abandoning the
+boustrophedon's 3-row layout - protected across every review round since
+order 11, including this same order 17 document. What's shipped: the two
+transitions that are **already geometrically vertical** in the layout
+(`review routed` at the end of row 1 dropping into `in review` at the start
+of row 2; `resolved` at the end of row 2 dropping into `approved` at the
+start of row 3) now render as real vertical belts (`ship-arrow-vertical`,
+`ship-belt-vertical`), flowing top to bottom
+(`@keyframes ship-belt-flow-vertical`), with the item's own downward motion
+matching the visual flow direction. The other 12 within-row handoffs stay
+horizontal. This also fixed the belt-direction bug the brief flagged
+separately (chevrons scrolling backward against their own arrow) - the
+horizontal keyframes' sign was inverted so flow now visibly matches
+direction.
+Fixing this also surfaced a real bug: `positionShipElbows()` located the two
+row-transition anchors via `.ship-stage:last-child`, which broke silently
+once the new vertical-arrow element became the actual last child in each
+row's HTML (the turn belt was landing wherever the browser's default static
+position fell, not tucked against its stage). Fixed by querying
+`[data-square="review routed"]` / `[data-square="resolved"]` directly.
+Asserted: exactly 2 `.ship-arrow-vertical` elements, both taller than wide;
+all other 12 belts wider than tall.
+
+**Two inserters per belt.** Every arrow now renders a loading inserter
+(upstream end) and an unloading inserter (downstream end), both bound to the
+same measured rate/backed-up/unknown state as order 14 established, each
+with its own phase seed (`square + '-load'` / `square + '-unload'`) so they
+never move in lockstep. `.inserter-arm`'s base rotation and the
+`inserter-swing` keyframes were generalized to a single `--arm-rest` custom
+property (0/±90/180deg) so one rule set covers horizontal-right,
+horizontal-left, and vertical orientations instead of three separate
+keyframe/override pairs. Asserted: exactly 2 `.ship-inserter` children per
+arrow (mutation-tested by dropping the unloading inserter - failed by name,
+`AssertionError: ('bugs found', 'expected 2 inserters, found', 1)`); both
+freeze at the pickup end on the bottleneck arrow; and the loading/unloading
+inserters on the same belt carry different `animation-delay` values -
+proving they swing on different phases, not as a mirror-synced pair
+(mutation-tested by giving both the same phase seed - failed by name,
+delays identical at `-2.471s`).
+
+`swing-frame-1/2/3.png` now capture both inserters per tracked arrow;
+`strip-1440-item-chain.png` is the "readable bug to rocket" evidence frame.
+`static/factorio/SOURCE.md` documents the new `items/` directory.
+
+**Not done / disagreements, stated rather than shipped quietly:** a single
+continuous vertical belt spanning all 14 arrows was not attempted beyond the
+two transitions above - it would require restructuring the row layout that
+every prior round explicitly protected, which this order also explicitly
+protects in the same breath it asks for vertical belts. The reference-frame
+side-by-side this order also asks for could not be produced - this session
+has no access to Ben's actual reference frame images, only his written
+description of them (same gap noted in round 2 and order 16's evidence).
