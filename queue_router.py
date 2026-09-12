@@ -7488,7 +7488,15 @@ border-radius:1px 1px 0 0;min-height:1px}
    fixed width either (see the 900px breakpoint below). No animation, ever -
    these are static per-refresh snapshots, so prefers-reduced-motion needs no
    extra rule here. */
+/* Ben: "I don't want to lose the spark lines." They survived the Factorio
+   rebuild but were squeezed to the sprite's own width on bare sand. Fixed
+   width wider than the machine, a touch taller, and on the same dark plate
+   as the captions so the line reads. */
 .ship-history-spark{display:block;width:100%;height:22px}
+.ship-stage>.ship-history-spark,.ship-stage .ship-issues-rate{width:110px;min-width:110px;margin:0 auto 3px auto}
+.ship-stage>.ship-history-spark{height:26px;background:rgba(0,0,0,.5);border-radius:3px;padding:2px 3px;box-sizing:border-box}
+.ship-stage .ship-issues-rate{background:rgba(0,0,0,.5);border-radius:3px;padding:2px 3px;box-sizing:border-box;height:auto}
+.ship-stage .ship-issues-rate .ship-history-spark{height:22px}
 /* SHIP-SPARK-3 hover-tooltip fix: SHIP-SPARK/SHIP-SPARK-2 used a native SVG
    <title> per column, which real hover shows fine but a headless-Chrome
    screenshot can never capture (native title tooltips are painted by the OS

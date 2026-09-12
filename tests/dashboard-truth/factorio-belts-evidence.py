@@ -255,6 +255,16 @@ with sync_playwright() as p:
     for sq in ('in review', 'folded'):
         assert not flows_up(sq), (sq, 'row-end belt must flow down')
 
+    # Ben: "I don't want to lose the spark lines" - the five history
+    # sparklines plus the issues-rate panel still render, one per stage that
+    # had one before the Factorio rebuild, each at least 100px wide and
+    # 20px tall (not squeezed to the sprite's width).
+    for square in ('prs open', 'ci q/run', 'in line', 'merged today', 'last deploy'):
+        sb = page.locator('[data-square="' + square + '"] .ship-history-spark').first.bounding_box()
+        assert sb and sb['width'] >= 100 and sb['height'] >= 20, (square, 'sparkline missing or squeezed', sb)
+    rb = page.locator('[data-square="issues open"] .ship-issues-rate').bounding_box()
+    assert rb and rb['width'] >= 100, ('issues open', 'rate sparkline missing or squeezed', rb)
+
     # Ben's closed-issues list on row 3: hh:mm for each measured leg, n/a for
     # an unmeasured one - and it sits to the right of DEPLOYED on row 3.
     closed = page.locator('.ship-row-3 .ship-closed')
