@@ -7305,8 +7305,13 @@ image-rendering:pixelated;opacity:.85;filter:var(--ground-shadow)}
    native frame drawn at 30x23, bottom-left); the arm sprite's mounting
    base is its very bottom edge, so the pivot is 50% 100% of the arm and
    the arm is placed so that point lands on the hub. */
-.ship-inserter .inserter-arm{position:absolute;left:9px;top:-11px;width:14px;height:32px;
-background-repeat:no-repeat;background-size:14px 32px;image-rendering:pixelated;
+/* Hub (the bearing ring) measured at (51,29) of the 105x79 platform frame
+   -> (14.6, 17.4) in the 34x32 slot with the platform bottom-left. The arm
+   is 20x46 (sprite aspect kept, longer like the reference - about 1.5x the
+   tripod's width) and pivots at its own bottom edge, placed on the hub. */
+.ship-inserter{z-index:2}
+.ship-inserter .inserter-arm{position:absolute;left:5px;top:-29px;width:20px;height:46px;
+background-repeat:no-repeat;background-size:20px 46px;image-rendering:pixelated;
 transform-origin:50% 100%;transform:rotate(var(--arm-rest,90deg));transition:transform .4s ease,opacity .4s ease}
 .ship-inserter.idle .inserter-arm{opacity:.4}
 /* LORE order 14 "the inserters must swing": a real Factorio inserter's arm
@@ -8415,19 +8420,24 @@ function shipAgeHtml(cap, iso) {
 // sharper fact.
 const SHIP_STAGE_META = {
     'bugs found':     {kind: 'robot',   sprite: 'repair-pack.png'},
+    // Ben: an assembling machine wherever work is HAPPENING (dispatched,
+    // ci run, in review, gate verdicts, merged, folded); the steel chest
+    // wherever work is just WAITING (issues open, prs open, review routed,
+    // conflicted, resolved, approved, in queue). Bugs found (biter) and
+    // deployed (silo) stay as they were.
     'issues open':    {kind: 'chest',   sprite: 'chest/steel-chest.png'},
-    'dispatched':     {kind: 'robot',   sprite: 'inserter.png'},
-    'prs open':       {kind: 'robot',   sprite: 'assembler'},
-    'ci q/run':       {kind: 'machine', sprite: 'lab.png'},
+    'dispatched':     {kind: 'machine', sprite: 'assembling-machine-3.png'},
+    'prs open':       {kind: 'chest',   sprite: 'chest/steel-chest.png'},
+    'ci q/run':       {kind: 'machine', sprite: 'assembling-machine-3.png'},
     'review routed':  {kind: 'chest',   sprite: 'chest/steel-chest.png'},
-    'in review':      {kind: 'robot',   sprite: 'radar.png'},
-    'gate verdicts':  {kind: 'robot',   sprite: 'programmable-speaker.png'},
-    'conflicted':     {kind: 'machine', sprite: 'deconstruction-planner.png'},
-    'resolved':       {kind: 'machine', sprite: 'construction-robot.png'},
+    'in review':      {kind: 'machine', sprite: 'assembling-machine-3.png'},
+    'gate verdicts':  {kind: 'machine', sprite: 'assembling-machine-3.png'},
+    'conflicted':     {kind: 'chest',   sprite: 'chest/steel-chest.png'},
+    'resolved':       {kind: 'chest',   sprite: 'chest/steel-chest.png'},
     'approved':       {kind: 'chest',   sprite: 'chest/steel-chest.png'},
     'in line':        {kind: 'chest',   sprite: 'chest/steel-chest.png'},
     'merged today':   {kind: 'machine', sprite: 'assembling-machine-3.png'},
-    'folded':         {kind: 'machine', sprite: 'roboport.png'},
+    'folded':         {kind: 'machine', sprite: 'assembling-machine-3.png'},
     'deployed':       {kind: 'machine', sprite: 'rocket-silo.png'},
     // Row 3's shipStage() call uses 'last deploy' as its own cap/data-square
     // (the box's caption text is the separate `label` param, 'deployed') -
