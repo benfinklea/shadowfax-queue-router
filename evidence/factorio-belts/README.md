@@ -28,6 +28,29 @@ against the source PNGs (`static/factorio/roboport.png`,
 sprites per `SHIP_STAGE_META`, not a fallback. They are just inherently
 grey/tan Factorio art at small size; left unchanged.
 
+**Round 3 (Elrond review, PR #35, 1 blocker - fixed):** `GATE VERDICTS` was
+rendering NO number at all (not even `?` after Round 2's fix removed that -
+just nothing), while `RESOLVED` correctly rendered `n/a` in the same
+screenshot. Both fields have carried the identical "no instrument for this,
+ever" status since PR #34 dropped `statusCheckRollup` - `gate_verdicts` just
+never got `resolved`'s null-to-`'n/a'` conversion at its call site. Fixed by
+mirroring `resolved`'s exact pattern (same muted/dim treatment, same
+`_na_reason` tooltip suffix). `strip-1440-full.png` now carries `resolved`
+null too, specifically so both squares' matching `n/a` treatment is provable
+in one screenshot, the same comparison the review made. Only that one call
+site changed in `queue_router.py` - the other four Round 2 defects were
+untouched, per the review's "do not change anything else".
+
+`tests/dashboard-truth/factorio-belts-evidence.py` grows one more assertion:
+every one of the 15 stages renders a number or an explicit `n/a`, never
+nothing. Mutation-tested (reverted the gate_verdicts fix, the assertion
+failed by name - `AssertionError: stage "gate verdicts" rendered no number
+and no n/a` - then restored). The pre-existing no-data/remnant-wreckage
+demo (`state-no-data.png`) moved to its own fixture
+(`pipeline_fixture_no_data`) so a transient per-refresh miss (a real,
+different condition from gate_verdicts/resolved's permanent `n/a`) can still
+legitimately render no number without tripping the new blanket assertion.
+
 - `strip-1440-full.png`: full strip at 1440px against a synthetic fixture with
   one deliberately measured-zero/backlogged arrow (`ci-green`), so a backed-up
   belt is visible alongside normal flowing ones.

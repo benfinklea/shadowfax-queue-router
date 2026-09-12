@@ -18,20 +18,25 @@ OUT.mkdir(parents=True, exist_ok=True)
 
 # A fully-populated 15-stage payload, with one deliberately measured-zero/
 # backlogged arrow (ci-green -> the bottleneck) so a backed-up belt renders
-# packed and red, and one deliberately no-data square (prs_open=None) so the
-# assembler's remnant wreckage renders instead of a live sprite.
+# packed and red. gate_verdicts and resolved are the two genuinely
+# permanent "no instrument for this, ever" fields (Round 3) - both null,
+# both must render 'n/a'. Every other field is a real, present value: this
+# fixture is what the blanket "no stage ever renders empty" assertion runs
+# against, so it has to reflect a normal, fully-available refresh, not a
+# degraded one.
 pipeline_fixture = dict(
     available=True, degraded=False, repo='armbrain-io/armbrain',
     bugs_found_24h=3, last_issue_created_at='2026-09-11T19:40:00Z',
     issues_open=7,
     dispatched=2, dispatched_last_at='2026-09-11T20:10:00Z',
-    prs_open=None, prs_open_last_at=None,
+    prs_open=4, prs_open_last_at='2026-09-11T20:15:00Z',
     ci_queued=1, ci_running=2, ci_last_run_started_at='2026-09-11T18:00:00Z',
     review_routed=2, review_routed_last_at='2026-09-11T20:05:00Z',
     in_review=1, in_review_last_at='2026-09-11T20:12:00Z',
     gate_verdicts=None, gate_verdicts_last_at=None,
+    gate_verdicts_na_reason='statusCheckRollup removed from the bulk PR query',
     conflicted=1, conflicted_last_at='2026-09-11T19:50:00Z',
-    resolved=2, resolved_na_reason=None,
+    resolved=None, resolved_na_reason='no snapshot history of mergeable-state transitions to detect a resolve event',
     approved=2, approved_last_at='2026-09-11T20:00:00Z',
     queue_depth=3, queue_prs=[], queue_sub='',
     merged_today=5, merged_last_hour=2, merged_spark=[1, 2, 1, 3, 2],
@@ -39,6 +44,7 @@ pipeline_fixture = dict(
     folded=1, folded_last_at='2026-09-11T20:19:00Z',
     deploys_ok_today=1, deploys_in_flight=1,
     last_deploy_sha='b494d7e', last_deploy_at='2026-09-11T20:20:00Z',
+    deployed_prs_today=3, deployed_prs_today_list=[101, 102, 103],
     green_waiting=0, green_waiting_prs=[],
     arrows=[
         {'key': 'issues-prs', 'rate_per_hour': 6, 'backlog': 4, 'drain_hours': 0.7},
@@ -53,6 +59,13 @@ agents_fixture = [
     {'live': True, 'square': 'issues open'},
     {'live': True, 'square': 'dispatched'},
 ]
+# A separate, deliberately-degraded copy - prs_open unavailable this refresh
+# (distinct from gate_verdicts/resolved's permanent n/a) - used only to
+# capture the no-data/remnant-wreckage evidence shot, kept out of the main
+# fixture so it can't collide with the "never empty" assertion above: a
+# transient per-refresh instrument failure is a different, real state from
+# "we structurally never have this number", and both need their own proof.
+pipeline_fixture_no_data = dict(pipeline_fixture, prs_open=None, prs_open_last_at=None)
 
 def stub_routes(page):
     # Network-level route interception, registered BEFORE navigation, so it
@@ -96,8 +109,6 @@ with sync_playwright() as p:
     assert belt_width >= 64, belt_width
     # Round 2 defect 5: row 3 is no longer a lone square.
     assert page.locator('.ship-row-3 .ship-stage').count() == 5
-    # No-data state (prs open) shows real remnant wreckage, not a live sprite.
-    assert page.locator('[data-square="prs open"] .ship-sprite.remnant').count() == 1
 
     # Round 2 (Elrond review, PR #35, defect 1): no stage may ever render a
     # bare '?' - it reads as indistinguishable from the no-data wreckage state
@@ -106,6 +117,19 @@ with sync_playwright() as p:
     # panels render nothing rather than a glyph when a value is unknown.
     strip_text = strip.inner_text()
     assert '?' not in strip_text, strip_text
+
+    # Round 3 (Elrond review, PR #35): every one of the 15 stages renders
+    # either a number or an explicit 'n/a' - never nothing. gate_verdicts
+    # (null since PR #34 dropped statusCheckRollup) was rendering an empty
+    # ship-num, a third state indistinguishable from a rendering bug rather
+    # than the same "I cannot know this" status 'resolved' already shows.
+    stages = page.locator('.ship-stage')
+    assert stages.count() == 15
+    for i in range(stages.count()):
+        stage = stages.nth(i)
+        square = stage.get_attribute('data-square')
+        num_text = stage.locator('.ship-num').inner_text() if stage.locator('.ship-num').count() else ''
+        assert num_text.strip() != '', 'stage "' + square + '" rendered no number and no n/a'
 
     # Round 2 defect 3: the row-turn elbows must sit tucked against their
     # anchor square, not floating - within ~40px of it in both axes.
@@ -118,7 +142,6 @@ with sync_playwright() as p:
     # Three states side by side, proven never to look alike.
     page.locator('[data-square="bugs found"]').screenshot(path=str(OUT / 'state-idle.png'))
     page.locator('[data-square="ci q/run"]').screenshot(path=str(OUT / 'state-stalled.png'))
-    page.locator('[data-square="prs open"]').screenshot(path=str(OUT / 'state-no-data.png'))
 
     # Greyscale fallback - the backed-up belt must still read as packed/dense.
     page.evaluate("document.documentElement.style.filter='grayscale(100%)'")
@@ -126,6 +149,29 @@ with sync_playwright() as p:
     strip.screenshot(path=str(OUT / 'strip-1440-greyscale.png'))
     page.evaluate("document.documentElement.style.filter=''")
 
+    browser.close()
+
+# Separate pass for the no-data/remnant-wreckage state: prs_open unavailable
+# THIS refresh (pipeline_fixture_no_data) is a different, real condition from
+# gate_verdicts/resolved's permanent n/a, and needs its own proof - kept out
+# of the main fixture above so it can't collide with the "never empty"
+# assertion (a transient per-refresh miss legitimately still renders no
+# number, only the sprite's remnant art carries that signal).
+with sync_playwright() as p:
+    browser = p.chromium.launch(headless=True)
+    page = browser.new_page(viewport={'width': 1440, 'height': 900})
+    errors = []
+    page.on('pageerror', lambda e: errors.append(str(e)))
+    page.route('**/api/pipeline*', lambda route: route.fulfill(
+        status=200, content_type='application/json', body=json.dumps(pipeline_fixture_no_data)))
+    page.route('**/api/agents*', lambda route: route.fulfill(
+        status=200, content_type='application/json', body=json.dumps(agents_fixture)))
+    page.goto('http://127.0.0.1:5099/', wait_until='domcontentloaded')
+    page.evaluate('async()=>{await refreshShipFlow();}')
+    page.wait_for_timeout(1000)
+    assert not errors, errors
+    assert page.locator('[data-square="prs open"] .ship-sprite.remnant').count() == 1
+    page.locator('[data-square="prs open"]').screenshot(path=str(OUT / 'state-no-data.png'))
     browser.close()
 
 # Reduced-motion pass, in a fresh context (emulate_media must be set before

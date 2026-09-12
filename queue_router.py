@@ -9244,7 +9244,12 @@ function shipFlowHtml(d) {
             // transition either before or after the rebalance): in review was
             // previously row 1's own dead end and never needed one.
             shipStage(d.in_review ?? null, 'in review', '', '', null, HELP.inReview, '', 'in-review', [], null, null, null, null, d.in_review_last_at) + shipArrow('in review', '👁', null, 'PRs currently under human/AI review', null, null, false, String(d.in_review ?? '?'), null, 'left') +
-            shipStage(d.gate_verdicts ?? null, 'gate verdicts', gateCls, '', null, HELP.gateVerdicts, '', 'gate-verdicts', [], null, null, null, null, d.gate_verdicts_last_at) + shipArrow('gate verdicts', '⛨', null, 'PRs with a non-passing gate-verdict check', null, null, false, String(d.gate_verdicts ?? '?'), null, 'left') +
+            // Round 3 (Elrond review, PR #35): gate_verdicts has been null
+            // since PR #34 dropped statusCheckRollup - the same "I cannot
+            // know this" status as 'resolved', so it renders 'n/a' the same
+            // way (was rendering nothing at all - a stage with no number and
+            // no n/a is its own, different, confusing state).
+            shipStage(d.gate_verdicts === null || d.gate_verdicts === undefined ? 'n/a' : d.gate_verdicts, 'gate verdicts', gateCls, '', null, HELP.gateVerdicts + ((d.gate_verdicts === null || d.gate_verdicts === undefined) && d.gate_verdicts_na_reason ? ' (' + d.gate_verdicts_na_reason + ')' : ''), '', 'gate-verdicts', [], null, null, null, null, d.gate_verdicts_last_at) + shipArrow('gate verdicts', '⛨', null, 'PRs with a non-passing gate-verdict check', null, null, false, String(d.gate_verdicts ?? '?'), null, 'left') +
             shipStage(d.conflicted ?? null, 'conflicted', conflictCls, '', null, HELP.conflicted, '', 'conflicted', [], null, null, null, null, d.conflicted_last_at) + shipArrow('conflicted', '⚠', null, 'Open PRs with a merge conflict', null, null, false, String(d.conflicted ?? '?'), null, 'left') +
             // 'resolved' is now row 2's own end - the elbow carries the turn
             // to 'approved' at the start of row 3 (its old decorative arrow
