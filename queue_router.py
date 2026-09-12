@@ -7611,7 +7611,13 @@ width:38px;gap:2px;padding:2px 0;z-index:4}
    they connect really are stacked above/below on screen, so those stay a
    column stack. */
 .ship-arrow-vbelt{flex-direction:row;flex:0 0 auto;width:auto;height:auto;
-gap:2px;padding:2px 4px;align-self:center}
+gap:2px;padding:2px 4px;align-self:center;align-items:center}
+/* Ben's built reference: each inserter sits at the belt's own beginning or
+   end - top or bottom - never centered beside it, so it visibly interacts
+   with the correct extreme of the belt (where items actually enter/exit)
+   rather than floating at the belt's midpoint. */
+.ship-inserter.align-top{align-self:flex-start}
+.ship-inserter.align-bottom{align-self:flex-end}
 /* The belt itself: a scrolling texture tile carrying the order-17 item
    chain. State is rendered, never captioned - order 9's "hover is where the
    numbers live" (native title attr on the arrow, unchanged). LORE order 17
@@ -7639,7 +7645,11 @@ animation:ship-belt-flow linear infinite;animation-duration:var(--belt-duration,
    hijacked by whichever axis happens to be the parent's main axis - this
    belt sits inside a column-direction parent (.ship-arrow-vertical, the
    row-turn) AND a row-direction one (.ship-arrow-vbelt, in-row) now. */
-.ship-belt-vertical{width:26px;height:72px;flex:0 0 auto}
+/* Ben: "buildings are not lined up... that's so there is more belt so it
+   will show more items on the belt so I can see when they're backed up" -
+   taller than the original 72px so a jam visibly piles up along real belt
+   length, not just a couple of dots. */
+.ship-belt-vertical{width:26px;height:140px;flex:0 0 auto}
 /* Ben's built reference: each belt segment's own chevron faces the actual
    direction of travel (down), not sideways - the base tile's chevron is
    baked in pointing right (it's a horizontal-belt asset), so a vertical
@@ -7650,6 +7660,13 @@ animation:ship-belt-flow linear infinite;animation-duration:var(--belt-duration,
 .ship-belt-vertical .ship-belt-track{background-image:url('/static/factorio/belt/belt-tile-vertical.png');
 background-size:18px 18px;background-repeat:repeat;animation-name:ship-belt-flow-vertical}
 @keyframes ship-belt-flow-vertical{to{background-position-y:18px}}
+/* Ben's built reference: consecutive in-row belts alternate their own flow
+   direction (down, up, down, up...), each with its own pre-rotated chevron
+   tile facing the direction it actually travels - never a downward tile on
+   a belt that flows up. */
+.ship-belt-vertical-up .ship-belt-track{background-image:url('/static/factorio/belt/belt-tile-vertical-up.png');
+animation-name:ship-belt-flow-vertical-up}
+@keyframes ship-belt-flow-vertical-up{to{background-position-y:-18px}}
 .ship-belt-items{position:absolute;inset:0}
 .ship-belt-item{position:absolute;top:50%;left:50%;width:16px;height:16px;transform:translate(-50%,-50%);
 filter:drop-shadow(0 1px 1px rgba(0,0,0,.6))}
@@ -8581,7 +8598,7 @@ function shipStagePhase(square) {
 // right-to-left, 180 for a vertical (top-to-bottom) belt - both the loading
 // and unloading inserter on a vertical belt reach straight down, since both
 // sit beside a belt whose flow is always downward.
-function shipInserterHtml(count, armRest, unknown, phaseSeed, backedUp, swingDuration) {
+function shipInserterHtml(count, armRest, unknown, phaseSeed, backedUp, swingDuration, alignCls) {
     const moving = count > 0;
     const hand = moving ? 'long-handed-inserter-hand-closed.png' : 'long-handed-inserter-hand-open.png';
     // Ben's remnants amendment: an arrow with NO measured rate (unknown, not
@@ -8590,6 +8607,11 @@ function shipInserterHtml(count, armRest, unknown, phaseSeed, backedUp, swingDur
     // look like the idle (measured-zero) inserter.
     const remnantCls = unknown ? ' remnant' : '';
     const backedUpCls = backedUp ? ' backed-up' : '';
+    // Ben's built-reference correction: on an in-row vertical belt, each
+    // inserter sits at the belt's own beginning or end (top or bottom), not
+    // centered beside it - alignCls carries that ('align-top'/'align-bottom'),
+    // set by the caller from the belt's own flow direction.
+    const alignClsStr = alignCls ? ' ' + alignCls : '';
     // long-handed-inserter-remnants.png measured 134x376: 4 frames stacked
     // 134x94 each - crop frame 1, don't scale the whole strip into the slot.
     const platformStyle = unknown
@@ -8599,7 +8621,7 @@ function shipInserterHtml(count, armRest, unknown, phaseSeed, backedUp, swingDur
     const swingVars = '--arm-rest:' + armRest + 'deg;' + ((moving && swingDuration)
         ? '--swing-duration:' + swingDuration + 's;--swing-delay:-' + (phase * swingDuration).toFixed(3) + 's;'
         : '');
-    return '<span class="ship-inserter ' + (moving ? 'moving' : 'idle') + remnantCls + backedUpCls + '">'
+    return '<span class="ship-inserter ' + (moving ? 'moving' : 'idle') + remnantCls + backedUpCls + alignClsStr + '">'
         + '<span class="inserter-platform"' + platformStyle + '></span>'
         + '<span class="inserter-arm" style="' + swingVars + 'background-image:url(/static/factorio/inserter/' + hand + ')"></span>'
         + '</span>';
@@ -8647,6 +8669,24 @@ const SHIP_ARROW_ITEM = {
     'merged today':  'items/tank.png',
     'folded':        'items/rocket.png',
 };
+// Ben's correction on the built reference: consecutive in-row vertical belts
+// alternate their own flow direction (down, up, down, up...) rather than all
+// pointing the same way - restarting at "down" per row, matching the
+// reference's own single-row demo. Purely a per-segment rendering choice
+// (the OVERALL item chain still always reads bug->rocket left to right);
+// only which end of THIS belt is "up" vs "down" flips.
+const SHIP_VBELT_ROW_ORDER = [
+    ['bugs found', 'issues open', 'dispatched', 'prs open', 'ci q/run'],
+    ['in review', 'gate verdicts', 'conflicted'],
+    ['approved', 'in line', 'merged today', 'folded'],
+];
+function shipVbeltFlowsDown(square) {
+    for (const row of SHIP_VBELT_ROW_ORDER) {
+        const idx = row.indexOf(square);
+        if (idx !== -1) return idx % 2 === 0;
+    }
+    return true;
+}
 // Standard 120x64 mip-chain sheet (order 11's own convention) - scaled to
 // whatever pixel size the belt slot calls for, first frame only.
 function shipItemImgHtml(itemPath, sizePx) {
@@ -8663,7 +8703,7 @@ function shipItemImgHtml(itemPath, sizePx) {
 // that have never had a formal rate/backlog instrument. `vertical` (order
 // 17 #3) swaps the belt's own long axis and the item layout from left/right
 // to top/bottom - see the call site for which two arrows use it.
-function shipBeltHtml(square, hasRate, rate, backedUp, knownCount, dir, vertical) {
+function shipBeltHtml(square, hasRate, rate, backedUp, knownCount, dir, vertical, vDown) {
     const itemPath = SHIP_ARROW_ITEM[square];
     if (!itemPath) return '';
     let state, slots;
@@ -8684,14 +8724,15 @@ function shipBeltHtml(square, hasRate, rate, backedUp, knownCount, dir, vertical
         const t = slots === 1 ? 0.5 : i / (slots - 1);
         // LORE order 17 #3 fix: the belt now genuinely scrolls in its flow
         // direction (see .ship-belt-track's keyframes), so item slot 0 is
-        // always the upstream (pickup) end regardless of dir/vertical -
-        // 'left'-dir mirrors which physical edge that is, vertical belts
-        // always flow top->bottom.
-        const pos = vertical ? (8 + 84 * t) : (dir === 'left' ? (92 - 84 * t) : (8 + 84 * t));
+        // always the upstream (pickup) end - 'left'-dir mirrors which
+        // physical edge that is for a horizontal belt; a vertical belt's
+        // own vDown flips which end (top or bottom) is upstream, per Ben's
+        // built reference (consecutive in-row belts alternate direction).
+        const pos = vertical ? (vDown ? (8 + 84 * t) : (92 - 84 * t)) : (dir === 'left' ? (92 - 84 * t) : (8 + 84 * t));
         const axis = vertical ? 'top' : 'left';
         itemsHtml += '<span class="ship-belt-item" style="' + axis + ':' + pos.toFixed(1) + '%">' + shipItemImgHtml(itemPath, itemSize) + '</span>';
     }
-    const dirCls = vertical ? ' ship-belt-vertical' : (dir === 'left' ? ' ship-belt-left' : '');
+    const dirCls = vertical ? (' ship-belt-vertical' + (vDown ? '' : ' ship-belt-vertical-up')) : (dir === 'left' ? ' ship-belt-left' : '');
     return '<div class="ship-belt ship-belt-' + state + dirCls + '">'
         + '<div class="ship-belt-track"></div>'
         + '<div class="ship-belt-items">' + itemsHtml + '</div></div>';
@@ -8767,6 +8808,14 @@ function shipArrow(square, glyph, arrow, description, legacyCount, width, isBott
     // stages - Ben's correction - so their inserters swing horizontally,
     // same as a plain (non-vertical) arrow.
     const armRest = (vertical && elbowId) ? 180 : (dir === 'left' ? -90 : 90);
+    // Ben's built reference: the two row-turn belts stay downstream-is-down
+    // (the stage before really is above, the stage after really is below);
+    // the 12 in-row belts alternate per SHIP_VBELT_ROW_ORDER, and each
+    // inserter sits at the belt's own beginning (top if flowing down, bottom
+    // if flowing up) or end (the opposite), never centered beside it.
+    const vDown = !vertical || elbowId ? true : shipVbeltFlowsDown(square);
+    const loadAlign = (vertical && !elbowId) ? (vDown ? 'align-top' : 'align-bottom') : null;
+    const unloadAlign = (vertical && !elbowId) ? (vDown ? 'align-bottom' : 'align-top') : null;
     return '<' + tag + (agentLane ? ' type="button"' : ' role="img"') + ' class="ship-arrow' + (isBottleneck ? ' bottleneck' : '') + dirCls + '"'
         + (elbowId ? ' id="' + elbowId + '"' : '') + ' style="' + style
         + '" data-square-left="' + square + '" title="' + label + '" aria-label="' + label + '"'
@@ -8776,9 +8825,9 @@ function shipArrow(square, glyph, arrow, description, legacyCount, width, isBott
         // (upstream, places items on) then unloading (downstream, takes them
         // off) - same rate/backedUp/unknown state on both, but each gets its
         // own phase seed so they are never mirror-synced.
-        + shipInserterHtml(rateForSpeed, armRest, !hasRate, square + '-load', isBottleneck, duration)
-        + shipBeltHtml(square, hasRate, rateForSpeed, isBottleneck, knownCount, dir, vertical)
-        + shipInserterHtml(rateForSpeed, armRest, !hasRate, square + '-unload', isBottleneck, duration)
+        + shipInserterHtml(rateForSpeed, armRest, !hasRate, square + '-load', isBottleneck, duration, loadAlign)
+        + shipBeltHtml(square, hasRate, rateForSpeed, isBottleneck, knownCount, dir, vertical, vDown)
+        + shipInserterHtml(rateForSpeed, armRest, !hasRate, square + '-unload', isBottleneck, duration, unloadAlign)
         + '</' + tag + '>';
 }
 
