@@ -5453,11 +5453,20 @@ def _ship_game_rate_label(rate):
     return text + "/hour"
 
 
-def _ship_game_drain_label(drain_hours):
+def _ship_game_drain_label(drain_hours, rate):
     """Same text the row's own shipDrainText() renders client-side - kept in
     lockstep so the server-provided label and the client's own fallback never
     disagree. Always plain grey text server-side too - this label never colors
-    itself red; the arrow's own glow still carries the bottleneck alarm."""
+    itself red; the arrow's own glow still carries the bottleneck alarm.
+
+    benfinklea/shadowfax-queue-router#39: an absent instrument (rate is None)
+    is 'unknown', not 'stalled' - merged-deploy has no hourly rate instrument
+    at all, and rendering 'stalled' painted the healthiest stage in the
+    pipeline as the one alarm on the strip. Only a MEASURED zero rate with a
+    backlog behind it (which is what drives drain_hours to None here, since
+    rate is already known not to be None) earns the word 'stalled'."""
+    if rate is None:
+        return "n/a"
     if drain_hours is None:
         return "stalled"
     n = round(float(drain_hours) * 10) / 10
@@ -5511,7 +5520,7 @@ def _build_ship_arrows(result, rates):
             # and above it, always grey) - computed for every arrow anyway since
             # it's free, but the client only renders it for the first one.
             "label": _ship_game_rate_label(rate),
-            "drain_label": _ship_game_drain_label(drain_hours),
+            "drain_label": _ship_game_drain_label(drain_hours, rate),
         })
     return arrows
 
@@ -8893,7 +8902,10 @@ function shipPipeWidth(rate, maxRate) {
     return Math.max(16, Math.min(36, 16 + 20 * Math.sqrt(r / maxRate)));
 }
 
-function shipDrainText(drain) {
+function shipDrainText(drain, hasRate) {
+    // #39: an absent rate instrument is 'n/a', not 'stalled' - kept in
+    // lockstep with the server's _ship_game_drain_label.
+    if (!hasRate) return 'n/a';
     if (drain === null || drain === undefined) return 'stalled';
     const n = Math.round(Number(drain) * 10) / 10;
     return n + 'h to drain';
@@ -9067,7 +9079,7 @@ function shipArrow(square, glyph, arrow, description, legacyCount, width, isBott
     const key = square.replaceAll(' ', '-').replaceAll('/', '-');
     const rateText = hasRate ? (rate + '/h') : 'rate unknown';
     const backlogText = (backlog === null || backlog === undefined) ? 'unknown waiting' : backlog + ' waiting';
-    const label = shipEscape(description + ': ' + rateText + ', ' + backlogText + ', ' + shipDrainText(drain));
+    const label = shipEscape(description + ': ' + rateText + ', ' + backlogText + ', ' + shipDrainText(drain, hasRate));
     const tag = agentLane ? 'button' : 'span';
     const dirCls = (dir === 'left' ? ' ship-arrow-left' : '') + (vertical ? (elbowId ? ' ship-arrow-vertical' : ' ship-arrow-vbelt') : '');
     // Six arrows (bugs found/dispatched/review routed/gate verdicts/conflicted/
