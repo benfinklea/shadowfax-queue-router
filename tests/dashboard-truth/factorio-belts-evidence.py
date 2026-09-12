@@ -674,6 +674,57 @@ with sync_playwright() as p:
     assert bg == '1536px 768px', bg
     browser.close()
 
+# ONE SCREEN (Ben, 3:27 PM CDT 2026-09-12): "tighten everything up
+# vertically - I'd like the full CI/CD to fit on one screen easily." His
+# window is 1512x850 CSS px (3024x1964 retina, browser chrome off), the page
+# header puts the strip's top at ~196. With a full 10-row closed-issues
+# list the whole strip (legend, three rows, list, silo) must end well above
+# the fold, and nothing may overlap: row 3 is pulled up beside the silo, so
+# the closed list must stay clear of DEPLOYED and the loop clear of row 2.
+pipeline_fixture_ten_closed = dict(pipeline_fixture, closed_issue_timings=[
+    dict(pipeline_fixture['closed_issue_timings'][0], number=7000 + i, title='Closed issue number %d with a longish title to clip' % i) for i in range(10)])
+with sync_playwright() as p:
+    browser = p.chromium.launch(headless=True)
+    page = browser.new_page(viewport={'width': 1512, 'height': 850})
+    stub_routes(page, pipeline_fixture_ten_closed)
+    page.goto('http://127.0.0.1:5099/', wait_until='domcontentloaded')
+    page.evaluate('async()=>{await refreshShipFlow();}')
+    page.wait_for_timeout(1200)
+    flow = page.locator('#ship-flow').bounding_box()
+    assert flow['y'] + flow['height'] <= 800, ('strip runs past a 850px window', flow)
+    assert flow['height'] <= 620, ('strip taller than one screen allows', flow)
+    def box(sel):
+        # The union of a stage's CHILDREN, not its flex box - row 2's boxes
+        # all stretch to the silo's height, which is empty ground below the
+        # short stages, not content.
+        return page.locator(sel).evaluate('''el => { let l = 1e9, t = 1e9, r = -1e9, b = -1e9;
+            for (const c of el.children) { const q = c.getBoundingClientRect(); if (!q.width) continue; l = Math.min(l, q.left); t = Math.min(t, q.top); r = Math.max(r, q.right); b = Math.max(b, q.bottom); }
+            if (l > r) { const q = el.getBoundingClientRect(); return {x: q.left, y: q.top, width: q.width, height: q.height}; }
+            return {x: l, y: t, width: r - l, height: b - t}; }''')
+    def overlap(a, b):
+        return a['x'] < b['x'] + b['width'] and b['x'] < a['x'] + a['width'] and a['y'] < b['y'] + b['height'] and b['y'] < a['y'] + a['height']
+    deployed = box('[data-square="last deploy"]'); closed = box('.ship-closed')
+    assert not overlap(deployed, closed), ('closed list overlaps DEPLOYED', deployed, closed)
+    for sq in ('conflicted', 'resolved'):
+        for above in ('gate verdicts', 'approved', 'in line'):
+            assert not overlap(box('[data-square="' + sq + '"]'), box('[data-square="' + above + '"]')), (sq, 'overlaps', above)
+    legend = box('#ship-flow .ship-legend')
+    # The legend lives in the panel's head row (above the ground, beside the
+    # repo dropdown) so it costs the strip no height - and must not sit on
+    # the dropdown or the refresh button.
+    ground = page.locator('#ship-flow').evaluate("el => { const q = el.parentElement.getBoundingClientRect(); return {x: q.left, y: q.top, width: q.width, height: q.height}; }")
+    assert legend['y'] + legend['height'] <= ground['y'] + 1, ('legend must sit above the ground, in the head row', legend, ground)
+    for sel in ('#glance-strip select', '#glance-strip .panel-refresh-btn'):
+        other = page.locator(sel).first.bounding_box()
+        assert other and not overlap(legend, other), ('legend overlaps', sel, legend, other)
+    # The closed list must clear every row-2 belt and inserter above it.
+    for i in range(page.locator('.ship-row-2 .ship-arrow').count()):
+        ab = page.locator('.ship-row-2 .ship-arrow').nth(i).bounding_box()
+        assert not overlap(closed, ab), ('closed list overlaps a row-2 belt', closed, ab)
+    assert not overlap(closed, box('#ship-elbow-4')), 'closed list overlaps the shared belt'
+    page.screenshot(path=str(OUT / 'one-screen-1512x850.png'))
+    browser.close()
+
 # Order 14 evidence: at least three frames at different points in the swing,
 # proving arms actually moved (not a single still) AND that two different
 # inserters are staggered (not swinging in lockstep). Real wall-clock waits

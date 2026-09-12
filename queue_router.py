@@ -7423,7 +7423,15 @@ background-repeat:repeat;background-size:1536px 768px;border-radius:6px}
    from the from-stage's top to the to-stage's bottom regardless of this
    gap (positionShipElbows sizes it), so the gap only needs to be enough
    for the belt to visibly read as a run between the rows, not to hold it. */
-.ship-flow.ship-row-1,.ship-flow.ship-row-2{margin-bottom:56px}
+/* Ben (3:27 PM, 2026-09-12): "tighten everything up vertically - the full
+   CI/CD should fit on one screen easily." The row-end belts span sprite to
+   sprite whatever the gap, so the rows only need enough air to read as
+   rows. Row 3 (the conflict loop + closed-issues list, all of it right of
+   x~360) is pulled UP into the empty ground beside the 9x9 silo's lower
+   half, which is what row 2's height is made of. */
+.ship-flow.ship-row-1{margin-bottom:14px}
+.ship-flow.ship-row-2{margin-bottom:0}
+.ship-flow.ship-row-3{margin-top:-98px}
 /* Ben's 10:08 AM rig (2026-09-12): row 2 AND row 3 both start at the right
    edge, under 'in review' - row 3 is the short conflict side-loop
    (conflicted, resolved) hanging under gate verdicts / approved, so it is
@@ -7451,7 +7459,7 @@ padding-right:12px;white-space:nowrap}
 .ship-stage{background:none;border:0;border-radius:0;
 padding:7px 6px;min-width:92px;text-align:center;display:flex;flex-direction:column;
 align-items:center;justify-content:flex-start;gap:2px;cursor:pointer}
-.ship-hist-spacer{height:26px;margin:0 auto 3px auto}
+.ship-hist-spacer{height:22px;margin:0 auto 2px auto}
 .ship-stage{position:relative}
 /* SHIP-GAME item 0: the whole box is the click target now (no caret button) -
    a visible focus ring is the keyboard-reachability signal the caret used to
@@ -7539,7 +7547,11 @@ filter:var(--ground-shadow)}
 @keyframes asm3-x{to{background-position-x:-640px}}
 @keyframes asm3-y{to{background-position-y:-356px}}
 @media(prefers-reduced-motion:reduce){.ship-sprite.asm3.working{animation:none}}
+/* One-screen (Ben, 3:27 PM): the legend takes no vertical space - it sits
+   up in the panel's head row, in the empty run between the repo dropdown
+   and the refresh button. */
 .ship-legend{display:flex;gap:18px;align-items:center;margin:6px 0 4px;font-size:.72em;color:#c7cee0;text-shadow:var(--text-outline)}
+#ship-flow .ship-legend{position:absolute;top:-36px;left:400px;margin:0;z-index:3}
 .ship-legend-chip{display:flex;align-items:center;gap:6px}
 .ship-legend-swatch{width:16px;height:16px;flex:0 0 auto}
 .ship-legend-swatch.stage-machine{border-radius:2px;border:1px solid #2a3450;background:rgba(255,255,255,.03)}
@@ -7674,8 +7686,8 @@ border-radius:1px 1px 0 0;min-height:1px}
    width wider than the machine, a touch taller, and on the same dark plate
    as the captions so the line reads. */
 .ship-history-spark{display:block;width:100%;height:22px}
-.ship-stage>.ship-history-spark,.ship-stage .ship-issues-rate{width:110px;min-width:110px;margin:0 auto 3px auto}
-.ship-stage>.ship-history-spark{height:26px;background:rgba(0,0,0,.5);border-radius:3px;padding:2px 3px;box-sizing:border-box}
+.ship-stage>.ship-history-spark,.ship-stage .ship-issues-rate{width:110px;min-width:110px;margin:0 auto 2px auto}
+.ship-stage>.ship-history-spark{height:22px;background:rgba(0,0,0,.5);border-radius:3px;padding:2px 3px;box-sizing:border-box}
 .ship-stage .ship-issues-rate{background:rgba(0,0,0,.5);border-radius:3px;padding:2px 3px;box-sizing:border-box;height:auto}
 .ship-stage .ship-issues-rate .ship-history-spark{height:22px}
 /* SHIP-SPARK-3 hover-tooltip fix: SHIP-SPARK/SHIP-SPARK-2 used a native SVG
@@ -8000,10 +8012,10 @@ gap:0;padding:2px 0;align-self:center;align-items:center}
    2), so the list is the row's LAST DOM child and lands in the open space
    on the left. */
 .ship-closed{align-self:flex-start;margin:8px 24px 0 0;background:rgba(0,0,0,.66);border-radius:4px;
-padding:6px 10px;color:#fff;font-size:.72em;font-family:'Orbitron',monospace;letter-spacing:.5px;min-width:380px;max-width:560px}
-.ship-closed-head{display:grid;grid-template-columns:1fr 78px 92px;gap:8px;text-transform:uppercase;color:#c7cee0;
+padding:4px 8px;color:#fff;font-size:.58em;font-family:'Orbitron',monospace;letter-spacing:.3px;min-width:380px;max-width:500px}
+.ship-closed-head{display:grid;grid-template-columns:1fr 70px 84px;gap:8px;text-transform:uppercase;color:#c7cee0;
 font-size:.85em;border-bottom:1px solid #556;padding-bottom:3px;margin-bottom:3px;white-space:nowrap}
-.ship-closed-row{display:grid;grid-template-columns:56px 1fr 78px 92px;gap:8px;line-height:1.5;white-space:nowrap}
+.ship-closed-row{display:grid;grid-template-columns:52px 1fr 70px 84px;gap:8px;line-height:1.2;white-space:nowrap}
 .ship-closed-title{overflow:hidden;text-overflow:ellipsis;color:#e6e9f0}
 .ship-closed-num{color:var(--neon-cyan)}
 .ship-closed-t{text-align:right;font-variant-numeric:tabular-nums}
