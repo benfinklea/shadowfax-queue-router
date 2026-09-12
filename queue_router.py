@@ -5518,8 +5518,66 @@ def _build_ship_arrows(result, rates):
 REVIEW_ROUTED_LABEL_SUFFIX = "-review"
 GATE_VERDICT_CHECK_NAME = "gate-verdict-check-review"
 
+# STAGE-HOVER: this list is no longer a 100-row sample - it is the COMPLETE set
+# of open PRs, because prs_open and its hover breakdown are both derived from it
+# (see _pr_open_breakdown). `gh pr list` pages internally at 100 rows per
+# GraphQL page, so on a repo with 63 open PRs this is still ONE page and the
+# same single call it always was; a repo would need >100 open PRs before it
+# costs a second page. The ceiling is high enough to be effectively complete
+# while still bounding a runaway repo, and the caller treats a result AT the
+# ceiling as truncated rather than pretending it is the true total.
+OPEN_PR_LIST_LIMIT = 1000
+
+# Ben's hover breakdown for the PRS OPEN tile, 2026-09-12: "63 PRs / 24 drafts /
+# 14 human-gated / 17 unreviewed / 7 approved-but-UNSTABLE". Each open PR lands in
+# the FIRST bucket it matches, in this order, so the buckets always sum to the
+# total - no PR is counted twice and none is dropped.
+#
+# NOTE the deliberate difference from the `held` set inside _get_shipping_readiness
+# (do-not-merge, needs-repair, hold, blocked-on-ben, gate-review, galadriel-review):
+# that set answers "may this PR merge right now", this one answers "is a HUMAN the
+# thing it is waiting on". Ben specified these four labels for the breakdown, so a
+# PR labelled needs-repair / gate-review / galadriel-review is NOT human-gated here
+# and falls through to a later bucket. The two sets are answering different
+# questions and are intentionally not unified.
+PR_OPEN_HUMAN_GATE_LABELS = {"blocked-on-ben", "hold", "needs-human", "do-not-merge"}
+PR_OPEN_BUCKET_ORDER = ("drafts", "human-gated", "conflicted", "unreviewed",
+                        "approved, checks failing", "ready to merge")
+
+
+def _pr_open_breakdown(prs):
+    """What is actually INSIDE the PRS OPEN tile, bucketed for its hover tooltip.
+
+    Derived entirely from the open-PR list _get_shipping_readiness already
+    fetches - zero additional GitHub calls, and it REPLACES the search_count
+    that used to compute prs_open, so this feature costs one search call LESS
+    per repo refresh than the code it replaces.
+
+    Buckets are first-match in PR_OPEN_BUCKET_ORDER, which is what makes them
+    sum to the total. Returns every bucket including the zeroes; the client
+    renders only the non-zero ones."""
+    counts = {name: 0 for name in PR_OPEN_BUCKET_ORDER}
+    for pr in prs:
+        labels = {(label.get("name") or "").lower() for label in (pr.get("labels") or [])}
+        if pr.get("isDraft"):
+            name = "drafts"
+        elif labels & PR_OPEN_HUMAN_GATE_LABELS:
+            name = "human-gated"
+        elif pr.get("mergeable") == "CONFLICTING":
+            name = "conflicted"
+        elif pr.get("reviewDecision") != "APPROVED":
+            name = "unreviewed"
+        elif pr.get("mergeStateStatus") in ("UNSTABLE", "BLOCKED"):
+            name = "approved, checks failing"
+        else:
+            name = "ready to merge"
+        counts[name] += 1
+    return {"noun": "PRs", "total": len(prs),
+            "buckets": [{"label": name, "count": counts[name]} for name in PR_OPEN_BUCKET_ORDER]}
+
+
 def _get_shipping_readiness(token, repo=None, default_branch="main"):
-    """Read the oldest 100 open PRs and the repo's merge queue together.
+    """Read every open PR (up to OPEN_PR_LIST_LIMIT) and the repo's merge queue together.
     SHIP-SPARK-3 item 4: mergeQueue(branch: default_branch) legitimately returns
     null on a repo with no merge queue configured - that is "n/a", not a failed
     read, so it no longer raises. A TRUNCATED queue (hasNextPage) still raises:
@@ -5548,7 +5606,7 @@ def _get_shipping_readiness(token, repo=None, default_branch="main"):
         return value
 
     prs = gh_json(["pr", "list", "--repo", repo, "--state", "open",
-                   "--limit", "100", "--search", "sort:created-asc", "--json",
+                   "--limit", str(OPEN_PR_LIST_LIMIT), "--search", "sort:created-asc", "--json",
                    "number,title,isDraft,reviewDecision,mergeable,mergeStateStatus,labels,updatedAt,"
                    "createdAt,reviews"])
     owner, name = repo.split("/")
@@ -6069,8 +6127,21 @@ def get_pipeline_status(repo=None, default_branch=None, force_refresh=False):
 
                 # ── 15-stage strip: stages 4,6,7,8,9,11 derive from the single PR-list
                 # call above - zero added GitHub calls for six of the nine new squares.
-                # prs_open itself keeps its own search_count below: that count is exact,
-                # where len(all_open_prs) would cap at the 100-PR page fetched above.
+                # STAGE-HOVER: prs_open now derives from that SAME list too, instead of
+                # spending its own search_count. That was safe to change only because the
+                # list is no longer a 100-row sample (see OPEN_PR_LIST_LIMIT) - so
+                # len(all_open_prs) IS the exact open-PR count, and it is the one number
+                # the hover buckets are guaranteed to sum to. A list sitting exactly AT the
+                # ceiling is the one case we cannot call exact: that falls through to the
+                # search_count below and publishes no breakdown, rather than under-reporting.
+                if len(all_open_prs) < OPEN_PR_LIST_LIMIT:
+                    result["prs_open"] = len(all_open_prs)
+                    result["prs_open_breakdown"] = _pr_open_breakdown(all_open_prs)
+                else:
+                    result["prs_open_breakdown"] = None
+                    result["prs_open_breakdown_na_reason"] = (
+                        f"open-PR list hit its {OPEN_PR_LIST_LIMIT}-row ceiling, so neither the "
+                        "total nor the buckets can be established from it")
                 opened_ats = [p["createdAt"] for p in all_open_prs if p.get("createdAt")]
                 result["prs_open_last_at"] = max(opened_ats) if opened_ats else None
 
@@ -6123,7 +6194,8 @@ def get_pipeline_status(repo=None, default_branch=None, force_refresh=False):
                     ("green_waiting", None), ("oldest_awaiting_min", None),
                     ("queue_oldest_min", None), ("green_oldest_min", None),
                     ("has_merge_queue", None), ("prs_oldest_min", None),
-                    ("prs_open_last_at", None), ("review_routed", None),
+                    ("prs_open_last_at", None), ("prs_open_breakdown", None),
+                    ("review_routed", None),
                     ("review_routed_last_at", None), ("in_review", None),
                     ("in_review_last_at", None), ("gate_verdicts", None),
                     ("gate_verdicts_last_at", None), ("conflicted", None),
@@ -6154,7 +6226,12 @@ def get_pipeline_status(repo=None, default_branch=None, force_refresh=False):
                     return None
                 return r.json().get("total_count", 0)
             result["issues_open"] = search_count(f"repo:{repo} type:issue state:open")
-            result["prs_open"] = search_count(f"repo:{repo} type:pr state:open")
+            # STAGE-HOVER: normally already set from the open-PR list above at zero
+            # search cost. This stays as the fallback for the two cases that leave it
+            # unset - the PR-list/merge-queue read failed, or that list hit its ceiling -
+            # so a failure degrades to exactly the old behaviour instead of losing the tile.
+            if result.get("prs_open") is None:
+                result["prs_open"] = search_count(f"repo:{repo} type:pr state:open")
             # 15-stage strip: a 24h created-count for "bugs found" plus a
             # sorted-desc probe for its timestamp. Both are repo-scoped so the
             # dropdown never serves armbrain's numbers for another repo.
@@ -7339,7 +7416,15 @@ background-repeat:repeat;background-size:128px 128px;border-radius:6px}
    gap (positionShipElbows sizes it), so the gap only needs to be enough
    for the belt to visibly read as a run between the rows, not to hold it. */
 .ship-flow.ship-row-1,.ship-flow.ship-row-2{margin-bottom:56px}
-.ship-flow.ship-row-2{flex-direction:row-reverse}
+/* Ben's 10:08 AM rig (2026-09-12): row 2 AND row 3 both start at the right
+   edge, under 'in review' - row 3 is the short conflict side-loop
+   (conflicted, resolved) hanging under gate verdicts / approved, so it is
+   row-reversed too, and its open space is now on the LEFT. */
+.ship-flow.ship-row-2,.ship-flow.ship-row-3{flex-direction:row-reverse}
+/* Reserves the column the shared resolved+approved up-belt (#ship-elbow-4,
+   position:absolute) runs in, so rows 2 and 3 leave a real gap for it
+   instead of the belt painting over 'in line' / the closed-issues list. */
+.ship-elbow-slot{flex:0 0 96px;align-self:stretch}
 .ship-age{font-size:0.66em;color:#7d8798;white-space:nowrap;margin-top:1px;text-shadow:var(--text-outline)}
 .ship-age.warn{color:var(--neon-yellow)}
 .ship-age.hot{color:var(--neon-red)}
@@ -7556,6 +7641,26 @@ border-radius:6px;padding:6px 10px;box-shadow:var(--glow-cyan),0 10px 30px rgba(
 font-family:'Rajdhani',sans-serif;color:#e0e0e0;font-size:13px;white-space:nowrap;
 pointer-events:none;opacity:0;display:none;transition:opacity 0.1s ease-in-out}
 .ship-spark-tooltip.visible{display:block;opacity:1}
+/* STAGE-HOVER (Ben, 2026-09-12): hovering a stage shows what is INSIDE it -
+   "63 PRs / 24 drafts / 14 human-gated / ...". Same custom-div reasoning as
+   .ship-spark-tooltip above and for the same reason: Ben reads this dashboard
+   largely through headless screenshots, and a native title= tooltip is painted
+   by the OS compositor, so it is invisible in every PNG an agent captures. This
+   bubble is real DOM, so the screenshot harness can see it.
+   Two zones: the counts, pre-line so one bucket reads per line and the numbers
+   column up; then the stage's help sentence, wrapped and dimmer, because this
+   tooltip REPLACES the native title= on any stage that has a breakdown and must
+   not lose the help text that attribute used to carry. */
+.ship-breakdown-tooltip{position:fixed;z-index:10000;background:var(--bg-card);border:1px solid var(--neon-cyan);
+border-radius:6px;padding:7px 11px;box-shadow:var(--glow-cyan),0 10px 30px rgba(0,0,0,0.8);
+font-family:'Rajdhani',sans-serif;color:#e0e0e0;font-size:13px;max-width:430px;
+pointer-events:none;opacity:0;display:none;transition:opacity 0.1s ease-in-out}
+.ship-breakdown-tooltip.visible{display:block;opacity:1}
+.ship-bd-lines{white-space:pre-line;font-variant-numeric:tabular-nums;line-height:1.45}
+.ship-bd-lines .ship-bd-total{display:block;font-family:'Orbitron',monospace;font-size:0.92em;
+font-weight:700;letter-spacing:1px;color:var(--neon-cyan);margin-bottom:3px}
+.ship-bd-help{border-top:1px solid #1a2332;margin-top:7px;padding-top:6px;
+font-size:0.85em;color:#aab2c4;white-space:normal;line-height:1.35}
 
 .monitor-glance-band{display:grid;grid-template-columns:minmax(720px,1.25fr) minmax(500px,.75fr);
 gap:10px;align-items:start;margin:10px 0}
@@ -7803,6 +7908,21 @@ padding:0;z-index:4}
    left of the stage with the inserters on the belt's right. */
 .ship-arrow-vertical.ship-arrow-left .ship-belt-vertical{left:0}
 .ship-arrow-vertical.ship-arrow-left .ship-inserter{left:30px}
+/* Ben's 10:08 AM rig: ONE tall belt runs up from beside RESOLVED (row 3)
+   past APPROVED to IN LINE (row 2) - "when things are resolved, they get
+   passed back up to approved". Three inserters on it: approved loads from
+   the right (level with its own machine), resolved loads from the right at
+   the very bottom (the belt's start - it flows UP), and one unloader at the
+   top-left into IN LINE. DOM order stays load / belt / unload so every
+   "first inserter is the loader" reader still holds; the resolved feeder
+   is its own nested .ship-arrow (no belt of its own - it shares this one). */
+.ship-arrow-vertical.ship-arrow-shared{width:96px}
+.ship-arrow-vertical.ship-arrow-shared .ship-belt-vertical{left:32px}
+.ship-arrow-vertical.ship-arrow-shared > .ship-inserter:first-child{left:62px;top:var(--load-top,0);bottom:auto}
+.ship-arrow-vertical.ship-arrow-shared > .ship-inserter:nth-child(3){left:0;top:var(--unload-top,0);bottom:auto}
+.ship-arrow-feeder{position:absolute;left:62px;bottom:0;width:34px;height:32px;padding:0;margin:0;
+display:block;flex:none;background:transparent;border:0;z-index:4}
+.ship-arrow-shared .ship-arrow-feeder .ship-inserter{left:0;top:0;bottom:auto}
 /* Ben's own built reference (a vertical belt bridging two side-by-side
    buildings) - correction after the first pass stacked the inserters
    above/below the belt: "the inserters go to the left and right of the
@@ -7825,9 +7945,12 @@ gap:0;padding:2px 0;align-self:center;align-items:center}
    sit on the RIGHT of the belt, beside the stage it loads from, and the
    unloading one on the left - mirror the arrow's own row to match the
    row-reversed row it sits in. */
-.ship-row-2 .ship-arrow-vbelt{flex-direction:row-reverse}
-/* Row 3's closed-issues list (Ben) - same dark plate as the captions. */
-.ship-closed{align-self:flex-start;margin-left:48px;margin-top:8px;background:rgba(0,0,0,.66);border-radius:4px;
+.ship-row-2 .ship-arrow-vbelt,.ship-row-3 .ship-arrow-vbelt{flex-direction:row-reverse}
+/* Row 3's closed-issues list (Ben) - same dark plate as the captions. Row 3
+   is row-reversed now (the conflict loop hangs under the right end of row
+   2), so the list is the row's LAST DOM child and lands in the open space
+   on the left. */
+.ship-closed{align-self:flex-start;margin:8px 24px 0 0;background:rgba(0,0,0,.66);border-radius:4px;
 padding:6px 10px;color:#fff;font-size:.72em;font-family:'Orbitron',monospace;letter-spacing:.5px;min-width:380px;max-width:560px}
 .ship-closed-head{display:grid;grid-template-columns:1fr 78px 92px;gap:8px;text-transform:uppercase;color:#c7cee0;
 font-size:.85em;border-bottom:1px solid #556;padding-bottom:3px;margin-bottom:3px;white-space:nowrap}
@@ -8405,6 +8528,94 @@ function hideShipSparkTooltip() {
     if (shipSparkTooltipEl) shipSparkTooltipEl.classList.remove('visible');
 }
 
+// STAGE-HOVER (Ben, 2026-09-12): "hovering a stage should show a breakdown of
+// what is inside it." Same lazy-init / event-delegation / one-shared-div pattern
+// as initShipSparkTooltip above, deliberately a SEPARATE element rather than a
+// mode of that one: the spark tooltip is a single nowrap line set via
+// textContent, this one is a multi-line block plus a help paragraph, and
+// widening the spark tooltip to cover both would change what every existing
+// sparkline hover renders.
+//
+// The server owns the bucket definitions and their order (_pr_open_breakdown);
+// this registry just holds the latest payload's breakdowns by stage caption, so
+// shipStage can find one without another positional parameter on its already
+// 14-argument signature - and so a second tile only needs one more line here.
+let shipBreakdowns = {};
+function shipSetBreakdowns(d) {
+    shipBreakdowns = { 'prs open': d.prs_open_breakdown || null };
+}
+function shipBreakdownText(cap, num) {
+    const b = shipBreakdowns[cap];
+    if (!b || !Array.isArray(b.buckets)) return '';
+    // Header is the total the buckets sum to. Prefer the server's own total over
+    // the rendered number so the header can never disagree with the buckets under
+    // it; fall back to the tile's number only if the payload omitted it.
+    const total = (b.total === null || b.total === undefined) ? num : b.total;
+    if (total === null || total === undefined || total === '' || total === '?') return '';
+    const lines = [String(total) + ' ' + (b.noun || cap)];
+    // Only non-zero buckets, in the server's order - Ben's example omits
+    // conflicted and ready-to-merge precisely because they were 1 and 0.
+    b.buckets.forEach(bucket => {
+        if (Number(bucket.count) > 0) lines.push(bucket.count + ' ' + bucket.label);
+    });
+    if (lines.length === 1) return '';  // a total with nothing inside it explains nothing
+    return lines.join('\\n');
+}
+let shipBreakdownTooltipEl = null;
+function initShipBreakdownTooltip() {
+    if (document.getElementById('ship-breakdown-tooltip')) return;
+    shipBreakdownTooltipEl = document.createElement('div');
+    shipBreakdownTooltipEl.id = 'ship-breakdown-tooltip';
+    shipBreakdownTooltipEl.className = 'ship-breakdown-tooltip';
+    document.body.appendChild(shipBreakdownTooltipEl);
+
+    document.addEventListener('mouseover', function(e) {
+        const el = e.target.closest('[data-ship-breakdown]');
+        if (el) showShipBreakdownTooltip(el, e);
+    });
+    document.addEventListener('mousemove', function(e) {
+        const el = e.target.closest('[data-ship-breakdown]');
+        if (el && shipBreakdownTooltipEl && shipBreakdownTooltipEl.classList.contains('visible')) {
+            positionShipBreakdownTooltip(e);
+        }
+    });
+    document.addEventListener('mouseout', function(e) {
+        const el = e.target.closest('[data-ship-breakdown]');
+        if (el) {
+            const related = e.relatedTarget ? e.relatedTarget.closest('[data-ship-breakdown]') : null;
+            if (related !== el) hideShipBreakdownTooltip();
+        }
+    });
+}
+function positionShipBreakdownTooltip(e) {
+    if (!shipBreakdownTooltipEl) return;
+    const padding = 14;
+    let left = e.clientX + padding, top = e.clientY + padding;
+    const rect = shipBreakdownTooltipEl.getBoundingClientRect();
+    if (left + rect.width > window.innerWidth - 10) left = e.clientX - rect.width - padding;
+    if (top + rect.height > window.innerHeight - 10) top = e.clientY - rect.height - padding;
+    shipBreakdownTooltipEl.style.left = Math.max(10, left) + 'px';
+    shipBreakdownTooltipEl.style.top = Math.max(10, top) + 'px';
+}
+function showShipBreakdownTooltip(el, e) {
+    if (!shipBreakdownTooltipEl) initShipBreakdownTooltip();
+    const text = el.getAttribute('data-ship-breakdown') || '';
+    if (!text) return;
+    // getAttribute returns text the HTML parser already decoded, so it has to be
+    // re-escaped before it goes back through innerHTML.
+    const lines = text.split('\\n');
+    const help = el.getAttribute('data-ship-breakdown-help') || '';
+    shipBreakdownTooltipEl.innerHTML =
+        '<div class="ship-bd-lines"><span class="ship-bd-total">' + shipEscape(lines[0]) + '</span>'
+        + shipEscape(lines.slice(1).join('\\n')) + '</div>'
+        + (help ? '<div class="ship-bd-help">' + shipEscape(help) + '</div>' : '');
+    positionShipBreakdownTooltip(e);
+    shipBreakdownTooltipEl.classList.add('visible');
+}
+function hideShipBreakdownTooltip() {
+    if (shipBreakdownTooltipEl) shipBreakdownTooltipEl.classList.remove('visible');
+}
+
 let openShipDropdown = null;
 let shipAgents = null;
 function shipEscape(value) {
@@ -8711,10 +8922,18 @@ function shipStage(num, cap, cls, sub, spark, help, stageCls, dropdownKey, prs, 
     // so a second click anywhere in the (now-open) box closes it, and the
     // document click-listener above closes it on a click outside the box.
     const open = openShipDropdown === key;
+    const bdText = shipBreakdownText(cap, num);
     return '<div class="ship-stage' + shapeCls + ' ' + (stageCls || '') + '" data-square="' + cap + '" data-dropdown="' + key + '"'
          + ' role="button" tabindex="0" aria-haspopup="true" aria-expanded="' + open + '" aria-controls="ship-list-' + key + '"'
          + ' onclick="toggleShipDropdown(this.dataset.dropdown)" onkeydown="shipStageKeydown(event,this.dataset.dropdown)"'
-         + (help ? ' title="' + help.replace(/"/g, '') + '"' : '') + '>' + (hist || '')
+         // STAGE-HOVER: a stage WITH a breakdown swaps its native title= for the
+         // screenshot-able .ship-breakdown-tooltip and carries the help sentence
+         // into that bubble's footer, so nothing the attribute used to say is
+         // lost. Stages without a breakdown keep the native title exactly as
+         // before - this tile's change must not alter the other fourteen.
+         + (bdText ? ' data-ship-breakdown="' + shipEscape(bdText) + '"'
+                     + (help ? ' data-ship-breakdown-help="' + shipEscape(help) + '"' : '')
+                   : (help ? ' title="' + help.replace(/"/g, '') + '"' : '')) + '>' + (hist || '')
          + '<div class="ship-sprite-wrap">' + shipSpriteHtml(cap, unknown, num)
          // An unknown count renders NOTHING here (no plate, no '?' glyph) -
          // it must never read as a measured 0, and must never look like a
@@ -8916,11 +9135,20 @@ const SHIP_ARROW_ITEM = {
     'prs open':      'items/copper-plate.png',
     'ci q/run':      'items/copper-cable.png',
     'review routed': 'items/electronic-circuit.png',   // row 1 -> row 2 turn (vertical belt)
-    'in review':     'items/advanced-circuit.png',
+    'in review':     'items/advanced-circuit.png',     // row 1 -> row 2 turn (vertical belt)
+    // Ben's 10:08 AM rig (2026-09-12): gate verdicts SPLITS - passing PRs go
+    // left along row 2 to approved, conflicted ones go straight down the same
+    // row-end column to the conflict loop on row 3. Both belts leave the same
+    // machine, so both carry its item (one item per source stage, not a 15th
+    // asset invented for a fork of the same output).
     'gate verdicts': 'items/speed-module.png',
+    'gate verdicts conflicted': 'items/speed-module.png',   // row 2 -> row 3 turn, straight down
     'conflicted':    'items/speed-module-2.png',
-    'resolved':      'items/speed-module-3.png',       // row 2 -> row 3 turn (vertical belt)
-    'approved':      'items/processing-unit.png',
+    // resolved has no belt of its own: its inserter feeds the shared up-belt
+    // (#ship-elbow-4) that carries approved's queue up to 'in line' - this
+    // is the item it places there.
+    'resolved':      'items/speed-module-3.png',
+    'approved':      'items/processing-unit.png',       // the shared up-belt, row 3 -> row 2
     'in line':       'items/car.png',
     'merged today':  'items/tank.png',
     'folded':        'items/rocket.png',
@@ -8931,18 +9159,21 @@ const SHIP_ARROW_ITEM = {
 // reference's own single-row demo. Purely a per-segment rendering choice
 // (the OVERALL item chain still always reads bug->rocket left to right);
 // only which end of THIS belt is "up" vs "down" flips.
+// Ben's 10:08 AM rig: every row starts DOWN now (chevrons read off the
+// screenshot belt by belt: row 2 goes down, up, down, up, down from gate
+// verdicts leftward; row 3's one belt goes down). 'approved' is the shared
+// belt (row 2's second, the long one down to row 3) and it flows UP - it is
+// the "up" of row 2's alternation, which is exactly why resolved can ride it
+// back up. Row-end belts not listed here default to down.
 const SHIP_VBELT_ROW_ORDER = [
     ['bugs found', 'issues open', 'dispatched', 'prs open', 'ci q/run', 'review routed'],
-    ['gate verdicts', 'conflicted', 'resolved', 'approved', 'in line', 'merged today'],
+    ['gate verdicts', 'approved', 'in line', 'merged today', 'folded'],
+    ['conflicted'],
 ];
 function shipVbeltFlowsDown(square) {
     for (let r = 0; r < SHIP_VBELT_ROW_ORDER.length; r++) {
         const idx = SHIP_VBELT_ROW_ORDER[r].indexOf(square);
-        // Ben: the row-end belt into row 2 "comes down on the right, so the
-        // next ones should be up, then down, then up" - row 1 has nothing
-        // feeding it so it starts down; every later row starts UP because
-        // the row-end belt that just fed it came down.
-        if (idx !== -1) return r === 0 ? idx % 2 === 0 : idx % 2 === 1;
+        if (idx !== -1) return idx % 2 === 0;
     }
     return true;
 }
@@ -8970,13 +9201,19 @@ function shipItemImgHtml(itemPath, sizePx) {
 // starting. Rate still sets the belt's scroll speed; it no longer invents
 // an item count.
 const SHIP_BELT_CAPACITY = 7;
-function shipBeltHtml(square, hasRate, rate, backedUp, knownCount, dir, vertical, vDown, backlog) {
+// `capacity` (optional) overrides SHIP_BELT_CAPACITY for a taller belt - the
+// shared row-2/row-3 up-belt is about twice a normal belt's height, so it
+// holds twice the items nose to tail. `extra` (optional, {itemPath, count})
+// is a SECOND queue riding the same belt, queued behind the main one (Ben's
+// rig: resolved conflicts rejoin approved's belt from its far end).
+function shipBeltHtml(square, hasRate, rate, backedUp, knownCount, dir, vertical, vDown, backlog, capacity, extra) {
     const itemPath = SHIP_ARROW_ITEM[square];
     if (!itemPath) return '';
+    const cap = capacity || SHIP_BELT_CAPACITY;
     let state, slots;
     const backlogKnown = backlog !== null && backlog !== undefined;
     if (hasRate && backlogKnown) {
-        slots = Math.min(SHIP_BELT_CAPACITY, Math.max(0, Math.round(Number(backlog))));
+        slots = Math.min(cap, Math.max(0, Math.round(Number(backlog))));
         if (backedUp) state = 'backed-up';
         else if (Number(rate) === 0) state = 'starved';
         else state = 'flowing';
@@ -8987,14 +9224,17 @@ function shipBeltHtml(square, hasRate, rate, backedUp, knownCount, dir, vertical
     } else if (knownCount !== null) {
         // No rate instrument, only a plain count of what is waiting to move
         // on from the stage before - shown as the queue, standing still.
-        state = 'known'; slots = Math.min(SHIP_BELT_CAPACITY, Math.max(0, Math.round(knownCount)));
+        state = 'known'; slots = Math.min(cap, Math.max(0, Math.round(knownCount)));
     } else {
         state = 'unknown'; slots = 0;
     }
+    const extraSlots = (extra && extra.count !== null && extra.count !== undefined)
+        ? Math.min(cap - slots, Math.max(0, Math.round(Number(extra.count)))) : 0;
     const itemSize = vertical ? 15 : 16;
-    const step = 84 / (SHIP_BELT_CAPACITY - 1);
+    const step = 84 / (cap - 1);
     let itemsHtml = '';
-    for (let i = 0; i < slots; i++) {
+    for (let i = 0; i < slots + extraSlots; i++) {
+        const path = i < slots ? itemPath : extra.itemPath;
         // Item 0 sits at the DOWNSTREAM end (against the unloading inserter);
         // each further item queues one step back toward the upstream end.
         // A vertical belt's vDown says which end is downstream (bottom when
@@ -9005,7 +9245,7 @@ function shipBeltHtml(square, hasRate, rate, backedUp, knownCount, dir, vertical
         const fromUpstream = 8 + step * i;
         const pos = vertical ? (vDown ? fromDownstream : fromUpstream) : (dir === 'left' ? fromUpstream : fromDownstream);
         const axis = vertical ? 'top' : 'left';
-        itemsHtml += '<span class="ship-belt-item" style="' + axis + ':' + pos.toFixed(1) + '%">' + shipItemImgHtml(itemPath, itemSize) + '</span>';
+        itemsHtml += '<span class="ship-belt-item" style="' + axis + ':' + pos.toFixed(1) + '%">' + shipItemImgHtml(path, itemSize) + '</span>';
     }
     const dirCls = vertical ? (' ship-belt-vertical' + (vDown ? '' : ' ship-belt-vertical-up')) : (dir === 'left' ? ' ship-belt-left' : '');
     return '<div class="ship-belt ship-belt-' + state + dirCls + '">'
@@ -9048,7 +9288,15 @@ function shipBeltHtml(square, hasRate, rate, backedUp, knownCount, dir, vertical
 // literal vertical belt everywhere would mean abandoning the boustrophedon
 // layout itself. `elbowId` makes it position:absolute + JS-synced
 // (positionShipElbows), same pattern as the plain turn glyph it replaces.
-function shipArrow(square, glyph, arrow, description, legacyCount, width, isBottleneck, arrowLabel, drainLabelText, dir, vertical, elbowId) {
+// `opts` (Ben's 10:08 AM rig, 2026-09-12): {shared: true, extraSquare,
+// extraCount} renders the row-2/row-3 shared up-belt - approved's own queue
+// plus a second queue (resolved) riding the same belt behind it, fed by a
+// nested feeder inserter at the belt's bottom; {feeder: true} renders that
+// feeder: a single loading inserter and NO belt (it places onto the shared
+// one), still a .ship-arrow of its own so hover/tooltip/remnant state read
+// the same as every other handoff.
+function shipArrow(square, glyph, arrow, description, legacyCount, width, isBottleneck, arrowLabel, drainLabelText, dir, vertical, elbowId, opts) {
+    opts = opts || {};
     const agentLane = glyph === '🤖';
     const rate = arrow ? arrow.rate_per_hour : null;
     const backlog = arrow ? arrow.backlog : null;
@@ -9069,7 +9317,8 @@ function shipArrow(square, glyph, arrow, description, legacyCount, width, isBott
     const backlogText = (backlog === null || backlog === undefined) ? 'unknown waiting' : backlog + ' waiting';
     const label = shipEscape(description + ': ' + rateText + ', ' + backlogText + ', ' + shipDrainText(drain));
     const tag = agentLane ? 'button' : 'span';
-    const dirCls = (dir === 'left' ? ' ship-arrow-left' : '') + (vertical ? (elbowId ? ' ship-arrow-vertical' : ' ship-arrow-vbelt') : '');
+    const dirCls = (dir === 'left' ? ' ship-arrow-left' : '') + (vertical ? (elbowId ? ' ship-arrow-vertical' : ' ship-arrow-vbelt') : '')
+        + (opts.shared ? ' ship-arrow-shared' : '') + (opts.feeder ? ' ship-arrow-feeder' : '');
     // Six arrows (bugs found/dispatched/review routed/gate verdicts/conflicted/
     // resolved) have never had a formal rate/backlog instrument - only a plain
     // count via arrowLabel (e.g. "5", or "?"/"n/a" when unavailable). Parsed
@@ -9092,7 +9341,11 @@ function shipArrow(square, glyph, arrow, description, legacyCount, width, isBott
     // the 12 in-row belts alternate per SHIP_VBELT_ROW_ORDER, and each
     // inserter sits at the belt's own beginning (top if flowing down, bottom
     // if flowing up) or end (the opposite), never centered beside it.
-    const vDown = !vertical || elbowId ? true : shipVbeltFlowsDown(square);
+    // Ben's 10:08 AM rig: the shared approved belt is the one row-end-style
+    // belt that flows UP (it is row 2's "up" in the alternation and carries
+    // resolved back up from row 3); the other row-end belts stay down. All
+    // of that is in SHIP_VBELT_ROW_ORDER now, so one rule covers both kinds.
+    const vDown = !vertical ? true : shipVbeltFlowsDown(square);
     // Ben asked what "remnant" means: it is NOT time-based - it is the wreck
     // sprite for a handoff we have no measurement for at all (the count is
     // n/a). A handoff with a plain count but no rate instrument shows an
@@ -9110,18 +9363,34 @@ function shipArrow(square, glyph, arrow, description, legacyCount, width, isBott
     const inserterRate = carrying ? rateForSpeed : 0;
     const loadAlign = (vertical && !elbowId) ? (vDown ? 'align-top' : 'align-bottom') : null;
     const unloadAlign = (vertical && !elbowId) ? (vDown ? 'align-bottom' : 'align-top') : null;
-    return '<' + tag + (agentLane ? ' type="button"' : ' role="img"') + ' class="ship-arrow' + (isBottleneck ? ' bottleneck' : '') + dirCls + '"'
+    const open = '<' + tag + (agentLane ? ' type="button"' : ' role="img"') + ' class="ship-arrow' + (isBottleneck ? ' bottleneck' : '') + dirCls + '"'
         + (elbowId ? ' id="' + elbowId + '"' : '') + ' style="' + style
         + '" data-square-left="' + square + '" title="' + label + '" aria-label="' + label + '"'
         + (agentLane ? ' data-dropdown="' + key + '" aria-controls="ship-list-' + key
-            + '" aria-expanded="' + (openShipDropdown === key) + '" onclick="toggleShipDropdown(this.dataset.dropdown)"' : '') + '>'
+            + '" aria-expanded="' + (openShipDropdown === key) + '" onclick="toggleShipDropdown(this.dataset.dropdown)"' : '') + '>';
+    // The feeder: resolved's loading inserter only - it places onto the
+    // shared belt it is nested in, so it has no belt and no unloader.
+    if (opts.feeder) {
+        return open + shipInserterHtml(inserterRate, armRest, noData, square + '-load', isBottleneck, duration, null) + '</' + tag + '>';
+    }
+    let extra = null, feederHtml = '';
+    if (opts.shared) {
+        const ec = opts.extraCount;
+        const extraCount = (ec === null || ec === undefined || ec === '' || Number.isNaN(Number(ec))) ? null : Number(ec);
+        extra = {itemPath: SHIP_ARROW_ITEM[opts.extraSquare], count: extraCount};
+        feederHtml = shipArrow(opts.extraSquare, opts.extraGlyph || '⤴', null, opts.extraDescription || '', null, null, false,
+            extraCount === null ? 'n/a' : String(extraCount), null, dir, false, null, {feeder: true});
+    }
+    return open
         // LORE order 17 #4: an inserter on BOTH sides of the belt - loading
         // (upstream, places items on) then unloading (downstream, takes them
         // off) - same rate/backedUp/unknown state on both, but each gets its
         // own phase seed so they are never mirror-synced.
         + shipInserterHtml(inserterRate, armRest, noData, square + '-load', isBottleneck, duration, loadAlign)
-        + shipBeltHtml(square, hasRate, rateForSpeed, isBottleneck, knownCount, dir, vertical, vDown, backlog)
+        + shipBeltHtml(square, hasRate, rateForSpeed, isBottleneck, knownCount, dir, vertical, vDown, backlog,
+            opts.shared ? SHIP_BELT_CAPACITY * 2 : null, extra)
         + shipInserterHtml(inserterRate, armRest, noData, square + '-unload', isBottleneck, duration, unloadAlign)
+        + feederHtml
         + '</' + tag + '>';
 }
 
@@ -9264,63 +9533,72 @@ function positionShipElbows() {
     const wrap = document.getElementById('ship-flow') && document.getElementById('ship-flow').parentElement;
     if (!wrap) return;
     const wrapRect = wrap.getBoundingClientRect();
-    // Elbow 1 turns from row 1's own last square ('review routed') down to
-    // row 2's first ('in review') - center it under review routed's right
-    // edge. Anchored by data-square directly (not :last-child) - LORE order
-    // 17 #3 made the vertical belt itself row1's actual last DOM child now
-    // (appended after the 'review routed' stage), so ':last-child' matched
-    // nothing and this silently never positioned at all until fixed.
-    // Ben's reference: the row-end belt is a tall column BESIDE the row's
-    // last stage, running down to beside the next row's first stage - so it
-    // spans from the from-stage's top to the to-stage's bottom, sitting just
-    // outside the from-stage's outer edge (right for row 1, left for the
-    // row-reversed row 2). Both stages' sprites are what the inserters at
-    // its top/bottom visibly reach into.
-    const place = (elbowId, fromSel, toSel, side) => {
+    // Every row-end belt spans SPRITE to SPRITE (Ben: the inserters at its
+    // top and bottom must sit level with the two machines they reach into,
+    // not with the stage boxes' outer edges, which include captions,
+    // sparklines and sub-lines), and is clamped inside #ship-flow's frame
+    // (Ben: "we lost the transport belt going from row 2 to 3").
+    // Ben's 10:08 AM rig (2026-09-12): row 3 is the conflict loop hanging
+    // under the right end of row 2 - CONFLICTED directly under GATE
+    // VERDICTS, RESOLVED directly under APPROVED. Both rows are
+    // right-aligned (row-reverse), so giving each row-3 box the same width
+    // as the row-2 box above it lines the sprites up column for column.
+    const stage = sq => document.querySelector('#ship-flow [data-square="' + sq + '"]');
+    const matchWidth = (a, b) => {
+        const ea = stage(a), eb = stage(b);
+        if (!ea || !eb) return;
+        ea.style.minWidth = ''; eb.style.minWidth = '';
+        const w = Math.max(ea.getBoundingClientRect().width, eb.getBoundingClientRect().width);
+        ea.style.minWidth = w + 'px'; eb.style.minWidth = w + 'px';
+    };
+    matchWidth('gate verdicts', 'conflicted');
+    matchWidth('approved', 'resolved');
+    // Row 1 ends on the right at 'in review'; row 2 (row-reverse) starts on
+    // the right at 'gate verdicts', directly under it - and the same column
+    // carries straight on down to 'conflicted' on row 3 (the split's down
+    // branch). Elbow 1 ends at gate verdicts' middle and elbow 3 starts
+    // there, so the two belts butt into one continuous column with the
+    // unloader (into gate verdicts) stacked over the loader (out of it),
+    // as in the rig. Both share one x so the column is dead straight.
+    const sprite = sq => { const s = stage(sq); return s && (s.querySelector('.ship-sprite-wrap') || s).getBoundingClientRect(); };
+    const flowRect = document.getElementById('ship-flow').getBoundingClientRect();
+    const column = (elbowId, top, bottom, left) => {
         const elbow = document.getElementById(elbowId);
-        const from = document.querySelector(fromSel);
-        const to = document.querySelector(toSel);
-        if (!elbow || !from || !to) return;
-        // Ben: the inserters at the belt's top and bottom must sit level
-        // with the two machines (sprites) they reach into, not with the
-        // stage boxes' outer edges (which include captions, sparklines and
-        // sub-lines) - so the belt spans sprite-top to sprite-bottom.
-        const fs = from.querySelector('.ship-sprite-wrap') || from;
-        const ts = to.querySelector('.ship-sprite-wrap') || to;
-        const f = fs.getBoundingClientRect();
-        const t = ts.getBoundingClientRect();
-        const fb = from.getBoundingClientRect();
-        const tb = to.getBoundingClientRect();
-        const top = Math.min(f.top, t.top);
-        const bottom = Math.max(f.bottom, t.bottom);
+        if (!elbow) return;
+        left = Math.max(flowRect.left + 2, Math.min(left, flowRect.right - 2 - elbow.offsetWidth));
         elbow.style.top = (top - wrapRect.top) + 'px';
         elbow.style.height = (bottom - top) + 'px';
-        // Sit just outside the two machines (sprites), then clamp inside the
-        // strip - row 3's box being wider than row 2's last had pushed the
-        // whole row-2 -> row-3 belt off the left edge of the frame.
-        let edge = side === 'right' ? Math.max(f.right, t.right) + 4 : Math.min(f.left, t.left) - 4 - elbow.offsetWidth;
-        const flowRect = document.getElementById('ship-flow').getBoundingClientRect();
-        edge = Math.max(flowRect.left + 2, Math.min(edge, flowRect.right - 2 - elbow.offsetWidth));
-        elbow.style.left = (edge - wrapRect.left) + 'px';
+        elbow.style.left = (left - wrapRect.left) + 'px';
     };
-    // Row 1 ends on the right at 'in review'; row 2 (row-reverse) starts on
-    // the right at 'gate verdicts', directly under it.
-    place('ship-elbow-1', '#ship-flow .ship-row-1 [data-square="in review"]', '#ship-flow .ship-row-2 [data-square="gate verdicts"]', 'right');
-    // Ben: DEPLOYED sits directly under FOLDED - line the two sprites'
-    // centres up (row 3's box is wider than row 2's last, so left-aligning
-    // the boxes leaves the machine itself sitting off to the right).
-    const folded = document.querySelector('#ship-flow .ship-row-2 [data-square="folded"] .ship-sprite-wrap');
-    const deployedStage = document.querySelector('#ship-flow .ship-row-3 [data-square="last deploy"]');
-    const deployed = deployedStage && deployedStage.querySelector('.ship-sprite-wrap');
-    if (folded && deployed) {
-        deployedStage.style.marginLeft = '';
-        const fc = folded.getBoundingClientRect(); const dc = deployed.getBoundingClientRect();
-        const delta = (fc.left + fc.width / 2) - (dc.left + dc.width / 2);
-        if (Math.abs(delta) > 1) deployedStage.style.marginLeft = delta + 'px';
+    const inReview = sprite('in review'), gate = sprite('gate verdicts'), conflicted = sprite('conflicted');
+    if (inReview && gate && conflicted) {
+        const x = Math.max(inReview.right, gate.right, conflicted.right) + 4;
+        const gateMid = gate.top + gate.height / 2;
+        column('ship-elbow-1', inReview.top, gateMid, x);
+        column('ship-elbow-3', gateMid, conflicted.bottom, x);
     }
-    // Row 2 ends on the left at 'folded'; row 3 starts on the left at
-    // 'last deploy' (DEPLOYED).
-    place('ship-elbow-2', '#ship-flow .ship-row-2 [data-square="folded"]', '#ship-flow .ship-row-3 [data-square="last deploy"]', 'left');
+    // The shared up-belt: from beside RESOLVED (row 3, its start) up past
+    // APPROVED to IN LINE (row 2, its end), in the column both rows reserve
+    // for it (.ship-elbow-slot). Its top sits at the higher of in line /
+    // approved's sprites so the unloader is level with in line; approved's
+    // own loader is dropped to sit level with approved's machine.
+    const slot = document.getElementById('ship-elbow-4-slot');
+    const inLine = sprite('in line'), approved = sprite('approved'), resolved = sprite('resolved');
+    const shared = document.getElementById('ship-elbow-4');
+    if (slot && inLine && approved && resolved && shared) {
+        const loader = shared.querySelector(':scope > .ship-inserter');
+        const insH = loader ? loader.offsetHeight : 32;
+        // Ben: every inserter level with the machine it reaches into. The
+        // unloader hugs in line's sprite top, approved's loader hugs
+        // approved's sprite bottom (it flows up, so approved loads mid-belt
+        // and resolved loads at the very start) - whichever of those two is
+        // higher is where the belt begins.
+        const top = Math.min(inLine.top, approved.bottom - insH);
+        const slotRect = slot.getBoundingClientRect();
+        column('ship-elbow-4', top, resolved.bottom, slotRect.left + (slotRect.width - shared.offsetWidth) / 2);
+        shared.style.setProperty('--load-top', (approved.bottom - insH - top) + 'px');
+        shared.style.setProperty('--unload-top', (inLine.top - top) + 'px');
+    }
 }
 function renderShipYard(workers, completions) {
     const yard = document.getElementById('ship-yard');
@@ -9642,7 +9920,7 @@ function shipCtStamp(iso, opts) {
 const SHIP_BLANK_PIPELINE = {
     bugs_found_24h: null, last_issue_created_at: null, issues_open: null,
     dispatched: null, dispatched_last_at: null,
-    prs_open: null, prs_open_last_at: null, prs_oldest_min: null,
+    prs_open: null, prs_open_last_at: null, prs_oldest_min: null, prs_open_breakdown: null,
     ci_queued: null, ci_running: null, ci_oldest_min: null, ci_last_run_started_at: null,
     green_waiting: null, green_waiting_prs: [], green_oldest_min: null,
     green_wait_avg_min: null, green_wait_n: null, green_wait_excluded: null, green_wait_prs: [],
@@ -9662,6 +9940,9 @@ const SHIP_BLANK_PIPELINE = {
     spark12h: {}, arrows: [], folded: null, folded_last_at: null,
 };
 function shipFlowHtml(d) {
+        // STAGE-HOVER: load this payload's stage breakdowns before any shipStage
+        // call below reads them (shipBreakdownText is called from inside shipStage).
+        shipSetBreakdowns(d);
         // Ben: "CI Q/RUN" -> "CI RUN" - the queue count now lives on the belt
         // to this stage's left (prs open -> ci run), driven by the same
         // ci_queued backlog via arrowByKey['prs-ci'] - this box shows only
@@ -9842,39 +10123,62 @@ function shipFlowHtml(d) {
             shipStage(d.in_review ?? null, 'in review', '', '', null, HELP.inReview, '', 'in-review', [], null, null, null, null, d.in_review_last_at)
             + shipArrow('in review', '👁', null, 'PRs currently under human/AI review', null, null, false, String(d.in_review ?? '?'), null, 'right', true, 'ship-elbow-1');
 
-        // Row 2: gate verdicts -> conflicted -> resolved -> approved -> in
-        // line -> merged today -> folded, in source order; the CSS
-        // row-reverse puts 'gate verdicts' at the right edge under 'in
-        // review'.
+        // Ben's 10:08 AM rig (2026-09-12): "From gate verdicts, split
+        // conflicted to go straight down, and have resolved come in from the
+        // left. When things are resolved, they get passed back up to
+        // approved. That means we have extra room on row 2 so we can fit
+        // deployed on row 2."
+        //
+        // Row 2 (row-reverse, so right to left under 'in review'): gate
+        // verdicts -> approved -> in line -> merged -> folded -> deployed.
+        // Row 3 (row-reverse too, hanging under the right end of row 2):
+        // conflicted (straight down from gate verdicts, on the same row-end
+        // column) -> resolved, whose inserter feeds the shared up-belt that
+        // carries approved's queue up to 'in line'.
+        const gvNa = d.gate_verdicts === null || d.gate_verdicts === undefined;
+        const resNa = d.resolved === null || d.resolved === undefined;
         const row2 =
             // Round 3 (Elrond review, PR #35): gate_verdicts has been null
             // since PR #34 dropped statusCheckRollup - the same "I cannot
             // know this" status as 'resolved', so it renders 'n/a' the same
             // way (was rendering nothing at all - a stage with no number and
             // no n/a is its own, different, confusing state).
-            shipStage(d.gate_verdicts === null || d.gate_verdicts === undefined ? 'n/a' : d.gate_verdicts, 'gate verdicts', gateCls, '', null, HELP.gateVerdicts + ((d.gate_verdicts === null || d.gate_verdicts === undefined) && d.gate_verdicts_na_reason ? ' (' + d.gate_verdicts_na_reason + ')' : ''), '', 'gate-verdicts', [], null, null, null, null, d.gate_verdicts_last_at) + shipArrow('gate verdicts', '⛨', null, 'PRs with a non-passing gate-verdict check', null, null, false, String(d.gate_verdicts ?? '?'), null, 'left', true) +
-            shipStage(d.conflicted ?? null, 'conflicted', conflictCls, '', null, HELP.conflicted, '', 'conflicted', [], null, null, null, null, d.conflicted_last_at) + shipArrow('conflicted', '⚠', null, 'Open PRs with a merge conflict', null, null, false, String(d.conflicted ?? '?'), null, 'left', true) +
-            // 'resolved' is row 2's own end - LORE order 17 #3: the turn to
-            // 'approved' at the start of row 3 is now a real vertical belt
-            // too, carrying item #10 (Speed Module 3).
-            shipStage(d.resolved === null || d.resolved === undefined ? 'n/a' : d.resolved, 'resolved', '', '', null, HELP.resolved + ((d.resolved === null || d.resolved === undefined) && d.resolved_na_reason ? ' (' + d.resolved_na_reason + ')' : ''), '', 'resolved', [], null, null, null, null, null) + shipArrow('resolved', '⤵', null, 'Resolved conflicts moving toward approval', null, null, false, String(d.resolved ?? 'n/a'), null, 'left', true) +
+            shipStage(gvNa ? 'n/a' : d.gate_verdicts, 'gate verdicts', gateCls, '', null, HELP.gateVerdicts + (gvNa && d.gate_verdicts_na_reason ? ' (' + d.gate_verdicts_na_reason + ')' : ''), '', 'gate-verdicts', [], null, null, null, null, d.gate_verdicts_last_at)
+            // The split's DOWN branch: the row-end column continues straight
+            // down past gate verdicts to conflicted on row 3 (#ship-elbow-3,
+            // JS-positioned directly under #ship-elbow-1 so the two read as
+            // one continuous belt with four inserters on it, as in the rig).
+            + shipArrow('gate verdicts conflicted', '⚠', null, 'PRs the gate turned back with a merge conflict, going down to CONFLICTED', null, null, false, String(d.conflicted ?? '?'), null, 'right', true, 'ship-elbow-3')
+            // The split's LEFT branch: the rest of the gate's output, along row 2 to approved.
+            + shipArrow('gate verdicts', '⛨', null, 'PRs waiting on a gate verdict, heading for APPROVED', null, null, false, String(d.gate_verdicts ?? '?'), null, 'left', true) +
             // SHIP-16-FIX: this used to feed the now-removed 'green waiting' square;
             // it now points straight at 'in line' - approved PRs move toward the
             // queue, and green-waiting's own count/age live as ci run's sub-line above.
-            shipStage(d.approved ?? null, 'approved', '', '', null, HELP.approved, '', 'approved', [], null, null, null, null, d.approved_last_at) + shipArrow('approved', '✅', arrowByKey['green-inline'], 'Approved PRs not yet merged', null, wFor('green-inline'), isB('green-inline'), null, null, 'left', true) +
+            // Ben's rig: this is the SHARED up-belt - one tall belt from
+            // beside resolved (row 3) up past approved to 'in line'.
+            // Approved loads it level with its own machine; resolved loads it
+            // at the bottom (the belt's start); 'in line' unloads at the top.
+            shipStage(d.approved ?? null, 'approved', '', '', null, HELP.approved, '', 'approved', [], null, null, null, null, d.approved_last_at)
+            + shipArrow('approved', '✅', arrowByKey['green-inline'], 'Approved PRs not yet merged (resolved conflicts rejoin this belt from below)', null, wFor('green-inline'), isB('green-inline'), null, null, 'left', true, 'ship-elbow-4',
+                {shared: true, extraSquare: 'resolved', extraCount: resNa ? null : d.resolved, extraGlyph: '⤴',
+                 extraDescription: 'Resolved conflicts passed back up onto the APPROVED belt'})
+            + '<span class="ship-elbow-slot" id="ship-elbow-4-slot"></span>' +
             shipStage(queueNum, 'in line', queueCls, queueSub, null, queueHelp, queueOld.cls, 'in-line', d.queue_prs, 'in queue', shipHistorySpark(sp.queue, 'queue'), null, null, null) + shipArrow('in line', '⚡', arrowByKey['inline-merged'], 'Merge queue entries', d.queue_depth, wFor('inline-merged'), isB('inline-merged'), null, null, 'left', true) +
             shipStage(d.merged_today, 'merged today', 'ok', mergedSub, d.merged_spark, HELP.merged + shipOldestWords('merged today', 'minutes since the last merge'), mergedStage, 'merged-today', d.merged_today_prs, 'merged', shipHistorySpark(sp.merged, 'merged'), null, null, d.last_merge_at) + shipArrow('merged today', '⚡', arrowByKey['merged-deploy'], 'Production deploy workflows in flight, or merge awaiting deploy', shipDeployCount(d), wFor('merged-deploy'), isB('merged-deploy'), null, null, 'left', true) +
-            // 'folded' is row 2's 7th and its own end - the turn down to
-            // 'deployed' (row 3's lone stage for now; Ben expects more steps
-            // to land here) is the second tall row-end belt, carrying item
-            // #14 (Rocket).
+            // Ben's rig: folded -> deployed is a plain in-row belt now
+            // (deployed moved up onto row 2), carrying item #14 (Rocket).
             shipStage(d.folded ?? null, 'folded', '', '', null, HELP.folded, '', 'folded', [], null, null, null, null, d.folded_last_at)
-            + shipArrow('folded', '🚀', null, 'Deploy workflows folded into this run', null, null, false, String(d.folded ?? '?'), null, 'left', true, 'ship-elbow-2');
+            + shipArrow('folded', '🚀', null, 'Deploy workflows folded into this run', null, null, false, String(d.folded ?? '?'), null, 'left', true)
+            + shipStage(noDeploy ? 'n/a' : (d.deployed_prs_today === null || d.deployed_prs_today === undefined ? '?' : d.deployed_prs_today), 'last deploy', 'ok', deployLastLine, null, (noDeploy ? 'no deploy workflow on ' + (d.repo_name || d.repo_full || 'this repo') : HELP.lastdep + shipOldestWords('last deploy', 'minutes since the last deploy, counted only while main has commits newer than it') + deployWords), deployStateCls, 'last-deploy', (d.deployed_prs_today_list || []).map(n => ({number:n,title:'deployed'})), 'deployed', shipHistorySpark(sp.deploy, 'deploy'), null, null, d.last_deploy_at);
 
-        // Row 3: deployed, alone for now (Ben: "it's ok if the bottom row
-        // only has 1 or two" - more steps are expected to land here).
+        // Row 3: the conflict loop, right-aligned under gate verdicts /
+        // approved (row-reverse): conflicted -> resolved, then a slot under
+        // the shared up-belt's column, then Ben's closed-issues list in the
+        // open space on the left.
         const row3 =
-            shipStage(noDeploy ? 'n/a' : (d.deployed_prs_today === null || d.deployed_prs_today === undefined ? '?' : d.deployed_prs_today), 'last deploy', 'ok', deployLastLine, null, (noDeploy ? 'no deploy workflow on ' + (d.repo_name || d.repo_full || 'this repo') : HELP.lastdep + shipOldestWords('last deploy', 'minutes since the last deploy, counted only while main has commits newer than it') + deployWords), deployStateCls, 'last-deploy', (d.deployed_prs_today_list || []).map(n => ({number:n,title:'deployed'})), 'deployed', shipHistorySpark(sp.deploy, 'deploy'), null, null, d.last_deploy_at)
+            shipStage(d.conflicted ?? null, 'conflicted', conflictCls, '', null, HELP.conflicted, '', 'conflicted', [], null, null, null, null, d.conflicted_last_at) + shipArrow('conflicted', '⚠', null, 'Open PRs with a merge conflict, waiting to be resolved', null, null, false, String(d.conflicted ?? '?'), null, 'left', true) +
+            shipStage(resNa ? 'n/a' : d.resolved, 'resolved', '', '', null, HELP.resolved + (resNa && d.resolved_na_reason ? ' (' + d.resolved_na_reason + ')' : ''), '', 'resolved', [], null, null, null, null, null)
+            + '<span class="ship-elbow-slot"></span>'
             + shipClosedIssuesHtml(d.closed_issue_timings);
 
         // Round 2 (Elrond review, PR #35, defect 3): the turns used to be a
@@ -11577,6 +11881,7 @@ startPolling();   // arm the timers before anything that can throw
 if (document.hidden) startSlowPolling();   // loaded in a background tab: still beat
 safeCall('initVramTooltip', initVramTooltip);
 safeCall('initShipSparkTooltip', initShipSparkTooltip);
+safeCall('initShipBreakdownTooltip', initShipBreakdownTooltip);
 safeCall('initShipRepoSelector', initShipRepoSelector);
 safeCall('refresh', refresh);
 safeCall('refreshHistory', refreshHistory);
