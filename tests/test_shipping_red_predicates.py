@@ -92,7 +92,8 @@ class ShippingRedPredicateTests(unittest.TestCase):
 console.log(JSON.stringify({
   mergedHealthy: mergedStageClass(7),
   mergedFailed: mergedStageClass(120),
-  foldedHealthy: foldedStageClass('in-sync'),
+  foldedHealthy: foldedStageClass('in-sync', new Date(Date.now() - 2 * 60 * 1000).toISOString()),
+  foldedStaleButHealthy: foldedStageClass('in-sync', new Date(Date.now() - 90 * 60 * 1000).toISOString()),
   foldedFailed: foldedStageClass('error'),
   conflictedHealthy: conflictedStageClass(0),
   conflictedFailed: conflictedStageClass(1),
@@ -113,8 +114,10 @@ console.log(JSON.stringify({
 
     def test_folded_red_is_absent_after_in_sync_run(self):
         self.assertNotRed(self.classes["foldedHealthy"], "FOLDED")
+        self.assertEqual(self.classes["foldedHealthy"], "")
+        self.assertEqual(self.classes["foldedStaleButHealthy"], "hot")
         self.assertEqual(self.classes["foldedFailed"], "hot")
-        self.assertIn("foldedStageClass(d.fold_status)", self.page)
+        self.assertIn("foldedStageClass(d.fold_status, d.folded_last_at)", self.page)
         self.assertIn("d.folded_last_at, foldCls", self.page)
 
     def test_conflicted_red_is_absent_with_no_actionable_conflicts(self):

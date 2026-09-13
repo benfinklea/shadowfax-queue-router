@@ -8959,9 +8959,14 @@ function shipOldestClass(box, min) {
 function mergedStageClass(minutesSinceMainCommit) {
     return shipOldestClass('merged today', minutesSinceMainCommit);
 }
-function foldedStageClass(status) {
+function foldedStageClass(status, lastAt) {
     if (status === null || status === undefined) return '';
-    return (status === 'in-sync' || status === 'folded') ? '' : 'hot';
+    if (status !== 'in-sync' && status !== 'folded') return 'hot';
+    if (!lastAt) return '';
+    const ms = Date.now() - Date.parse(lastAt);
+    if (!Number.isFinite(ms) || Number.isNaN(ms)) return '';
+    const cadenceMs = 15 * 60000;
+    return ms >= cadenceMs * 4 ? 'hot' : (ms >= cadenceMs ? 'warn' : '');
 }
 function conflictedStageClass(count) {
     return Number(count) > 0 ? 'hot' : '';
@@ -10396,7 +10401,7 @@ function shipFlowHtml(d) {
         // New 15-stage squares: colour from the count alone (no measured age series yet).
         const bugsCls = d.bugs_found_24h >= 5 ? 'hot' : (d.bugs_found_24h > 0 ? 'warn' : '');
         const conflictCls = conflictedStageClass(d.conflicted);
-        const foldCls = foldedStageClass(d.fold_status);
+        const foldCls = foldedStageClass(d.fold_status, d.folded_last_at);
         const gateCls = d.gate_verdicts > 0 ? 'warn' : '';
 
         // Round 2 (Elrond review, PR #35, defects 4+5 "the same layout
