@@ -5692,11 +5692,14 @@ def _dispatched_stage():
         return None, None
 
 
-def _folded_stage():
-    """Commits master is ahead of live (rev-list against local refs — no GitHub
-    call) and the timestamp of the newest status=folded line in runs.log.
-    Deliberately reads runs.log, not cron.log: cron.log carries stderr only and
-    its 'fold: frodo synced' line is a different event (fleet-planning#903)."""
+def _folded_stage(state_path=None):
+    """Return fold backlog plus the latest run's timestamp and outcome.
+
+    ``in-sync`` is a successful fold run that had no work to do.  The status
+    file preserves that distinction; using only ``status=folded`` log lines
+    made a current tree look like a stale, failed fold.
+    """
+    state_path = state_path or "/workspace/planning/state/fold-master-into-live/last-run.json"
     ahead = None
     try:
         cp = subprocess.run(["git", "-C", "/workspace/planning", "rev-list", "--count",
@@ -5705,17 +5708,60 @@ def _folded_stage():
         ahead = int(cp.stdout.strip())
     except Exception:
         ahead = None
-    last_at = None
+    last_at = status = None
     try:
-        with open("/workspace/planning/state/fold-master-into-live/runs.log") as f:
-            for line in f:
-                if "\tstatus=folded\t" in line:
-                    ts = line.split("\t", 1)[0]
-                    if last_at is None or ts > last_at:
-                        last_at = ts
+        with open(state_path) as f:
+            state = json.load(f)
+        status = state.get("status")
+        last_at = state.get("ts")
     except Exception:
         pass
-    return ahead, last_at
+    return ahead, last_at, status
+
+
+def _actionable_conflicts(prs):
+    """Open, non-draft PRs whose GitHub mergeability is CONFLICTING."""
+    return [pr for pr in prs
+            if not pr.get("isDraft") and pr.get("mergeable") == "CONFLICTING"]
+
+
+def _get_main_commit_activity(headers, since, repo=None, branch="main"):
+    """Count commits on the main log since ``since`` and return its latest time.
+
+    GitHub's commit endpoint is the source used to inspect what actually landed
+    on the branch.  Search indexing and the closed-PR ordering can lag it, so
+    neither is suitable for the live 60-minute red predicate.
+    """
+    repo = repo or GITHUB_CI_REPO
+    commits = []
+    page = 1
+    while True:
+        r = requests.get(f"https://api.github.com/repos/{repo}/commits", params={
+            "sha": branch, "since": since, "per_page": 100, "page": page,
+        }, headers=headers, timeout=8)
+        r.raise_for_status()
+        batch = r.json()
+        if not isinstance(batch, list):
+            raise ValueError("Main commit log did not return a list")
+        commits.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    dates = [c.get("commit", {}).get("committer", {}).get("date") for c in commits]
+    dates = [value for value in dates if value]
+    if dates:
+        return len(commits), max(dates)
+
+    # The window can legitimately be empty.  Keep the age predicate truthful
+    # by reading the latest entry from the same commit-log source.
+    r = requests.get(f"https://api.github.com/repos/{repo}/commits", params={
+        "sha": branch, "per_page": 1,
+    }, headers=headers, timeout=8)
+    r.raise_for_status()
+    latest = r.json()
+    last_at = (latest[0].get("commit", {}).get("committer", {}).get("date")
+               if isinstance(latest, list) and latest else None)
+    return 0, last_at
 
 
 def _get_merged_today_prs(headers, today, repo=None):
@@ -6179,7 +6225,10 @@ def get_pipeline_status(repo=None, default_branch=None, force_refresh=False):
                     "504s on this repo's 48 open PRs); a per-PR rollup fetch was not added to "
                     "avoid an ~48-call/refresh rate-budget risk")
 
-                conflicted = [p for p in all_open_prs if p.get("mergeable") == "CONFLICTING"]
+                # Drafts are unfinished work and already occupy the draft bucket.
+                # A draft conflict is not an actionable merge blockage, so it must
+                # not turn the CONFLICTED remediation tile red.
+                conflicted = _actionable_conflicts(all_open_prs)
                 result["conflicted"] = len(conflicted)
                 result["conflicted_prs"] = _pr_rows(conflicted)
                 conf_ats = [p["updatedAt"] for p in conflicted if p.get("updatedAt")]
@@ -6221,7 +6270,7 @@ def get_pipeline_status(repo=None, default_branch=None, force_refresh=False):
                 result["shipping_readiness_na_reason"] = f"PR-list/merge-queue read failed: {e}"
 
             result["dispatched"], result["dispatched_last_at"] = _dispatched_stage()
-            result["folded"], result["folded_last_at"] = _folded_stage()
+            result["folded"], result["folded_last_at"], result["fold_status"] = _folded_stage()
             # "Today" is CENTRAL TIME (Ben's day), not UTC - counters were resetting at 7pm CT.
             from zoneinfo import ZoneInfo
             from datetime import timedelta
@@ -6272,24 +6321,18 @@ def get_pipeline_status(repo=None, default_branch=None, force_refresh=False):
             result["green_wait_n"] = green_wait["green_wait_n"]
             result["green_wait_excluded"] = green_wait["green_wait_excluded"]
             result["green_wait_prs"] = green_wait["green_wait_prs"]
-            # merged in last 60 minutes
+            # MERGED's live counter and age both read the main branch commit log.
+            # GitHub search indexing and closed-PR ordering can lag commits that
+            # are already visible on main (fleet-planning#979).
             hour_ago = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
-            result["merged_last_hour"] = search_count(f"repo:{repo} type:pr merged:>={hour_ago}")
-            # most recent merge timestamp
-            result["last_merge_at"] = None
             try:
-                r = requests.get(f"https://api.github.com/repos/{repo}/pulls",
-                                 params={"state": "closed", "sort": "updated", "direction": "desc", "per_page": 30},
-                                 headers=headers, timeout=8)
-                if r.ok:
-                    prs = r.json()
-                    merged_at_times = [pr.get("merged_at") for pr in prs if pr.get("merged_at")]
-                    if merged_at_times:
-                        result["last_merge_at"] = max(merged_at_times)
-                else:
-                    logger.warning("GitHub last-merge fetch failed: HTTP %s", r.status_code)
+                result["merged_last_hour"], result["last_merge_at"] = _get_main_commit_activity(
+                    headers, hour_ago, repo=repo, branch=default_branch)
             except Exception as e:
-                logger.warning(f"last-merge lookup failed: {e}")
+                github_fetches_ok = False
+                result["merged_last_hour"] = None
+                result["last_merge_at"] = None
+                logger.warning(f"main commit-log lookup failed: {e}")
             spark = []
             for i in range(6, 0, -1):
                 d0 = (now_ct - timedelta(days=i)).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -6600,7 +6643,7 @@ def api_pipeline():
                   "green_wait_avg_min", "green_wait_n", "green_wait_excluded", "has_merge_queue",
                   "deploy_state", "deploy_next_tick_at", "deploy_run_id", "deploy_run_state",
                   "deploy_run_sha", "deploy_run_sha_full", "deploy_configured",
-                  "deployed_prs_today"):
+                  "deployed_prs_today", "fold_status"):
         result.setdefault(field, None)
     result.setdefault("green_wait_prs", [])
     result.setdefault("deployed_prs_today_list", [])
@@ -8846,7 +8889,7 @@ function shipEmptyListHtml(key, repoPath) {
         'review-routed': ['no open PR carries a reviewer label right now', gh + '/pulls', 'open the PRs'],
         'in-review':     ['no open PR is waiting on a review verdict', gh + '/pulls?q=is%3Apr+is%3Aopen+review%3Arequired', 'open the PRs'],
         'gate-verdicts': ['n/a - ' + (d.gate_verdicts_na_reason || 'no gate-verdict instrument'), null, null],
-        'conflicted':    ['no open PR has a merge conflict', gh + '/pulls', 'open the PRs'],
+        'conflicted':    ['no open non-draft PR has a merge conflict', gh + '/pulls', 'open the PRs'],
         'resolved':      ['n/a - ' + (d.resolved_na_reason || 'no resolve instrument'), null, null],
         'approved':      ['no open PR is approved and unmerged', gh + '/pulls?q=is%3Apr+is%3Aopen+review%3Aapproved', 'open the PRs'],
         'in-line':       ['the merge queue is empty', gh + '/queue', 'open the merge queue'],
@@ -8913,6 +8956,16 @@ function shipOldestClass(box, min) {
     const m = Number(min);
     return m < t[0] ? 'merge-green' : (m < t[1] ? 'merge-yellow' : 'merge-red');
 }
+function mergedStageClass(minutesSinceMainCommit) {
+    return shipOldestClass('merged today', minutesSinceMainCommit);
+}
+function foldedStageClass(status) {
+    if (status === null || status === undefined) return '';
+    return (status === 'in-sync' || status === 'folded') ? '' : 'hot';
+}
+function conflictedStageClass(count) {
+    return Number(count) > 0 ? 'hot' : '';
+}
 function shipOldestSub(count, min) {
     // The "oldest:" sub-line: nothing when the box holds nothing, and (Round 2,
     // Elrond review PR #35) nothing when the age itself is unknown either -
@@ -8947,12 +9000,14 @@ function shipAgeText(ageMs) {
 }
 // n/a and unknown (?) squares pass no ISO timestamp and render no age - an
 // unknown must never read as fresh.
-function shipAgeHtml(cap, iso) {
+function shipAgeHtml(cap, iso, forcedClass) {
     if (!iso) return '';
     const ms = Date.now() - Date.parse(iso);
     if (!Number.isFinite(ms) || Number.isNaN(ms)) return '';
     const cadenceMs = (SHIP_STAGE_CADENCE_MIN[cap] || SHIP_STAGE_DEFAULT_CADENCE_MIN) * 60000;
-    const cls = ms >= cadenceMs * 4 ? 'hot' : (ms >= cadenceMs ? 'warn' : '');
+    const cls = forcedClass === undefined
+        ? (ms >= cadenceMs * 4 ? 'hot' : (ms >= cadenceMs ? 'warn' : ''))
+        : forcedClass;
     const abs = new Date(iso).toLocaleString('en-US', {month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZone: 'America/Chicago', timeZoneName: 'short'});
     return '<div class="ship-age ' + cls + '" title="' + shipEscape(abs) + '">' + shipAgeText(Math.max(0, ms)) + '</div>';
 }
@@ -9068,7 +9123,7 @@ function shipSpriteHtml(cap, unknown, num) {
 
 // `lastActivity` (last positional arg) is the 15-stage strip's ISO "last activity"
 // timestamp for this square; it renders the small age line under the caption.
-function shipStage(num, cap, cls, sub, spark, help, stageCls, dropdownKey, prs, label, hist, sub2, belowCap, lastActivity) {
+function shipStage(num, cap, cls, sub, spark, help, stageCls, dropdownKey, prs, label, hist, sub2, belowCap, lastActivity, ageClass) {
     const agents = (shipAgents || []).filter(a => a.live && a.square === cap);
     const key = dropdownKey || cap.replaceAll(' ', '-').replaceAll('/', '-');
     // Round 2 (Elrond review, PR #35): a bare "?" glyph is indistinguishable
@@ -9118,7 +9173,7 @@ function shipStage(num, cap, cls, sub, spark, help, stageCls, dropdownKey, prs, 
          // kept as its own div rather than concatenated onto `sub`, so it always reads as
          // a distinct line, not just another " · "-joined clause of the first one.
          + (sub2 ? '<div class="ship-sub">' + sub2 + '</div>' : '')
-         + shipAgeHtml(cap, lastActivity)
+         + shipAgeHtml(cap, lastActivity, ageClass)
          + (spark ? sparkHtml(spark) : '') + '</div>' + shipDropdown(key, prs || [], agents) + '</div>';
 }
 
@@ -10190,7 +10245,7 @@ const SHIP_BLANK_PIPELINE = {
     deploy_next_tick_at: null, deploy_run_sha: null,
     deployed_prs_today: null, deployed_prs_today_list: [],
     closed_issue_timings: null,
-    spark12h: {}, arrows: [], folded: null, folded_last_at: null,
+    spark12h: {}, arrows: [], folded: null, folded_last_at: null, fold_status: null,
 };
 function shipFlowHtml(d) {
     shipLastPipeline = d;
@@ -10244,7 +10299,7 @@ function shipFlowHtml(d) {
             : (HELP.inLine + shipOldestWords('in queue', 'age of the oldest merge-queue entry since it was enqueued'));
         // merged today: colour by minutes since the LAST merge (the "Last: · 60m:" text stays);
         // the pulse rides only on red, exactly as the old merges-per-hour rule already did.
-        const mergedCls = shipOldestClass('merged today', d.merged_since_min);
+        const mergedCls = mergedStageClass(d.merged_since_min);
         const mergedStage = mergedCls + (mergedCls === 'merge-red' ? ' merge-pulse' : '');
         // last deploy: colour by minutes since the last deploy ONLY while main has commits the
         // deploy does not contain; nothing waiting = green whatever the age; unknown = neutral.
@@ -10340,7 +10395,8 @@ function shipFlowHtml(d) {
 
         // New 15-stage squares: colour from the count alone (no measured age series yet).
         const bugsCls = d.bugs_found_24h >= 5 ? 'hot' : (d.bugs_found_24h > 0 ? 'warn' : '');
-        const conflictCls = d.conflicted > 0 ? 'hot' : '';
+        const conflictCls = conflictedStageClass(d.conflicted);
+        const foldCls = foldedStageClass(d.fold_status);
         const gateCls = d.gate_verdicts > 0 ? 'warn' : '';
 
         // Round 2 (Elrond review, PR #35, defects 4+5 "the same layout
@@ -10402,7 +10458,7 @@ function shipFlowHtml(d) {
             // down past gate verdicts to conflicted on row 3 (#ship-elbow-3,
             // JS-positioned directly under #ship-elbow-1 so the two read as
             // one continuous belt with four inserters on it, as in the rig).
-            + shipArrow('gate verdicts conflicted', '⚠', null, 'PRs the gate turned back with a merge conflict, going down to CONFLICTED', null, null, false, String(d.conflicted ?? '?'), null, 'right', true, 'ship-elbow-3')
+            + shipArrow('gate verdicts conflicted', '⚠', null, 'Non-draft PRs the gate turned back with a merge conflict, going down to CONFLICTED', null, null, false, String(d.conflicted ?? '?'), null, 'right', true, 'ship-elbow-3')
             // The split's LEFT branch: the rest of the gate's output, along row 2 to approved.
             + shipArrow('gate verdicts', '⛨', null, 'PRs waiting on a gate verdict, heading for APPROVED', null, null, false, String(d.gate_verdicts ?? '?'), null, 'left', true) +
             // SHIP-16-FIX: this used to feed the now-removed 'green waiting' square;
@@ -10421,7 +10477,7 @@ function shipFlowHtml(d) {
             shipStage(d.merged_today, 'merged today', 'ok', mergedSub, d.merged_spark, HELP.merged + shipOldestWords('merged today', 'minutes since the last merge'), mergedStage, 'merged-today', d.merged_today_prs, 'merged', shipHistorySpark(sp.merged, 'merged'), null, null, d.last_merge_at) + shipArrow('merged today', '⚡', arrowByKey['merged-deploy'], 'Production deploy workflows in flight, or merge awaiting deploy', shipDeployCount(d), wFor('merged-deploy'), isB('merged-deploy'), null, null, 'left', true) +
             // Ben's rig: folded -> deployed is a plain in-row belt now
             // (deployed moved up onto row 2), carrying item #14 (Rocket).
-            shipStage(d.folded ?? null, 'folded', '', '', null, HELP.folded, '', 'folded', [], null, null, null, null, d.folded_last_at)
+            shipStage(d.folded ?? null, 'folded', '', '', null, HELP.folded, foldCls, 'folded', [], null, null, null, null, d.folded_last_at, foldCls)
             + shipArrow('folded', '🚀', null, 'Deploy workflows folded into this run', null, null, false, String(d.folded ?? '?'), null, 'left', true)
             + shipStage(noDeploy ? 'n/a' : (d.deployed_prs_today === null || d.deployed_prs_today === undefined ? '?' : d.deployed_prs_today), 'last deploy', 'ok', deployLastLine, null, (noDeploy ? 'no deploy workflow on ' + (d.repo_name || d.repo_full || 'this repo') : HELP.lastdep + shipOldestWords('last deploy', 'minutes since the last deploy, counted only while main has commits newer than it') + deployWords), deployStateCls, 'last-deploy', (d.deployed_prs_today_list || []).map(n => ({number:n,title:'deployed'})), 'deployed', shipHistorySpark(sp.deploy, 'deploy'), null, null, d.last_deploy_at);
 
@@ -10430,7 +10486,7 @@ function shipFlowHtml(d) {
         // the shared up-belt's column, then Ben's closed-issues list in the
         // open space on the left.
         const row3 =
-            shipStage(d.conflicted ?? null, 'conflicted', conflictCls, '', null, HELP.conflicted, '', 'conflicted', d.conflicted_prs || [], null, null, null, null, d.conflicted_last_at) + shipArrow('conflicted', '⚠', null, 'Open PRs with a merge conflict, waiting to be resolved', null, null, false, String(d.conflicted ?? '?'), null, 'left', true) +
+            shipStage(d.conflicted ?? null, 'conflicted', conflictCls, '', null, HELP.conflicted, '', 'conflicted', d.conflicted_prs || [], null, null, null, null, d.conflicted_last_at) + shipArrow('conflicted', '⚠', null, 'Open non-draft PRs with a merge conflict, waiting to be resolved', null, null, false, String(d.conflicted ?? '?'), null, 'left', true) +
             shipStage(resNa ? 'n/a' : d.resolved, 'resolved', '', '', null, HELP.resolved + (resNa && d.resolved_na_reason ? ' (' + d.resolved_na_reason + ')' : ''), '', 'resolved', [], null, null, null, null, null)
             + '<span class="ship-elbow-slot"></span>'
             + shipClosedIssuesHtml(d.closed_issue_timings);
@@ -10811,7 +10867,7 @@ const HELP = {
     reviewRouted:  'REVIEW ROUTED - open pull requests carrying a reviewer label, meaning they have been handed to a specific reviewer.',
     inReview:      'IN REVIEW - open pull requests awaiting a review verdict (review required or changes requested).',
     gateVerdicts:  'GATE VERDICTS - open pull requests whose automated gate-verdict check has not passed.',
-    conflicted:    'CONFLICTED - open pull requests GitHub reports as having a merge conflict.',
+    conflicted:    'CONFLICTED - open non-draft pull requests GitHub reports as having a merge conflict. Draft conflicts are unfinished work, not an actionable blockage.',
     resolved:      'RESOLVED - merge conflicts cleared in the last 24 hours. Shown as n/a when there is no history store to detect the clearing event cheaply.',
     approved:      'APPROVED - pull requests with an approving review that have not merged yet.',
     folded:        'FOLDED - commits on master not yet folded into live, the branch that actually serves traffic.',
