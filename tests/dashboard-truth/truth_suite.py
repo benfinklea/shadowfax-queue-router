@@ -429,25 +429,39 @@ def check_pipeline() -> None:
     ct = ZoneInfo("America/Chicago")
     midnight = now.astimezone(ct).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(dt.timezone.utc)
     hour = now - dt.timedelta(hours=1)
-    query = """query($issues:String!,$prs:String!,$today:String!,$hour:String!){
+    query = """query($issues:String!,$prs:String!,$today:String!){
       issues:search(query:$issues,type:ISSUE,first:1){issueCount}
       prs:search(query:$prs,type:ISSUE,first:1){issueCount}
       today:search(query:$today,type:ISSUE,first:1){issueCount nodes{... on PullRequest{mergedAt}}}
-      hour:search(query:$hour,type:ISSUE,first:1){issueCount}
     }"""
     variables = ["-f", f"query={query}", "-f", "issues=repo:armbrain-io/armbrain is:issue is:open",
                  "-f", "prs=repo:armbrain-io/armbrain is:pr is:open",
-                 "-f", f"today=repo:armbrain-io/armbrain is:pr is:merged merged:>={midnight.strftime('%Y-%m-%dT%H:%M:%SZ')}",
-                 "-f", f"hour=repo:armbrain-io/armbrain is:pr is:merged merged:>={hour.strftime('%Y-%m-%dT%H:%M:%SZ')}"]
+                 "-f", f"today=repo:armbrain-io/armbrain is:pr is:merged merged:>={midnight.strftime('%Y-%m-%dT%H:%M:%SZ')}"]
     try:
         g = gh_json(["graphql", *variables])["data"]
         expected = {"issues_open": g["issues"]["issueCount"], "prs_open": g["prs"]["issueCount"],
-                    "merged_today": g["today"]["issueCount"], "merged_last_hour": g["hour"]["issueCount"]}
+                    "merged_today": g["today"]["issueCount"]}
         for field, actual in expected.items():
             claim = d.get(field)
             emit("PASS" if close(claim, actual, 1) else "FAIL", f"pipeline.{field}", claim, actual, "±1 in-flight churn")
-        pulls = gh_json(["repos/armbrain-io/armbrain/pulls", "--method", "GET", "-f", "state=closed", "-f", "sort=updated", "-f", "direction=desc", "-f", "per_page=30"])
-        last_merge = max((p.get("merged_at") for p in pulls if p.get("merged_at")), default=None)
+        commits = []
+        page_number = 1
+        while True:
+            batch = gh_json(["repos/armbrain-io/armbrain/commits", "--method", "GET",
+                             "-f", "sha=main", "-f", f"since={hour.strftime('%Y-%m-%dT%H:%M:%SZ')}",
+                             "-f", "per_page=100", "-f", f"page={page_number}"])
+            commits.extend(batch)
+            if len(batch) < 100:
+                break
+            page_number += 1
+        emit("PASS" if close(d.get("merged_last_hour"), len(commits), 1) else "FAIL",
+             "pipeline.merged_last_hour", d.get("merged_last_hour"), len(commits), "±1 in-flight churn")
+        if commits:
+            last_merge = max(c.get("commit", {}).get("committer", {}).get("date") for c in commits)
+        else:
+            latest = gh_json(["repos/armbrain-io/armbrain/commits", "--method", "GET",
+                              "-f", "sha=main", "-f", "per_page=1"])
+            last_merge = latest[0].get("commit", {}).get("committer", {}).get("date") if latest else None
         emit("PASS" if d.get("last_merge_at") == last_merge else "FAIL", "pipeline.last_merge_at", d.get("last_merge_at"), last_merge)
         cutoff = (now - dt.timedelta(hours=48)).strftime("%Y-%m-%dT%H:%M:%SZ")
         direct_ci_before = {}
@@ -838,36 +852,19 @@ console.log(JSON.stringify({
                 node_ok = run(["node", "--check", handle.name], timeout=10).returncode == 0
         emit("PASS" if node_ok else "FAIL", "page.javascript_syntax", node_ok, "node --check")
 
-        merge_probe = None
-        merge_start = page.find("function mergedRateClass(")
-        merge_end = page.find("function refreshShipFlow()", merge_start)
-        if merge_start >= 0 and merge_end > merge_start:
-            fixture_js = page[merge_start:merge_end] + "\nconsole.log(JSON.stringify([0,1,2,3,7].map(mergedRateClass)));\n"
-            with tempfile.NamedTemporaryFile("w", suffix=".js") as handle:
-                handle.write(fixture_js); handle.flush()
-                probe = run(["node", handle.name], timeout=10)
-            if probe.returncode == 0:
-                try:
-                    merge_probe = json.loads(probe.stdout.strip())
-                except json.JSONDecodeError:
-                    pass
-        expected_classes = ["merge-red merge-pulse", "merge-red", "merge-yellow", "merge-green", "merge-green"]
-        threshold_ok = merge_probe == expected_classes
-        emit("PASS" if threshold_ok else "FAIL", "page.merged_rate.thresholds",
-             merge_probe, {"0": expected_classes[0], "1": expected_classes[1], "2": expected_classes[2],
-                           "3": expected_classes[3], "7": expected_classes[4]})
-        live_count = api.get("pipeline", {}).get("merged_last_hour")
-        live_class = None
-        if isinstance(live_count, int) and merge_probe:
-            live_class = expected_classes[min(live_count, 3)]
+        live_age = api.get("pipeline", {}).get("merged_since_min")
+        if isinstance(live_age, (int, float)):
+            live_class = "merge-green" if live_age < 30 else ("merge-yellow" if live_age < 90 else "merge-red")
+        else:
+            live_class = None
         binding_ok = (
             live_class is not None
-            and "mergedRateClass(d.merged_last_hour)" in page
-            and "ship-stage ' + (stageCls || '')" in page
+            and "mergedStageClass(d.merged_since_min)" in page
+            and "ship-stage' + shapeCls + ' ' + (stageCls || '')" in page
         )
-        emit("PASS" if binding_ok else "FAIL", "page.merged_rate.class_binding",
-             {"merged_last_hour": live_count, "expected_class": live_class},
-             "merged box class is derived from merged_last_hour")
+        emit("PASS" if binding_ok else "FAIL", "page.merged_commit_age.class_binding",
+             {"merged_since_min": live_age, "expected_class": live_class},
+             "merged box red predicate is derived from main commit-log age")
 
         integer_tps_ok = (
             "Math.round(s.tps_now)" in page
