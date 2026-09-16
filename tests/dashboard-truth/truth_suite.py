@@ -15,6 +15,7 @@ import os
 import re
 import socket
 import sqlite3
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -194,6 +195,72 @@ def nvidia(name: str):
             "watts": sum(x[4] for x in rows)}
 
 
+# GPU utilization is a free-running instantaneous gauge. Two point reads taken
+# at different instants routinely differ by more than any fixed tolerance with
+# nothing wrong anywhere: measured on gandalf, sd ranged 14.7 to 37.3 across
+# load conditions against a 20-point tolerance. The same rule is already written
+# in fleet-sentinel.sh overall_material_key(): never compare a free-running
+# instrument point-to-point. So sample a window and compare means, widening the
+# tolerance by the noise the window actually observed (fleet-planning#1209).
+GPU_UTIL_SAMPLES = 12
+# Half the gauge's 0-100 range. Past this the comparison discriminates nothing.
+UTIL_INDISCRIMINATE_BAND = 50.0
+
+
+def nvidia_util_window(name: str) -> tuple[float, float, int] | None:
+    """Return (mean, sd, n) of a short utilization window, or None if unreadable."""
+    host, user = HOSTS[name]
+    command = ("for _ in $(seq 1 %d); do nvidia-smi --query-gpu=utilization.gpu "
+               "--format=csv,noheader,nounits; done" % GPU_UTIL_SAMPLES)
+    cp = run(["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+              "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR",
+              "-o", "ConnectTimeout=4", f"{user}@{host}", command], timeout=20)
+    values = []
+    for line in cp.stdout.splitlines():
+        for field in line.split(","):
+            try:
+                values.append(float(field.strip()))
+            except ValueError:
+                pass
+    if not values:
+        return None
+    sd = statistics.pstdev(values) if len(values) > 1 else 0.0
+    return statistics.mean(values), sd, len(values)
+
+
+def util_matches(claim, window, floor: float) -> tuple[bool, str]:
+    """Compare a dashboard claim against a sampled window, noise-aware.
+
+    Returns (level, detail) where level is PASS, FAIL or WARN.
+
+    The dashboard side is a SINGLE point read, not an average, so the band has
+    to carry the gauge's full spread and not merely the standard error of the
+    window mean - an SEM shrinks with n and would re-create the original defect
+    at a larger sample size. For a point drawn from the same distribution as a
+    window of n, sd(point - mean) = sd * sqrt(1 + 1/n); two of those is the
+    threshold, floored at the metric's fixed tolerance.
+
+    The honest consequence: on a gauge this noisy the band is wide, so only
+    gross drift is detectable. That is a property of comparing one instantaneous
+    read against another, not a weakness introduced here.
+    """
+    if claim is None or window is None:
+        return "WARN", "no sample"
+    mean, sd, n = window
+    tolerance = max(floor, 2 * sd * (1 + 1 / n) ** 0.5) if n > 1 else floor
+    delta = abs(float(claim) - mean)
+    detail = (f"window n={n} mean={mean:.1f} sd={sd:.1f}; "
+              f"|claim-mean|={delta:.1f} vs tolerance={tolerance:.1f}")
+    # A band wider than half the gauge's range cannot separate drift from
+    # variance for ANY claim - every value passes, so a PASS would assert a
+    # verification that did not happen. Say so instead. This is the
+    # unreachable-threshold defect in reverse: a check that can never fail
+    # looks identical to a system with nothing wrong.
+    if tolerance >= UTIL_INDISCRIMINATE_BAND:
+        return "WARN", detail + "; band exceeds half the 0-100 range, no verdict possible"
+    return ("PASS" if delta <= tolerance else "FAIL"), detail
+
+
 def close(a, b, absolute=None, pct=None) -> bool:
     if a is None or b is None:
         return False
@@ -231,6 +298,15 @@ def check_gpu() -> None:
             ("power", d.get("gpu_watts"), direct["watts"], 35, None),
         )
         for metric, claim, actual, absolute, pct in checks:
+            # util is a free-running gauge; a single pair of reads cannot tell
+            # drift from variance. Compare sampled windows instead (fp#1209).
+            if metric == "util":
+                window = nvidia_util_window(name)
+                level, detail = util_matches(claim, window, absolute)
+                emit(level, f"gpu.{name}.util", claim,
+                     "unreadable" if window is None else round(window[0], 2),
+                     detail)
+                continue
             other = after.get(name)
             if other is not None:
                 other_value = other["used_gb" if metric == "vram_used" else
