@@ -96,7 +96,23 @@ def url_json(url: str, timeout: int = 8, headers: dict | None = None):
 
 
 def run(cmd: list[str], timeout: int = 15, env: dict | None = None) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, text=True, capture_output=True, timeout=timeout, env=env)
+    """Run a probe command. A timeout is a FAILED PROBE, not a crashed suite.
+
+    Every caller here is probing something that may be unreachable, and each
+    one already handles a non-zero returncode. Letting TimeoutExpired escape
+    instead killed the whole hourly run from inside a thread pool the moment
+    one host hung: no verdicts at all for any check, and the resulting silence
+    was indistinguishable from a clean pass (fleet-planning#1226).
+    """
+    try:
+        return subprocess.run(cmd, text=True, capture_output=True,
+                              timeout=timeout, env=env)
+    except subprocess.TimeoutExpired as exc:
+        return subprocess.CompletedProcess(
+            cmd, 124, exc.stdout or "",
+            (exc.stderr or "") + f"probe timed out after {timeout}s")
+    except OSError as exc:
+        return subprocess.CompletedProcess(cmd, 127, "", f"probe failed: {exc}")
 
 
 def check_apis() -> None:
