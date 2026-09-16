@@ -8103,7 +8103,7 @@ gap:0;padding:0;align-self:flex-start;margin-top:var(--ship-ground,33px);align-i
    is row-reversed now (the conflict loop hangs under the right end of row
    2), so the list is the row's LAST DOM child and lands in the open space
    on the left. */
-.ship-closed{align-self:flex-start;margin:8px 24px 0 0;background:rgba(0,0,0,.66);border-radius:4px;
+.ship-closed{align-self:flex-start;margin:8px 24px 0 0;transform:translateX(-180px);background:rgba(0,0,0,.66);border-radius:4px;
 padding:4px 8px;color:#fff;font-size:.58em;font-family:'Orbitron',monospace;letter-spacing:.3px;min-width:380px;max-width:500px}
 .ship-closed-head{display:grid;grid-template-columns:1fr 70px 84px;gap:8px;text-transform:uppercase;color:#c7cee0;
 font-size:.85em;border-bottom:1px solid #556;padding-bottom:3px;margin-bottom:3px;white-space:nowrap}
@@ -9799,19 +9799,19 @@ function shipWorkerNode(w) {
     el.innerHTML = shipHouseSvg(0) + '<span class="ship-worker-bot">' + shipBotSvg('ship-yard-bot') + shipSparkMarkup() + '</span>';
     return el;
 }
-// Anchors #ship-yard under the first (issues->prs) arrow via a bounding-rect
-// read every refresh - cheap, and keeps the yard's own children (the robots)
-// untouched, unlike rebuilding the arrow's HTML would.
+// Ben's 2026-09-16 mark: active-lane sprites belong beside WORKING
+// (the dispatched stage in this source), not above ISSUES OPENED. Keep the
+// yard's persistent DOM and animation state; only change its anchor.
 function positionShipYard() {
     const yard = document.getElementById('ship-yard');
     const wrap = yard && yard.parentElement;
-    const arrow = document.querySelector('#ship-flow .ship-arrow[data-square-left="issues open"]');
-    if (!yard || !wrap || !arrow) return;
-    const arrowRect = arrow.getBoundingClientRect();
+    const working = document.querySelector('#ship-flow .ship-stage[data-square="dispatched"]');
+    if (!yard || !wrap || !working) return;
+    const workingRect = working.getBoundingClientRect();
     const wrapRect = wrap.getBoundingClientRect();
-    yard.style.left = (arrowRect.left - wrapRect.left + arrowRect.width / 2) + 'px';
-    yard.style.top = (arrowRect.bottom - wrapRect.top + 2) + 'px';
-    yard.style.transform = 'translateX(-50%)';
+    yard.style.left = (workingRect.right - wrapRect.left + 4) + 'px';
+    yard.style.top = (workingRect.top - wrapRect.top + 4) + 'px';
+    yard.style.transform = 'none';
 }
 // Round 2 (Elrond review, PR #35, defect 3): "the boustrophedon turn arrows
 // are drawing outside the belt run" - the turn used to be a full-width
@@ -9883,15 +9883,12 @@ function positionShipElbows() {
         column('ship-elbow-1', inReview.top, gateMid - SHIP_COLUMN_SPLIT_PX / 2, x);
         column('ship-elbow-3', gateMid + SHIP_COLUMN_SPLIT_PX / 2, conflicted.bottom, x);
     }
-    // The shared up-belt: from beside RESOLVED (row 3, its start) up past
-    // APPROVED to IN LINE (row 2, its end), in the column both rows reserve
-    // for it (.ship-elbow-slot). Its top sits at the higher of in line /
-    // approved's sprites so the unloader is level with in line; approved's
-    // own loader is dropped to sit level with approved's machine.
+    // Ben's 2026-09-16 mark: this belt ends at APPROVED. It must never run
+    // down through the CLOSED ISSUES plate in row 3.
     const slot = document.getElementById('ship-elbow-4-slot');
-    const inLine = sprite('in line'), approved = sprite('approved'), resolved = sprite('resolved');
+    const inLine = sprite('in line'), approved = sprite('approved');
     const shared = document.getElementById('ship-elbow-4');
-    if (slot && inLine && approved && resolved && shared) {
+    if (slot && inLine && approved && shared) {
         const loader = shared.querySelector(':scope > .ship-inserter');
         const insH = loader ? loader.offsetHeight : 32;
         // Ben: every inserter level with the machine it reaches into. The
@@ -9902,13 +9899,8 @@ function positionShipElbows() {
         const loadTop = approved.top + approved.height / 2 - insH / 2;   // loader centred on approved's chest
         const top = Math.min(inLine.top, loadTop);
         const slotRect = slot.getBoundingClientRect();
-        // Ben (10:35 AM): "move the resolved feeder up so it's level with
-        // resolved" - the feeder sits at the belt's very start (bottom), so
-        // the belt ends where the feeder, centred on resolved's chest, ends.
-        const bottom = resolved.top + resolved.height / 2 + insH / 2;
+        const bottom = approved.top + approved.height / 2 + insH / 2;
         column('ship-elbow-4', top, bottom, slotRect.left + (slotRect.width - shared.offsetWidth) / 2);
-        shared.style.setProperty('--load-top', (loadTop - top) + 'px');
-        shared.style.setProperty('--unload-top', (inLine.top - top) + 'px');
     }
 }
 function renderShipYard(workers, completions) {
@@ -10420,8 +10412,7 @@ function shipFlowHtml(d) {
             // LORE order 15: unknown bugs_found_24h renders 'n/a' (Round 3's
             // rule - never empty, never a bare '?') the same way gate_verdicts
             // and resolved already do.
-            shipStage(d.bugs_found_24h === null || d.bugs_found_24h === undefined ? 'n/a' : d.bugs_found_24h, 'bugs found', bugsCls, '', null, HELP.bugsFound, '', 'bugs-found', [], null, null, null, null, d.last_issue_created_at) + shipArrow('bugs found', '⚡', null, 'Issues created in the last 24h', null, null, false, String(d.bugs_found_24h ?? '?'), null, 'right', true) +
-            shipStage(d.issues_open, 'issues open', '', '', null, HELP.issues, '', null, null, null, shipIssuesRatePanel(sp.issues), null, arrowByKey['issues-prs'] && arrowByKey['issues-prs'].drain_label, d.last_issue_created_at) + shipArrow('issues open', '🤖', arrowByKey['issues-prs'], 'PRs opened in the last hour, from GitHub search - click for live agent lanes', null, wFor('issues-prs'), isB('issues-prs'), arrowByKey['issues-prs'] && arrowByKey['issues-prs'].label, null, 'right', true) +
+            shipStage(d.issues_open, 'issues open', '', '', null, HELP.issues + ' ' + HELP.bugsFound, '', null, null, null, shipIssuesRatePanel(sp.issues), 'opened 24h: ' + (d.bugs_found_24h === null || d.bugs_found_24h === undefined ? 'n/a' : d.bugs_found_24h), arrowByKey['issues-prs'] && arrowByKey['issues-prs'].drain_label, d.last_issue_created_at) + shipArrow('issues open', '🤖', arrowByKey['issues-prs'], 'PRs opened in the last hour, from GitHub search - click for live agent lanes', null, wFor('issues-prs'), isB('issues-prs'), arrowByKey['issues-prs'] && arrowByKey['issues-prs'].label, null, 'right', true) +
             shipStage(d.dispatched ?? null, 'dispatched', '', '', null, HELP.dispatched, '', 'dispatched', [], null, null, null, null, d.dispatched_last_at) + shipArrow('dispatched', '🤖', null, 'Live dispatched lanes', null, null, false, String(d.dispatched ?? '?'), null, 'right', true) +
             shipStage(d.prs_open, 'prs open', '', prsOld.sub, null, HELP.prs + shipOldestWords('prs open', 'age of the oldest open, non-draft pull request'), prsOld.cls, null, null, null, shipHistorySpark(sp.prs, 'prs'), null, null, d.prs_open_last_at) + shipArrow('prs open', '⚙', arrowByKey['prs-ci'], 'Distinct PRs with a CI run started this hour, from the GitHub workflow-runs list', d.ci_queued, wFor('prs-ci'), isB('prs-ci'), null, null, 'right', true) +
             shipStage(ciNum, 'ci q/run', ciCls, ciOld.sub, null, HELP.ciqr + shipOldestWords('ci q/run', 'how long the oldest queued run in the last 48 h has waited to start (since it was re-queued, if it was re-run)') + ' Green waiting: ' + greenWaitingText + ' PRs approved and green but not yet enqueued.' + greenWaitWords, ciOld.cls, null, null, 'ci run', shipHistorySpark(sp.ci, 'ci'), 'green waiting: ' + greenWaitingText + (greenSub ? ' · ' + greenSub : '') + (greenWaitSub ? ' · ' + greenWaitSub : ''), null, d.ci_last_run_started_at) + shipArrow('ci q/run', '⚙', arrowByKey['ci-green'], 'Distinct PRs with a green Pre-Merge Gate run this hour (workflow 255384592)', d.ci_running, wFor('ci-green'), isB('ci-green'), null, null, 'right', true) +
@@ -10474,9 +10465,7 @@ function shipFlowHtml(d) {
             // Approved loads it level with its own machine; resolved loads it
             // at the bottom (the belt's start); 'in line' unloads at the top.
             shipStage(d.approved ?? null, 'approved', '', '', null, HELP.approved, '', 'approved', d.approved_prs || [], null, null, null, null, d.approved_last_at)
-            + shipArrow('approved', '✅', arrowByKey['green-inline'], 'Approved PRs not yet merged (resolved conflicts rejoin this belt from below)', null, wFor('green-inline'), isB('green-inline'), null, null, 'left', true, 'ship-elbow-4',
-                {shared: true, extraSquare: 'resolved', extraCount: resNa ? null : d.resolved, extraGlyph: '⤴',
-                 extraDescription: 'Resolved conflicts passed back up onto the APPROVED belt'})
+            + shipArrow('approved', '✅', arrowByKey['green-inline'], 'Approved PRs not yet merged', null, wFor('green-inline'), isB('green-inline'), null, null, 'left', true, 'ship-elbow-4')
             + '<span class="ship-elbow-slot" id="ship-elbow-4-slot"></span>' +
             shipStage(queueNum, 'in line', queueCls, queueSub, null, queueHelp, queueOld.cls, 'in-line', d.queue_prs, 'in queue', shipHistorySpark(sp.queue, 'queue'), null, null, null) + shipArrow('in line', '⚡', arrowByKey['inline-merged'], 'Merge queue entries', d.queue_depth, wFor('inline-merged'), isB('inline-merged'), null, null, 'left', true) +
             shipStage(d.merged_today, 'merged today', 'ok', mergedSub, d.merged_spark, HELP.merged + shipOldestWords('merged today', 'minutes since the last merge'), mergedStage, 'merged-today', d.merged_today_prs, 'merged', shipHistorySpark(sp.merged, 'merged'), null, null, d.last_merge_at) + shipArrow('merged today', '⚡', arrowByKey['merged-deploy'], 'Production deploy workflows in flight, or merge awaiting deploy', shipDeployCount(d), wFor('merged-deploy'), isB('merged-deploy'), null, null, 'left', true) +
