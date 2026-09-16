@@ -8001,6 +8001,10 @@ font-size:0.85em;letter-spacing:0.5px;vertical-align:middle}
    regardless of how many share the row - the leftover width now collects
    at the row's own far edge instead of between every stage. */
 .ship-stage{flex:0 0 auto;padding:7px 0}
+/* Ben's 2026-09-16 correction: ISSUES OPENED 24H remains its own gauge.
+   Its two-line plate is wider than the sprite, so move only that gauge right
+   far enough to keep the plate and age chip inside the panel. */
+.ship-row-1>.ship-stage[data-square="bugs found"]{transform:translateX(40px)}
 /* 7 stages per row (Ben) at a 1440 viewport: captions may wrap to a
    second line and sub-lines may wrap too - the numerals stay full size
    (legibility beats fidelity applies to the count, not the label). */
@@ -10412,7 +10416,8 @@ function shipFlowHtml(d) {
             // LORE order 15: unknown bugs_found_24h renders 'n/a' (Round 3's
             // rule - never empty, never a bare '?') the same way gate_verdicts
             // and resolved already do.
-            shipStage(d.issues_open, 'issues open', '', '', null, HELP.issues + ' ' + HELP.bugsFound, '', null, null, null, shipIssuesRatePanel(sp.issues), 'opened 24h: ' + (d.bugs_found_24h === null || d.bugs_found_24h === undefined ? 'n/a' : d.bugs_found_24h), arrowByKey['issues-prs'] && arrowByKey['issues-prs'].drain_label, d.last_issue_created_at) + shipArrow('issues open', '🤖', arrowByKey['issues-prs'], 'PRs opened in the last hour, from GitHub search - click for live agent lanes', null, wFor('issues-prs'), isB('issues-prs'), arrowByKey['issues-prs'] && arrowByKey['issues-prs'].label, null, 'right', true) +
+            shipStage(d.bugs_found_24h === null || d.bugs_found_24h === undefined ? 'n/a' : d.bugs_found_24h, 'bugs found', bugsCls, '', null, HELP.bugsFound, '', 'bugs-found', [], null, null, null, null, d.last_issue_created_at) + shipArrow('bugs found', '⚡', null, 'Issues created in the last 24h', null, null, false, String(d.bugs_found_24h ?? '?'), null, 'right', true) +
+            shipStage(d.issues_open, 'issues open', '', '', null, HELP.issues, '', null, null, null, shipIssuesRatePanel(sp.issues), null, arrowByKey['issues-prs'] && arrowByKey['issues-prs'].drain_label, d.last_issue_created_at) + shipArrow('issues open', '🤖', arrowByKey['issues-prs'], 'PRs opened in the last hour, from GitHub search - click for live agent lanes', null, wFor('issues-prs'), isB('issues-prs'), arrowByKey['issues-prs'] && arrowByKey['issues-prs'].label, null, 'right', true) +
             shipStage(d.dispatched ?? null, 'dispatched', '', '', null, HELP.dispatched, '', 'dispatched', [], null, null, null, null, d.dispatched_last_at) + shipArrow('dispatched', '🤖', null, 'Live dispatched lanes', null, null, false, String(d.dispatched ?? '?'), null, 'right', true) +
             shipStage(d.prs_open, 'prs open', '', prsOld.sub, null, HELP.prs + shipOldestWords('prs open', 'age of the oldest open, non-draft pull request'), prsOld.cls, null, null, null, shipHistorySpark(sp.prs, 'prs'), null, null, d.prs_open_last_at) + shipArrow('prs open', '⚙', arrowByKey['prs-ci'], 'Distinct PRs with a CI run started this hour, from the GitHub workflow-runs list', d.ci_queued, wFor('prs-ci'), isB('prs-ci'), null, null, 'right', true) +
             shipStage(ciNum, 'ci q/run', ciCls, ciOld.sub, null, HELP.ciqr + shipOldestWords('ci q/run', 'how long the oldest queued run in the last 48 h has waited to start (since it was re-queued, if it was re-run)') + ' Green waiting: ' + greenWaitingText + ' PRs approved and green but not yet enqueued.' + greenWaitWords, ciOld.cls, null, null, 'ci run', shipHistorySpark(sp.ci, 'ci'), 'green waiting: ' + greenWaitingText + (greenSub ? ' · ' + greenSub : '') + (greenWaitSub ? ' · ' + greenWaitSub : ''), null, d.ci_last_run_started_at) + shipArrow('ci q/run', '⚙', arrowByKey['ci-green'], 'Distinct PRs with a green Pre-Merge Gate run this hour (workflow 255384592)', d.ci_running, wFor('ci-green'), isB('ci-green'), null, null, 'right', true) +
