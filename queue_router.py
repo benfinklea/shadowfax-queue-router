@@ -8004,7 +8004,7 @@ font-size:0.85em;letter-spacing:0.5px;vertical-align:middle}
 /* Ben's 2026-09-16 correction: ISSUES OPENED 24H remains its own gauge.
    Its two-line plate is wider than the sprite, so move only that gauge right
    far enough to keep the plate and age chip inside the panel. */
-.ship-row-1>.ship-stage[data-square="bugs found"]{transform:translateX(40px)}
+.ship-row-1>.ship-stage[data-square="bugs found"]{transform:translateX(70px)}
 /* 7 stages per row (Ben) at a 1440 viewport: captions may wrap to a
    second line and sub-lines may wrap too - the numerals stay full size
    (legibility beats fidelity applies to the count, not the label). */
@@ -8107,8 +8107,8 @@ gap:0;padding:0;align-self:flex-start;margin-top:var(--ship-ground,33px);align-i
    is row-reversed now (the conflict loop hangs under the right end of row
    2), so the list is the row's LAST DOM child and lands in the open space
    on the left. */
-.ship-closed{align-self:flex-start;margin:8px 24px 0 0;transform:translateX(-180px);background:rgba(0,0,0,.66);border-radius:4px;
-padding:4px 8px;color:#fff;font-size:.58em;font-family:'Orbitron',monospace;letter-spacing:.3px;min-width:380px;max-width:500px}
+.ship-closed{align-self:flex-start;margin:8px 24px 0 0;transform:translateX(-50px);background:rgba(0,0,0,.66);border-radius:4px;
+padding:4px 8px;color:#fff;font-size:.58em;font-family:'Orbitron',monospace;letter-spacing:.3px;width:430px;min-width:430px;max-width:430px}
 .ship-closed-head{display:grid;grid-template-columns:1fr 70px 84px;gap:8px;text-transform:uppercase;color:#c7cee0;
 font-size:.85em;border-bottom:1px solid #556;padding-bottom:3px;margin-bottom:3px;white-space:nowrap}
 .ship-closed-row{display:grid;grid-template-columns:52px 1fr 70px 84px;gap:8px;line-height:1.2;white-space:nowrap}
@@ -9813,9 +9813,9 @@ function positionShipYard() {
     if (!yard || !wrap || !working) return;
     const workingRect = working.getBoundingClientRect();
     const wrapRect = wrap.getBoundingClientRect();
-    yard.style.left = (workingRect.right - wrapRect.left + 4) + 'px';
+    yard.style.left = (workingRect.left - wrapRect.left - 4) + 'px';
     yard.style.top = (workingRect.top - wrapRect.top + 4) + 'px';
-    yard.style.transform = 'none';
+    yard.style.transform = 'translateX(-100%)';
 }
 // Round 2 (Elrond review, PR #35, defect 3): "the boustrophedon turn arrows
 // are drawing outside the belt run" - the turn used to be a full-width
